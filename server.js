@@ -177,6 +177,38 @@ app.get('/ml/status', (_, res) => res.json({
   expira_en:  ML.expires ? Math.round((ML.expires - Date.now()) / 60000) + ' min' : 'n/a'
 }));
 
+// ── MERCADO LIBRE — Sync manual ─────────────────────────────────────
+app.post('/ml/sync', async (req, res) => {
+  try {
+    const dias = parseInt(req.query.dias) || 30;
+    if (!ML.access) return res.status(400).json({ error: 'ML no conectado. Conectá primero desde Configuración.' });
+    const result = await syncMLVentas(dias);
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('ML sync manual:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── MERCADO LIBRE — Resumen de ventas ───────────────────────────────
+app.get('/ml/ventas', async (req, res) => {
+  try {
+    const { desde, hasta, limit = 200 } = req.query;
+    let q = `order=fecha.desc&limit=${limit}`;
+    if (desde) q += `&fecha=gte.${desde}`;
+    if (hasta) q += `&fecha=lte.${hasta}`;
+    const ventas = await sbGet('ventas_ml', q);
+    const stats = {
+      total: ventas.length,
+      ingreso_bruto: ventas.reduce((s,v) => s + (parseFloat(v.ingreso_bruto)||0), 0),
+      comisiones: ventas.reduce((s,v) => s + (parseFloat(v.comision_ml)||0), 0),
+      neto: ventas.reduce((s,v) => s + (parseFloat(v.neto_mp)||0), 0),
+      conciliadas: ventas.filter(v => v.conciliado).length
+    };
+    res.json({ ok: true, ventas, stats });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── MERCADO LIBRE — Sync ventas ──────────────────────────────────────
 async function syncMLVentas(diasAtras = 7) {
   if (!ML.access) throw new Error('ML no autenticado. Conectá ML primero desde la app.');
@@ -223,15 +255,8 @@ async function syncMLVentas(diasAtras = 7) {
   } while (offset < total);
 
   console.log(`✓ ML sync: ${insertados} órdenes (${desde} → hoy)`);
-  return { insertados, desde };
+  return { insertados, nuevas: insertados, desde };
 }
-
-app.post('/ml/sync', async (req, res) => {
-  try {
-    const result = await syncMLVentas(req.body?.dias || 7);
-    res.json({ ok: true, ...result });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
 
 // ── MERCADO PAGO — Parseo extracto XLSX ─────────────────────────────
 app.post('/mp/extracto', upload.single('file'), async (req, res) => {
