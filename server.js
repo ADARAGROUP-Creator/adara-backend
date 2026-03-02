@@ -54,7 +54,10 @@ async function sb(method, table, body, query = '') {
 }
 
 const sbGet    = (t, q)    => sb('GET',   t, null, q);
-const sbUpsert = (t, body) => sb('POST',  t, body);
+const sbUpsert = (t, body, onConflict) => {
+  const q = onConflict ? `on_conflict=${onConflict}` : '';
+  return sb('POST', t, body, q);
+};
 const sbPatch  = (t, q, b) => sb('PATCH', t, b, q);
 
 // ─── Token Mercado Libre (se persiste en Supabase) ──────────────────
@@ -177,86 +180,148 @@ app.get('/ml/status', (_, res) => res.json({
   expira_en:  ML.expires ? Math.round((ML.expires - Date.now()) / 60000) + ' min' : 'n/a'
 }));
 
-// ── MERCADO LIBRE — Sync manual ─────────────────────────────────────
-app.post('/ml/sync', async (req, res) => {
-  try {
-    const dias = parseInt(req.query.dias) || 30;
-    if (!ML.access) return res.status(400).json({ error: 'ML no conectado. Conectá primero desde Configuración.' });
-    const result = await syncMLVentas(dias);
-    res.json({ ok: true, ...result });
-  } catch (e) {
-    console.error('ML sync manual:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ── MERCADO LIBRE — Resumen de ventas ───────────────────────────────
-app.get('/ml/ventas', async (req, res) => {
-  try {
-    const { desde, hasta, limit = 200 } = req.query;
-    let q = `order=fecha.desc&limit=${limit}`;
-    if (desde) q += `&fecha=gte.${desde}`;
-    if (hasta) q += `&fecha=lte.${hasta}`;
-    const ventas = await sbGet('ventas_ml', q);
-    const stats = {
-      total: ventas.length,
-      ingreso_bruto: ventas.reduce((s,v) => s + (parseFloat(v.ingreso_bruto)||0), 0),
-      comisiones: ventas.reduce((s,v) => s + (parseFloat(v.comision_ml)||0), 0),
-      neto: ventas.reduce((s,v) => s + (parseFloat(v.neto_mp)||0), 0),
-      conciliadas: ventas.filter(v => v.conciliado).length
-    };
-    res.json({ ok: true, ventas, stats });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 // ── MERCADO LIBRE — Sync ventas ──────────────────────────────────────
-async function syncMLVentas(diasAtras = 7) {
+async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null) {
   if (!ML.access) throw new Error('ML no autenticado. Conectá ML primero desde la app.');
 
-  const me       = await mlGet('/users/me');
-  const userId   = me.id;
-  const desde    = new Date(Date.now() - diasAtras * 86400000).toISOString().split('T')[0];
-  const lineas   = await sbGet('lineas_negocio', 'activa=eq.true');
-  const linTech  = lineas?.find(l => l.nombre.toLowerCase().includes('tecnol')) || lineas?.[0];
+  const me     = await mlGet('/users/me');
+  const userId = me.id;
 
-  let offset = 0, total = 0, insertados = 0;
+  // Fechas: si se pasan explícitas, usarlas. Si no, usar diasAtras.
+  const desde = fechaDesde || new Date(Date.now() - diasAtras * 86400000).toISOString().split('T')[0];
+  const hasta = fechaHasta || new Date().toISOString().split('T')[0];
 
-  do {
-    const data   = await mlGet(`/orders/search?seller=${userId}&order.date_created.from=${desde}T00:00:00.000-03:00&offset=${offset}&limit=50&sort=date_asc`);
-    total        = data.paging?.total || 0;
-    const orders = data.results || [];
-    if (!orders.length) break;
+  // Cargar maestros para matching de línea por SKU
+  const lineas = await sbGet('lineas_negocio', 'activa=eq.true');
+  const skus   = await sbGet('sku_adara', 'limit=500').catch(() => []) || [];
+  const linDefault = lineas?.find(l => l.nombre.toLowerCase().includes('tecnol')) || lineas?.[0];
 
-    const rows = orders.map(o => {
-      const item    = o.order_items?.[0] || {};
-      const payment = o.payments?.[0]    || {};
-      const bruto   = o.total_amount     || 0;
-      return {
-        ml_order_id:      String(o.id),
-        linea_negocio_id: linTech?.id,
-        fecha:            o.date_created?.split('T')[0],
-        sku_codigo:       item.item?.seller_sku || null,
-        producto_desc:    item.item?.title || '',
-        cantidad:         item.quantity || 1,
-        ingreso_bruto:    bruto,
-        comision_ml:      bruto * 0.1375,
-        iibb:             bruto * 0.015,
-        neto_mp:          bruto * (1 - 0.1375 - 0.015),
-        estado_pago:      payment.status || 'pending',
-        mp_payment_id:    payment.id ? String(payment.id) : null,
-        ml_status:        o.status || 'unknown',
-        conciliado:       false
-      };
+  // Función para matchear SKU → linea_negocio_id
+  function matchLinea(sellerSku, itemTitle) {
+    if (sellerSku) {
+      // 1. Buscar por seller_sku exacto en tabla sku_adara
+      const skuMatch = skus.find(s => s.codigo_adara === sellerSku || s.codigo_ml === sellerSku);
+      if (skuMatch?.linea_negocio_id) return skuMatch.linea_negocio_id;
+    }
+    // 2. Heurística por título del producto
+    const t = (itemTitle || '').toLowerCase();
+    for (const l of (lineas || [])) {
+      const nombre = l.nombre.toLowerCase();
+      if (nombre.includes('mochila') && (t.includes('mochila') || t.includes('bolso') || t.includes('backpack'))) return l.id;
+      if (nombre.includes('vaso')    && (t.includes('vaso')    || t.includes('botella') || t.includes('termo'))) return l.id;
+      if (nombre.includes('luminar') && (t.includes('luminar') || t.includes('lámpara') || t.includes('lampara') || t.includes('led') || t.includes('foco'))) return l.id;
+      if (nombre.includes('tecnol')  && (t.includes('xiaomi')  || t.includes('redmi')   || t.includes('smartwatch') || t.includes('auricular') || t.includes('bluetooth'))) return l.id;
+    }
+    // 3. Default
+    return linDefault?.id || null;
+  }
+
+  // ML API tiene un tope de offset=1000. Para traer más, partimos por rangos de fecha.
+  // Estrategia: iterar por intervalos de 15 días.
+  const dateChunks = [];
+  let chunkStart = new Date(desde);
+  const endDate  = new Date(hasta);
+  while (chunkStart <= endDate) {
+    let chunkEnd = new Date(chunkStart);
+    chunkEnd.setDate(chunkEnd.getDate() + 14); // 15 días por chunk
+    if (chunkEnd > endDate) chunkEnd = new Date(endDate);
+    dateChunks.push({
+      from: chunkStart.toISOString().split('T')[0],
+      to:   chunkEnd.toISOString().split('T')[0]
     });
+    chunkStart = new Date(chunkEnd);
+    chunkStart.setDate(chunkStart.getDate() + 1);
+  }
 
-    await sbUpsert('ventas_ml', rows);
-    insertados += rows.length;
-    offset     += 50;
-  } while (offset < total);
+  let totalInsertados = 0, totalOrdenes = 0;
 
-  console.log(`✓ ML sync: ${insertados} órdenes (${desde} → hoy)`);
-  return { insertados, nuevas: insertados, desde };
+  for (const chunk of dateChunks) {
+    let offset = 0, chunkTotal = 0;
+
+    do {
+      const data = await mlGet(
+        `/orders/search?seller=${userId}` +
+        `&order.date_created.from=${chunk.from}T00:00:00.000-03:00` +
+        `&order.date_created.to=${chunk.to}T23:59:59.999-03:00` +
+        `&offset=${offset}&limit=50&sort=date_asc`
+      );
+      chunkTotal = data.paging?.total || 0;
+      const orders = data.results || [];
+      if (!orders.length) break;
+
+      const rows = orders.map(o => {
+        const item    = o.order_items?.[0] || {};
+        const payment = o.payments?.[0]    || {};
+        const bruto   = o.total_amount     || 0;
+
+        // Comisión REAL desde la API (marketplace_fee), NO hardcodeada
+        const comisionReal = payment.marketplace_fee != null
+          ? Math.abs(payment.marketplace_fee)
+          : (item.sale_fee || bruto * 0.1375); // fallback solo si API no lo trae
+
+        // Costo envío que paga el vendedor
+        const shippingCost = payment.shipping_cost || 0;
+
+        // Neto = lo que realmente recibís
+        const netoMP = bruto - comisionReal - shippingCost;
+
+        // SKU del seller
+        const sellerSku = item.item?.seller_sku || item.item?.seller_custom_field || null;
+
+        // Matchear línea de negocio por SKU o título
+        const lineaId = matchLinea(sellerSku, item.item?.title);
+
+        return {
+          ml_order_id:      String(o.id),
+          linea_negocio_id: lineaId,
+          fecha:            o.date_created?.split('T')[0],
+          sku_codigo:       sellerSku,
+          producto_desc:    item.item?.title || '',
+          cantidad:         item.quantity || 1,
+          ingreso_bruto:    bruto,
+          comision_ml:      comisionReal,
+          envio_ml:         shippingCost,
+          neto_mp:          netoMP,
+          estado_pago:      payment.status || 'pending',
+          mp_payment_id:    payment.id ? String(payment.id) : null,
+          ml_status:        o.status || 'unknown',
+          pack_id:          o.pack_id ? String(o.pack_id) : null,
+          comprador:        o.buyer?.nickname || null,
+          // ⚠ NO incluimos conciliado ni factura_tango — el upsert no debe pisar datos del usuario
+        };
+      });
+
+      // Upsert con on_conflict=ml_order_id para no generar duplicados
+      if (rows.length) {
+        await sbUpsert('ventas_ml', rows, 'ml_order_id');
+        totalInsertados += rows.length;
+      }
+
+      offset += 50;
+      totalOrdenes += orders.length;
+    } while (offset < chunkTotal && offset < 1000);
+
+    // Si hay más de 1000 en este chunk, loguear warning
+    if (chunkTotal > 1000) {
+      console.warn(`⚠ Chunk ${chunk.from}→${chunk.to}: ${chunkTotal} órdenes (>1000). Puede faltar data. Reducir intervalo.`);
+    }
+  }
+
+  console.log(`✓ ML sync: ${totalInsertados} órdenes (${desde} → ${hasta}) en ${dateChunks.length} chunks`);
+  return { insertados: totalInsertados, total: totalOrdenes, desde, hasta, chunks: dateChunks.length };
 }
+
+app.post('/ml/sync', async (req, res) => {
+  try {
+    const { dias, desde, hasta } = { ...req.query, ...req.body };
+    const result = await syncMLVentas(
+      parseInt(dias) || 7,
+      desde || null,
+      hasta || null
+    );
+    res.json({ ok: true, ...result });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ── MERCADO PAGO — Parseo extracto XLSX ─────────────────────────────
 app.post('/mp/extracto', upload.single('file'), async (req, res) => {
@@ -310,10 +375,10 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
       return { fecha, descripcion: desc, tipo_operacion: tipo, categoria, monto_bruto: bruto || null, comision: Math.abs(com), monto_neto: monto, estado, referencia_mp: ref || null, conciliado: false };
     }).filter(Boolean);
 
-    // Upsert por lotes
+    // Upsert por lotes con on_conflict
     let insertados = 0;
     for (let i = 0; i < movs.length; i += 100) {
-      await sbUpsert('movimientos_mp', movs.slice(i, i + 100));
+      await sbUpsert('movimientos_mp', movs.slice(i, i + 100), 'referencia_mp');
       insertados += Math.min(100, movs.length - i);
     }
 
@@ -328,18 +393,37 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
 });
 
 async function autoConciliarMP() {
-  const movs   = await sbGet('movimientos_mp', 'conciliado=eq.false&categoria=eq.venta_ml&limit=500');
-  const ventas = await sbGet('ventas_ml', 'conciliado=eq.false&limit=500');
+  // Traer movimientos MP no conciliados de tipo venta
+  const movs   = await sbGet('movimientos_mp', 'conciliado=eq.false&categoria=eq.venta_ml&limit=2000');
+  // Traer TODAS las ventas ML no conciliadas (pueden ser muchas por packs)
+  const ventas = await sbGet('ventas_ml', 'conciliado=eq.false&limit=5000');
   let n = 0;
+
   for (const mov of (movs || [])) {
-    const match = (ventas || []).find(v => v.mp_payment_id && mov.referencia_mp?.includes(v.mp_payment_id));
-    if (match) {
-      await sbPatch('movimientos_mp', `id=eq.${mov.id}`, { conciliado: true, venta_ml_id: match.id });
-      await sbPatch('ventas_ml', `id=eq.${match.id}`, { conciliado: true });
+    if (!mov.referencia_mp) continue;
+
+    // Buscar TODAS las ventas con este payment_id (packs = varias ventas, 1 payment)
+    const matches = (ventas || []).filter(v =>
+      v.mp_payment_id && mov.referencia_mp.includes(v.mp_payment_id)
+    );
+
+    if (matches.length > 0) {
+      // Marcar movimiento MP como conciliado
+      await sbPatch('movimientos_mp', `id=eq.${mov.id}`, {
+        conciliado: true,
+        venta_ml_id: matches[0].id // link a la primera del pack
+      });
+
+      // Marcar TODAS las ventas ML del pack como conciliadas
+      for (const match of matches) {
+        await sbPatch('ventas_ml', `id=eq.${match.id}`, { conciliado: true });
+        match.conciliado = true; // evitar re-match en el mismo loop
+      }
       n++;
     }
   }
-  console.log(`✓ Auto-conciliación MP: ${n} movimientos`);
+
+  console.log(`✓ Auto-conciliación MP: ${n} movimientos → ${(ventas||[]).filter(v=>v.conciliado).length} ventas`);
   return n;
 }
 
@@ -464,7 +548,7 @@ app.get('/tango/sync', async (req, res) => {
       grabado:          f.Grabado || false
     }));
 
-    await sbUpsert('facturas_tango', rows);
+    await sbUpsert('facturas_tango', rows, 'movimiento_id');
 
     // Intentar cruzar con ventas ML por número de factura
     let cruzadas = 0;
