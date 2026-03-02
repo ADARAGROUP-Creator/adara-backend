@@ -330,62 +330,177 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
 
     const wb   = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
     const ws   = wb.Sheets[wb.SheetNames[0]];
-    const rows = XLSX.utils.sheet_to_json(ws, { defval: null });
-    if (!rows.length) return res.status(400).json({ error: 'El archivo está vacío' });
+    
+    // ─── Detectar formato del archivo ─────────────────────────────
+    // MP tiene múltiples formatos de reporte. Buscamos la fila de headers.
+    const allRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
+    if (!allRows.length) return res.status(400).json({ error: 'El archivo está vacío' });
 
-    // Detectar columnas (MP cambia los nombres según el tipo de reporte)
-    const col = (r, ...opts) => {
-      const keys = Object.keys(r);
-      for (const opt of opts) {
-        const found = keys.find(k => k.toLowerCase().includes(opt.toLowerCase()));
-        if (found) return found;
+    // Buscar la fila que contiene los headers reales
+    let headerRow = -1;
+    let headerCols = {};
+    
+    for (let i = 0; i < Math.min(allRows.length, 15); i++) {
+      const row = (allRows[i] || []).map(c => String(c || '').trim().toUpperCase());
+      const joined = row.join('|');
+      
+      // Formato Account Statement: RELEASE_DATE, TRANSACTION_TYPE, REFERENCE_ID, TRANSACTION_NET_AMOUNT
+      if (joined.includes('RELEASE_DATE') || joined.includes('REFERENCE_ID')) {
+        headerRow = i;
+        headerCols = {
+          fecha: row.findIndex(c => c.includes('RELEASE_DATE') || c.includes('DATE')),
+          tipo:  row.findIndex(c => c.includes('TRANSACTION_TYPE') || c.includes('TYPE')),
+          ref:   row.findIndex(c => c.includes('REFERENCE_ID') || c.includes('REFERENCE')),
+          neto:  row.findIndex(c => c.includes('NET_AMOUNT') || c.includes('TRANSACTION_NET')),
+          saldo: row.findIndex(c => c.includes('BALANCE') || c.includes('PARTIAL')),
+        };
+        headerCols.format = 'account_statement';
+        break;
       }
-      return null;
+      
+      // Formato detallado viejo: tiene columnas como descripción, bruto, comisión
+      if (joined.includes('FECHA') && (joined.includes('MONTO') || joined.includes('DESCRIPCI'))) {
+        headerRow = i;
+        headerCols = {
+          fecha: row.findIndex(c => c.includes('FECHA') || c.includes('DATE')),
+          tipo:  row.findIndex(c => c.includes('TIPO') || c.includes('OPERACI')),
+          desc:  row.findIndex(c => c.includes('DESCRIPCI') || c.includes('CONCEPTO') || c.includes('DETALLE')),
+          neto:  row.findIndex(c => c.includes('MONTO') || c.includes('NETO') || c.includes('AMOUNT')),
+          bruto: row.findIndex(c => c.includes('BRUTO') || c.includes('INGRESADO') || c.includes('GROSS')),
+          com:   row.findIndex(c => c.includes('COMISI') || c.includes('COMMISSION') || c.includes('CARGO')),
+          ref:   row.findIndex(c => c.includes('REFERENCIA') || c.includes('NRO DE REF') || c.includes('ID OPERAC') || c.includes('REFERENCE')),
+          estado:row.findIndex(c => c.includes('ESTADO') || c.includes('STATUS')),
+        };
+        headerCols.format = 'detailed';
+        break;
+      }
+    }
+
+    if (headerRow < 0) {
+      return res.status(400).json({ 
+        error: 'No reconozco el formato del archivo. Headers encontrados: ' + 
+               JSON.stringify(allRows.slice(0, 5).map(r => (r||[]).slice(0,5)))
+      });
+    }
+
+    console.log(`MP extracto: formato=${headerCols.format}, headerRow=${headerRow}, cols=`, headerCols);
+
+    // ─── Parsear números argentinos (23.142,34 → 23142.34) ────────
+    const parseARS = (v) => {
+      if (v == null) return 0;
+      if (typeof v === 'number') return v;
+      const s = String(v).replace(/\s/g, '').replace(/\./g, '').replace(',', '.');
+      return parseFloat(s) || 0;
     };
-    const s = rows[0];
-    const cFecha  = col(s, 'fecha', 'date');
-    const cDesc   = col(s, 'descripción', 'descripcion', 'concepto', 'detalle');
-    const cTipo   = col(s, 'tipo de operación', 'tipo de opera', 'tipo');
-    const cMonto  = col(s, 'monto', 'amount', 'neto', 'total');
-    const cBruto  = col(s, 'dinero ingresado', 'bruto', 'gross');
-    const cCom    = col(s, 'comisión', 'commission', 'cargo mp');
-    const cRef    = col(s, 'referencia', 'nro de referencia', 'id operac', 'reference');
-    const cEstado = col(s, 'estado', 'status');
 
-    const movs = rows.map(row => {
-      const fecha_raw = row[cFecha];
-      if (!fecha_raw) return null;
-      const fecha   = fecha_raw instanceof Date ? fecha_raw.toISOString().split('T')[0] : String(fecha_raw).substring(0, 10);
-      const desc    = String(row[cDesc]  || '').trim();
-      const tipo    = String(row[cTipo]  || '').toLowerCase();
-      const monto   = parseFloat(String(row[cMonto]  || 0).replace(/\./g, '').replace(',', '.')) || 0;
-      const bruto   = parseFloat(String(row[cBruto]  || 0).replace(/\./g, '').replace(',', '.')) || 0;
-      const com     = parseFloat(String(row[cCom]    || 0).replace(/\./g, '').replace(',', '.')) || 0;
-      const ref     = String(row[cRef]   || '').trim();
-      const estado  = String(row[cEstado]|| '').toLowerCase();
+    // ─── Parsear fecha (DD-MM-YYYY o DD/MM/YYYY → YYYY-MM-DD) ────
+    const parseFecha = (v) => {
+      if (!v) return null;
+      if (v instanceof Date) return v.toISOString().split('T')[0];
+      const s = String(v).trim();
+      // DD-MM-YYYY or DD/MM/YYYY
+      const m = s.match(/^(\d{2})[-\/](\d{2})[-\/](\d{4})/);
+      if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+      // YYYY-MM-DD
+      const m2 = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (m2) return `${m2[1]}-${m2[2]}-${m2[3]}`;
+      // Excel serial number
+      if (typeof v === 'number' && v > 40000) {
+        return new Date(Math.round((v - 25569) * 86400000)).toISOString().split('T')[0];
+      }
+      return s.substring(0, 10);
+    };
 
-      let categoria = 'otro';
-      if (tipo.includes('venta') || desc.toLowerCase().includes('mercado libre')) categoria = 'venta_ml';
-      else if (tipo.includes('retiro') || tipo.includes('transfer'))              categoria = 'retiro';
-      else if (tipo.includes('reembolso') || tipo.includes('devoluc'))            categoria = 'devolucion';
-      else if (tipo.includes('impuesto') || desc.toLowerCase().includes('percep'))categoria = 'impuesto';
-      else if (tipo.includes('comisión') || tipo.includes('cargo'))               categoria = 'comision';
-      else if (tipo.includes('qr') || tipo.includes('cobro'))                     categoria = 'cobro_qr';
+    // ─── Categorizar tipo de movimiento ───────────────────────────
+    const categorizarTipo = (tipo) => {
+      const t = (tipo || '').toLowerCase();
+      if (t.includes('liquidación de dinero') && !t.includes('cancelada'))  return 'venta_ml';
+      if (t.includes('liquidación') && t.includes('cancelada'))             return 'venta_cancelada';
+      if (t.includes('bonificación'))                                       return 'bonificacion_envio';
+      if (t.includes('devolución'))                                         return 'devolucion';
+      if (t.includes('transferencia enviada') || t.includes('transferencia programada')) return 'transferencia_salida';
+      if (t.includes('transferencia recibida') || t.includes('entrada'))    return 'transferencia_entrada';
+      if (t.includes('débito'))                                             return 'debito';
+      if (t.includes('rendimiento'))                                        return 'rendimiento';
+      if (t.includes('impuesto'))                                           return 'impuesto';
+      if (t.includes('dinero retenido'))                                    return 'retencion';
+      if (t.includes('dinero recibido'))                                    return 'dinero_recibido';
+      if (t.includes('pago') || t.includes('compra'))                       return 'pago';
+      return 'otro';
+    };
 
-      return { fecha, descripcion: desc, tipo_operacion: tipo, categoria, monto_bruto: bruto || null, comision: Math.abs(com), monto_neto: monto, estado, referencia_mp: ref || null, conciliado: false };
-    }).filter(Boolean);
+    // ─── Iterar filas de datos ────────────────────────────────────
+    const movs = [];
+    for (let i = headerRow + 1; i < allRows.length; i++) {
+      const row = allRows[i] || [];
+      
+      const fecha = parseFecha(row[headerCols.fecha]);
+      if (!fecha) continue; // skip empty rows
+      
+      const tipo = String(row[headerCols.tipo] || '').trim();
+      if (!tipo) continue;
+      
+      const ref  = String(row[headerCols.ref] || '').trim();
+      const neto = parseARS(row[headerCols.neto]);
+      const categoria = categorizarTipo(tipo);
 
-    // Upsert por lotes con on_conflict
+      // Para formato account_statement, no hay bruto/comisión separados
+      const bruto = headerCols.format === 'detailed' && headerCols.bruto >= 0
+        ? parseARS(row[headerCols.bruto]) : null;
+      const com = headerCols.format === 'detailed' && headerCols.com >= 0
+        ? Math.abs(parseARS(row[headerCols.com])) : 0;
+
+      movs.push({
+        fecha,
+        descripcion: tipo,  // en account_statement el tipo ES la descripción
+        tipo_operacion: categoria,
+        categoria,
+        monto_bruto: bruto,
+        comision: com,
+        monto_neto: neto,
+        estado: 'approved',
+        referencia_mp: ref || null,
+        conciliado: false
+      });
+    }
+
+    console.log(`MP extracto: ${movs.length} movimientos parseados, ${movs.filter(m => m.categoria === 'venta_ml').length} liquidaciones`);
+
+    if (!movs.length) {
+      return res.status(400).json({ error: 'No se encontraron movimientos válidos en el archivo' });
+    }
+
+    // ─── Insertar en Supabase (sin on_conflict porque no hay PK única en referencia_mp, puede repetir) ────
+    // Primero limpiamos movimientos previos del mismo período para evitar duplicados
+    const fechaMin = movs.reduce((min, m) => m.fecha < min ? m.fecha : min, movs[0].fecha);
+    const fechaMax = movs.reduce((max, m) => m.fecha > max ? m.fecha : max, movs[0].fecha);
+    
+    // Delete previos del mismo rango
+    try {
+      await sb('DELETE', 'movimientos_mp', null, `fecha=gte.${fechaMin}&fecha=lte.${fechaMax}`);
+      console.log(`MP extracto: borrados movimientos previos ${fechaMin} → ${fechaMax}`);
+    } catch(e) { console.warn('Delete previos:', e.message); }
+
+    // Insertar todos
     let insertados = 0;
     for (let i = 0; i < movs.length; i += 100) {
-      await sbUpsert('movimientos_mp', movs.slice(i, i + 100), 'referencia_mp');
-      insertados += Math.min(100, movs.length - i);
+      const batch = movs.slice(i, i + 100);
+      await sb('POST', 'movimientos_mp', batch);
+      insertados += batch.length;
     }
 
     // Auto-conciliar con ventas ML
     const conciliados = await autoConciliarMP();
 
-    res.json({ ok: true, total: movs.length, insertados, conciliados_automaticamente: conciliados });
+    res.json({ 
+      ok: true, 
+      formato: headerCols.format,
+      total: movs.length, 
+      liquidaciones: movs.filter(m => m.categoria === 'venta_ml').length,
+      insertados, 
+      conciliados_automaticamente: conciliados,
+      periodo: `${fechaMin} → ${fechaMax}`
+    });
   } catch (e) {
     console.error('MP extracto:', e);
     res.status(500).json({ error: e.message });
@@ -393,38 +508,48 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
 });
 
 async function autoConciliarMP() {
-  // Traer movimientos MP no conciliados de tipo venta
-  const movs   = await sbGet('movimientos_mp', 'conciliado=eq.false&categoria=eq.venta_ml&limit=2000');
-  // Traer TODAS las ventas ML no conciliadas (pueden ser muchas por packs)
+  // Traer movimientos MP tipo venta no conciliados
+  const movs   = await sbGet('movimientos_mp', 'conciliado=eq.false&categoria=eq.venta_ml&limit=5000');
+  // Traer TODAS las ventas ML no conciliadas
   const ventas = await sbGet('ventas_ml', 'conciliado=eq.false&limit=5000');
-  let n = 0;
+  let nMovs = 0, nVentas = 0;
+
+  // Crear índice de ventas por mp_payment_id para lookup rápido
+  const ventasByPayment = {};
+  for (const v of (ventas || [])) {
+    if (v.mp_payment_id) {
+      if (!ventasByPayment[v.mp_payment_id]) ventasByPayment[v.mp_payment_id] = [];
+      ventasByPayment[v.mp_payment_id].push(v);
+    }
+  }
 
   for (const mov of (movs || [])) {
     if (!mov.referencia_mp) continue;
 
-    // Buscar TODAS las ventas con este payment_id (packs = varias ventas, 1 payment)
-    const matches = (ventas || []).filter(v =>
-      v.mp_payment_id && mov.referencia_mp.includes(v.mp_payment_id)
-    );
+    // Buscar ventas con este payment_id (exacto)
+    const matches = ventasByPayment[mov.referencia_mp] || [];
 
     if (matches.length > 0) {
       // Marcar movimiento MP como conciliado
       await sbPatch('movimientos_mp', `id=eq.${mov.id}`, {
         conciliado: true,
-        venta_ml_id: matches[0].id // link a la primera del pack
+        venta_ml_id: matches[0].id
       });
 
       // Marcar TODAS las ventas ML del pack como conciliadas
       for (const match of matches) {
-        await sbPatch('ventas_ml', `id=eq.${match.id}`, { conciliado: true });
-        match.conciliado = true; // evitar re-match en el mismo loop
+        if (!match.conciliado) {
+          await sbPatch('ventas_ml', `id=eq.${match.id}`, { conciliado: true });
+          match.conciliado = true;
+          nVentas++;
+        }
       }
-      n++;
+      nMovs++;
     }
   }
 
-  console.log(`✓ Auto-conciliación MP: ${n} movimientos → ${(ventas||[]).filter(v=>v.conciliado).length} ventas`);
-  return n;
+  console.log(`✓ Auto-conciliación MP: ${nMovs} movimientos → ${nVentas} ventas ML`);
+  return { movimientos: nMovs, ventas: nVentas };
 }
 
 app.post('/mp/conciliar', async (_, res) => {
