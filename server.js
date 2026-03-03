@@ -755,18 +755,18 @@ app.listen(PORT, async () => {
   await loadMLToken();
 });
 
-
 app.get('/ml/debug-payment', async (req, res) => {
   try {
-    const paymentId = '143663300901';
-    const data = await mlGet('/v1/payments/' + paymentId);
+    const data = await mlGet('/collections/143663300901');
     res.json({
       taxes_amount: data.taxes_amount,
       fee_details: data.fee_details,
       net_received_amount: data.net_received_amount,
       marketplace_fee: data.marketplace_fee,
       charges_details: data.charges_details,
-      transaction_details: data.transaction_details
+      transaction_details: data.transaction_details,
+      finance_charge: data.finance_charge,
+      all_keys: Object.keys(data)
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
