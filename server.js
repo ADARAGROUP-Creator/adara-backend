@@ -755,10 +755,12 @@ app.listen(PORT, async () => {
   await loadMLToken();
 });
 
-app.get('/ml/debug-order/:id', async (req, res) => {
+app.get('/ml/debug-order', async (req, res) => {
   try {
     const me = await mlGet('/users/me');
-    const data = await mlGet(`/orders/search?seller=${me.id}&q=${req.params.id}&limit=1`);
+    const data = await mlGet(
+      `/orders/search?seller=${me.id}&order.date_created.from=2026-01-30T00:00:00.000-03:00&order.date_created.to=2026-01-31T23:59:59.999-03:00&limit=1&sort=date_desc`
+    );
     const order = data.results?.[0];
     if (!order) return res.json({ error: 'No encontrada' });
     const payment = order.payments?.[0] || {};
@@ -770,8 +772,14 @@ app.get('/ml/debug-order/:id', async (req, res) => {
       net_received_amount: payment.net_received_amount,
       marketplace_fee: payment.marketplace_fee,
       shipping_cost: payment.shipping_cost,
-      amount_refunded: payment.amount_refunded,
+      coupon_amount: payment.coupon_amount,
       all_payment_keys: Object.keys(payment),
+      full_payment: payment,
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
+```
+
+Deployá y abrí:
+```
+https://adara-backend-production.up.railway.app/ml/debug-order
