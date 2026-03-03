@@ -765,3 +765,18 @@ app.get('/ml/debug-order', async (req, res) => {
     res.json({ order_id: order.id, total_amount: order.total_amount, taxes_amount: payment.taxes_amount, fee_details: payment.fee_details, net_received_amount: payment.net_received_amount, marketplace_fee: payment.marketplace_fee, shipping_cost: payment.shipping_cost, all_payment_keys: Object.keys(payment), full_payment: payment });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
+
+app.get('/ml/debug-payment', async (req, res) => {
+  try {
+    const paymentId = '143663300901';
+    const data = await mlGet('/v1/payments/' + paymentId);
+    res.json({
+      taxes_amount: data.taxes_amount,
+      fee_details: data.fee_details,
+      net_received_amount: data.net_received_amount,
+      marketplace_fee: data.marketplace_fee,
+      charges_details: data.charges_details,
+      transaction_details: data.transaction_details
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
