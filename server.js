@@ -757,15 +757,20 @@ app.listen(PORT, async () => {
 
 app.get('/ml/debug-order/:id', async (req, res) => {
   try {
-    const order = await mlGet(`/orders/${req.params.id}`);
+    const me = await mlGet('/users/me');
+    const data = await mlGet(`/orders/search?seller=${me.id}&q=${req.params.id}&limit=1`);
+    const order = data.results?.[0];
+    if (!order) return res.json({ error: 'No encontrada' });
     const payment = order.payments?.[0] || {};
     res.json({
+      order_id: order.id,
+      total_amount: order.total_amount,
       taxes_amount: payment.taxes_amount,
       fee_details: payment.fee_details,
-      total_amount: payment.total_amount,
       net_received_amount: payment.net_received_amount,
       marketplace_fee: payment.marketplace_fee,
       shipping_cost: payment.shipping_cost,
+      amount_refunded: payment.amount_refunded,
       all_payment_keys: Object.keys(payment),
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
