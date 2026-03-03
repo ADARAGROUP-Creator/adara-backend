@@ -754,3 +754,19 @@ app.listen(PORT, async () => {
   console.log(`   Tango    : ${TF_APP_KEY    ? '✓' : '✗ FALTA variable TF_APP_KEY (opcional)'}`);
   await loadMLToken();
 });
+
+app.get('/ml/debug-order/:id', async (req, res) => {
+  try {
+    const order = await mlGet(`/orders/${req.params.id}`);
+    const payment = order.payments?.[0] || {};
+    res.json({
+      taxes_amount: payment.taxes_amount,
+      fee_details: payment.fee_details,
+      total_amount: payment.total_amount,
+      net_received_amount: payment.net_received_amount,
+      marketplace_fee: payment.marketplace_fee,
+      shipping_cost: payment.shipping_cost,
+      all_payment_keys: Object.keys(payment),
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
