@@ -780,6 +780,3 @@ app.get('/ml/debug-order', async (req, res) => {
 });
 ```
 
-Deployá y abrí:
-```
-https://adara-backend-production.up.railway.app/ml/debug-order
