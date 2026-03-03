@@ -759,14 +759,17 @@ app.get('/ml/debug-payment', async (req, res) => {
   try {
     const data = await mlGet('/collections/143663300901');
     res.json({
-      taxes_amount: data.taxes_amount,
-      fee_details: data.fee_details,
+      transaction_amount: data.transaction_amount,
       net_received_amount: data.net_received_amount,
+      mercadopago_fee: data.mercadopago_fee,
       marketplace_fee: data.marketplace_fee,
-      charges_details: data.charges_details,
-      transaction_details: data.transaction_details,
-      finance_charge: data.finance_charge,
-      all_keys: Object.keys(data)
+      finance_fee: data.finance_fee,
+      discount_fee: data.discount_fee,
+      coupon_fee: data.coupon_fee,
+      shipping_cost: data.shipping_cost,
+      taxes_amount: data.taxes_amount,
+      installments: data.installments,
+      diferencia: data.transaction_amount - data.net_received_amount - (data.mercadopago_fee||0) - (data.finance_fee||0) - (data.shipping_cost||0)
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
