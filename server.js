@@ -251,72 +251,76 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
 
       const rows = [];
 
-      for (const o of orders) {
+      // Build base rows from orders
+      const orderData = orders.map(o => {
         const item    = o.order_items?.[0] || {};
         const payment = o.payments?.[0]    || {};
         const bruto   = o.total_amount     || 0;
         const fechaVenta = o.date_created?.split('T')[0];
 
-        // Comisión REAL desde la API (marketplace_fee), NO hardcodeada
         const comisionReal = payment.marketplace_fee != null
           ? Math.abs(payment.marketplace_fee)
           : (item.sale_fee || bruto * 0.1375);
 
-        // Costo envío que paga el vendedor
         const shippingCost = payment.shipping_cost || 0;
-
-        // Costo financiero (cuotas)
         const financingFee = payment.fee_details?.find(f => f.type === 'financing_fee')?.amount || 0;
-
-        // Impuestos
         const taxes = payment.taxes_amount || 0;
-
-        // Neto = lo que realmente recibís
         const porCobrar = payment.net_received_amount || (bruto - comisionReal - shippingCost - financingFee - taxes);
-
-        // SKU del seller
         const sellerSku = item.item?.seller_sku || item.item?.seller_custom_field || null;
-
-        // Matchear línea de negocio por SKU o título
         const lineaId = matchLinea(sellerSku, item.item?.title);
-
-        // Cancelación
         const motivoCancelacion = o.status === 'cancelled'
-          ? (o.cancel_detail?.reason || o.status_detail || null)
-          : null;
-
-        // Monto devuelto
+          ? (o.cancel_detail?.reason || o.status_detail || null) : null;
         const montoDevuelto = payment.amount_refunded || 0;
 
-        rows.push({
-          ml_order_id:      String(o.id),
-          periodo:          fechaVenta ? fechaVenta.substring(0, 7) : null,
-          fecha:            fechaVenta,
-          titulo:           item.item?.title || '',
-          sku:              sellerSku,
-          cantidad:         item.quantity || 1,
-          importe_bruto:    bruto,
-          cargo_venta:      -Math.abs(comisionReal),
-          cargo_envio:      -Math.abs(shippingCost),
-          costo_financiero: -Math.abs(financingFee),
-          impuestos:        -Math.abs(taxes),
-          por_cobrar:       porCobrar,
-          mp_payment_id:    payment.id ? String(payment.id) : null,
-          ml_status:        o.status || 'unknown',
-          motivo_cancelacion: motivoCancelacion,
-          monto_devuelto:   montoDevuelto,
-          pack_id:          o.pack_id ? String(o.pack_id) : null,
-          linea_negocio_id: lineaId,
-          _shipping_id:     o.shipping?.id || null,  // temp: for enrichment
-        });
-      }
-
-      // Save shipping IDs for enrichment, remove temp field before DB insert
-      const dbRows = rows.map(r => {
-        const { _shipping_id, ...row } = r;
-        return row;
+        return {
+          shippingId: o.shipping?.id || null,
+          row: {
+            ml_order_id:      String(o.id),
+            periodo:          fechaVenta ? fechaVenta.substring(0, 7) : null,
+            fecha:            fechaVenta,
+            titulo:           item.item?.title || '',
+            sku:              sellerSku,
+            cantidad:         item.quantity || 1,
+            importe_bruto:    bruto,
+            cargo_venta:      -Math.abs(comisionReal),
+            cargo_envio:      -Math.abs(shippingCost),
+            costo_financiero: -Math.abs(financingFee),
+            impuestos:        -Math.abs(taxes),
+            por_cobrar:       porCobrar,
+            mp_payment_id:    payment.id ? String(payment.id) : null,
+            ml_status:        o.status || 'unknown',
+            motivo_cancelacion: motivoCancelacion,
+            monto_devuelto:   montoDevuelto,
+            pack_id:          o.pack_id ? String(o.pack_id) : null,
+            linea_negocio_id: lineaId,
+            tipo_envio:       null,
+            fecha_entrega:    null,
+            ciudad_destino:   null,
+            enviado:          false,
+          }
+        };
       });
 
+      // Fetch shipment data in parallel (batches of 10)
+      const PARALLEL = 10;
+      for (let i = 0; i < orderData.length; i += PARALLEL) {
+        const batch = orderData.slice(i, i + PARALLEL);
+        await Promise.all(batch.map(async ({ shippingId, row }) => {
+          if (!shippingId) return;
+          try {
+            const ship = await mlGet(`/shipments/${shippingId}`);
+            row.tipo_envio = ship.logistic_type === 'self_service' ? 'flex'
+              : ship.logistic_type === 'fulfillment' ? 'fulfillment'
+              : ship.logistic_type === 'xd_drop_off' ? 'colecta'
+              : ship.logistic_type || 'otro';
+            row.fecha_entrega = ship.status_history?.date_delivered?.split('T')[0] || null;
+            row.ciudad_destino = ship.receiver_address?.city?.name || ship.receiver_address?.city || null;
+            row.enviado = ship.status === 'delivered';
+          } catch (e) { row.tipo_envio = 'otro'; }
+        }));
+      }
+
+      const dbRows = orderData.map(d => d.row);
       if (dbRows.length) {
         await sbUpsert('ventas_ml', dbRows, 'ml_order_id');
         totalInsertados += dbRows.length;
@@ -345,55 +349,6 @@ app.post('/ml/sync', async (req, res) => {
       hasta || null
     );
     res.json({ ok: true, ...result });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── ML — Enriquecer ventas con datos de envío (tipo, fecha entrega, ciudad) ──
-app.post('/ml/enrich', async (req, res) => {
-  try {
-    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
-    const me = await mlGet('/users/me');
-    const userId = me.id;
-
-    // Get orders without shipment data (max 50 per call)
-    const ventas = await sbGet('ventas_ml', 'tipo_envio=is.null&ml_status=neq.cancelled&select=id,ml_order_id&limit=50&order=fecha.desc');
-    if (!ventas?.length) return res.json({ ok: true, enriched: 0, remaining: 0 });
-
-    let enriched = 0;
-    for (const v of ventas) {
-      try {
-        // Get order to find shipping_id
-        const order = await mlGet(`/orders/${v.ml_order_id}`);
-        const shippingId = order?.shipping?.id;
-        if (!shippingId) continue;
-
-        const ship = await mlGet(`/shipments/${shippingId}`);
-        const tipoEnvio = ship.logistic_type === 'self_service' ? 'flex'
-          : ship.logistic_type === 'fulfillment' ? 'fulfillment'
-          : ship.logistic_type === 'xd_drop_off' ? 'colecta'
-          : ship.logistic_type || 'otro';
-        const fechaEntrega = ship.status_history?.date_delivered?.split('T')[0] || null;
-        const ciudadDestino = ship.receiver_address?.city?.name || ship.receiver_address?.city || null;
-        const enviado = ship.status === 'delivered';
-
-        await sbPatch('ventas_ml', `id=eq.${v.id}`, {
-          tipo_envio: tipoEnvio, fecha_entrega: fechaEntrega,
-          ciudad_destino: ciudadDestino, enviado
-        });
-        enriched++;
-      } catch (e) {
-        console.warn(`Enrich ${v.ml_order_id}:`, e.message);
-        // Mark as 'otro' to avoid re-processing
-        await sbPatch('ventas_ml', `id=eq.${v.id}`, { tipo_envio: 'otro' }).catch(() => {});
-      }
-    }
-
-    // Count remaining
-    const remaining = await sbGet('ventas_ml', 'tipo_envio=is.null&ml_status=neq.cancelled&select=id&limit=1');
-    const remainCount = remaining?.length ? 'hay más' : 0;
-
-    console.log(`✓ ML enrich: ${enriched}/${ventas.length} enriched`);
-    res.json({ ok: true, enriched, processed: ventas.length, remaining: remainCount });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
