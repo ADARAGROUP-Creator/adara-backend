@@ -757,14 +757,10 @@ app.listen(PORT, async () => {
 
 app.get('/ml/debug-settlement', async (req, res) => {
   try {
-    const data = await mlGet('/v1/account/settlement_report/config');
-    res.json(data);
-  } catch(e) {
-    try {
-      const data2 = await mlGet('/v1/account/bank_report/config');
-      res.json({ bank_report_config: data2 });
-    } catch(e2) {
-      res.json({ error1: e.message, error2: e2.message });
-    }
-  }
+    const r = await fetch('https://api.mercadopago.com/v1/account/settlement_report/config', {
+      headers: { 'Authorization': 'Bearer ' + ML.access }
+    });
+    const data = await r.json();
+    res.json({ status: r.status, data });
+  } catch(e) { res.json({ error: e.message }); }
 });
