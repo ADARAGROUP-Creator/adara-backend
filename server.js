@@ -327,37 +327,50 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             );
           }
 
-          // 2. Collections (neto real)
+          // 2. MP Payment details (real fee breakdown via charges_details)
           if (od.paymentId && od.row.ml_status !== 'cancelled') {
             promises.push(
-              fetch(`https://api.mercadolibre.com/collections/${od.paymentId}`, {
+              fetch(`https://api.mercadopago.com/v1/payments/${od.paymentId}`, {
                 headers: { 'Authorization': 'Bearer ' + ML.access }
-              }).then(r => r.ok ? r.json() : null).then(col => {
-                if (!col || !col.net_received_amount) return;
-                const netoReal = col.net_received_amount;
-                od.row.por_cobrar = netoReal;
+              }).then(r => r.ok ? r.json() : null).then(pay => {
+                if (!pay) return;
 
-                // Calculate: impuestos+financiero = bruto - neto - comisión - envío
-                const comision = Math.abs(od.row.cargo_venta);
-                const envio = Math.abs(od.row.cargo_envio);
-                const totalDeducido = od.bruto - netoReal;
-                const otrosDescuentos = totalDeducido - comision - envio;
+                // Net received
+                if (pay.net_received_amount) od.row.por_cobrar = pay.net_received_amount;
 
-                // Split: estimate financing from installments, rest is taxes
-                const cuotas = col.installments || 1;
-                if (cuotas > 1 && otrosDescuentos > 0) {
-                  // Approx: financing ~ 5-15% of bruto for 3-12 installments
-                  const financingEstimate = Math.min(otrosDescuentos * 0.4, od.bruto * 0.15);
-                  od.row.costo_financiero = -Math.abs(Math.round(financingEstimate));
-                  od.row.impuestos = -Math.abs(Math.round(otrosDescuentos - financingEstimate));
-                } else {
-                  // No installments: all other deductions are taxes
-                  od.row.impuestos = otrosDescuentos > 0 ? -Math.abs(Math.round(otrosDescuentos)) : 0;
+                // Parse charges_details for real breakdown
+                const charges = pay.charges_details || [];
+                let comision = 0, impuestos = 0, envio = 0, financiero = 0;
+
+                for (const ch of charges) {
+                  const amt = ch.amounts?.original || 0;
+                  const name = (ch.name || '').toLowerCase();
+                  const type = (ch.type || '').toLowerCase();
+
+                  if (name.includes('meli_percentage_fee') || name.includes('meli_fee') || name.includes('commission')) {
+                    comision += amt;
+                  } else if (name.includes('tax_withholding') || name.includes('iibb') || name.includes('sirtac') || name.includes('debitos_creditos') || type === 'tax') {
+                    impuestos += amt;
+                  } else if (name.includes('shp_') || name.includes('shipping') || type === 'shipping') {
+                    envio += amt;
+                  } else if (name.includes('financing') || name.includes('interest')) {
+                    financiero += amt;
+                  } else if (name.includes('coupon') || name.includes('rebate')) {
+                    // cupones — no afectan los cargos del vendedor
+                  } else {
+                    // Unknown charge → put in comision as safe default
+                    comision += amt;
+                  }
                 }
 
-                // Mark as conciliado if we got real net
-                if (netoReal > 0) od.row.conciliado = true;
-                od.row.fecha_cobro = col.money_release_date?.split('T')[0] || col.date_approved?.split('T')[0] || null;
+                if (comision > 0) od.row.cargo_venta = -Math.abs(comision);
+                if (impuestos > 0) od.row.impuestos = -Math.abs(impuestos);
+                if (envio > 0) od.row.cargo_envio = -Math.abs(envio);
+                if (financiero > 0) od.row.costo_financiero = -Math.abs(financiero);
+
+                // Conciliation data
+                od.row.fecha_cobro = pay.money_release_date?.split('T')[0] || pay.date_approved?.split('T')[0] || null;
+                if (pay.net_received_amount > 0 && pay.status === 'approved') od.row.conciliado = true;
               }).catch(() => {})
             );
           }
@@ -958,29 +971,4 @@ app.listen(PORT, async () => {
   console.log(`   ML keys  : ${ML_CLIENT_ID  ? '✓' : '✗ FALTA variable ML_CLIENT_ID'}`);
   console.log(`   Tango    : ${TF_APP_KEY    ? '✓' : '✗ FALTA variable TF_APP_KEY (opcional)'}`);
   await loadMLToken();
-});
-
-app.get('/ml/debug-mp-payment', async (req, res) => {
-  try {
-    // Buscar un pago reciente con la API de MP
-    const r = await fetch('https://api.mercadopago.com/v1/payments/search?sort=date_created&criteria=desc&limit=1', {
-      headers: { 'Authorization': 'Bearer ' + ML.access }
-    });
-    const data = await r.json();
-    const payment = data.results?.[0];
-    if (!payment) return res.json({ error: 'No payments found' });
-    res.json({
-      id: payment.id,
-      status: payment.status,
-      transaction_amount: payment.transaction_amount,
-      net_received_amount: payment.net_received_amount,
-      fee_details: payment.fee_details,
-      charges_details: payment.charges_details,
-      taxes_amount: payment.taxes_amount,
-      shipping_amount: payment.shipping_amount,
-      transaction_details: payment.transaction_details,
-      installments: payment.installments,
-      all_keys: Object.keys(payment)
-    });
-  } catch(e) { res.json({ error: e.message }); }
 });
