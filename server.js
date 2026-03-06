@@ -254,7 +254,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
       // Build base rows from orders
       const orderData = orders.map(o => {
         const item    = o.order_items?.[0] || {};
-        const payment = o.payments?.[0]    || {};
+        const payment = o.payments?.find(p => p.status === 'approved') || o.payments?.[0] || {};
         const bruto   = o.total_amount     || 0;
         const fechaVenta = o.date_created?.split('T')[0];
 
@@ -1004,16 +1004,4 @@ app.listen(PORT, async () => {
   console.log(`   ML keys  : ${ML_CLIENT_ID  ? '✓' : '✗ FALTA variable ML_CLIENT_ID'}`);
   console.log(`   Tango    : ${TF_APP_KEY    ? '✓' : '✗ FALTA variable TF_APP_KEY (opcional)'}`);
   await loadMLToken();
-});
-
-// ── DEBUG (temporal) ────────────────────────────────────────────
-app.get('/debug-payment-full/:paymentId', async (req, res) => {
-  try {
-    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
-    const r = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.paymentId}`, {
-      headers: { 'Authorization': 'Bearer ' + ML.access }
-    });
-    if (!r.ok) return res.status(r.status).json({ error: `MP API: ${r.status}` });
-    res.json(await r.json());
-  } catch (e) { res.status(500).json({ error: e.message }); }
 });
