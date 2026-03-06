@@ -959,3 +959,28 @@ app.listen(PORT, async () => {
   console.log(`   Tango    : ${TF_APP_KEY    ? '✓' : '✗ FALTA variable TF_APP_KEY (opcional)'}`);
   await loadMLToken();
 });
+
+app.get('/ml/debug-mp-payment', async (req, res) => {
+  try {
+    // Buscar un pago reciente con la API de MP
+    const r = await fetch('https://api.mercadopago.com/v1/payments/search?sort=date_created&criteria=desc&limit=1', {
+      headers: { 'Authorization': 'Bearer ' + ML.access }
+    });
+    const data = await r.json();
+    const payment = data.results?.[0];
+    if (!payment) return res.json({ error: 'No payments found' });
+    res.json({
+      id: payment.id,
+      status: payment.status,
+      transaction_amount: payment.transaction_amount,
+      net_received_amount: payment.net_received_amount,
+      fee_details: payment.fee_details,
+      charges_details: payment.charges_details,
+      taxes_amount: payment.taxes_amount,
+      shipping_amount: payment.shipping_amount,
+      transaction_details: payment.transaction_details,
+      installments: payment.installments,
+      all_keys: Object.keys(payment)
+    });
+  } catch(e) { res.json({ error: e.message }); }
+});
