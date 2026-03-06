@@ -989,8 +989,4 @@ app.get('/ml/debug-charges/:paymentId', async (req, res) => {
     });
   } catch(e) { res.json({ error: e.message }); }
 });
-```
 
-Deployá y abrí con el payment ID de esa venta Flex (el que se ve en la tabla):
-```
-https://adara-backend-production.up.railway.app/ml/debug-charges/149104535258
