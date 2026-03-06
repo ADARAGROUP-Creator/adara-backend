@@ -358,7 +358,12 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
                   : ship.logistic_type === 'xd_drop_off' ? 'colecta'
                   : ship.logistic_type || 'otro';
                 od.row.fecha_entrega = ship.status_history?.date_delivered?.split('T')[0] || null;
-                od.row.ciudad_destino = ship.receiver_address?.city?.name || ship.receiver_address?.city || null;
+                // Ciudad destino: si es "La Matanza", usar neighborhood para distinguir norte (GBA1) vs sur (GBA2)
+                let ciudad = ship.receiver_address?.city?.name || ship.receiver_address?.city || null;
+                if (ciudad && ciudad.toLowerCase() === 'la matanza' && ship.receiver_address?.neighborhood?.name) {
+                  ciudad = ship.receiver_address.neighborhood.name;
+                }
+                od.row.ciudad_destino = ciudad;
                 od.row.enviado = ship.status === 'delivered';
 
                 // Bonificación Flex: ML devuelve base_cost - list_cost como bonificación
@@ -485,6 +490,39 @@ app.post('/ml/sync', async (req, res) => {
       hasta || null
     );
     res.json({ ok: true, ...result });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DEBUG ENDPOINTS (temporales, para diagnosticar) ──────────────────
+app.get('/debug-payment-full/:paymentId', async (req, res) => {
+  try {
+    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
+    const r = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.paymentId}`, {
+      headers: { 'Authorization': 'Bearer ' + ML.access }
+    });
+    const data = await r.json();
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/debug-order/:orderId', async (req, res) => {
+  try {
+    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
+    const order = await mlGet(`/orders/${req.params.orderId}`);
+    let shipment = null;
+    if (order.shipping?.id) {
+      shipment = await mlGet(`/shipments/${order.shipping.id}`);
+    }
+    res.json({
+      order_id: order.id,
+      status: order.status,
+      shipping_id: order.shipping?.id,
+      receiver_address: shipment?.receiver_address || null,
+      logistic_type: shipment?.logistic_type || null,
+      shipment_status: shipment?.status || null,
+      base_cost: shipment?.base_cost || null,
+      list_cost: shipment?.shipping_option?.list_cost || null
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1048,33 +1086,4 @@ app.listen(PORT, async () => {
   console.log(`   ML keys  : ${ML_CLIENT_ID  ? '✓' : '✗ FALTA variable ML_CLIENT_ID'}`);
   console.log(`   Tango    : ${TF_APP_KEY    ? '✓' : '✗ FALTA variable TF_APP_KEY (opcional)'}`);
   await loadMLToken();
-});
-
-// ── DEBUG (temporales — eliminar en producción) ─────────────────
-app.get('/debug-payment-full/:paymentId', async (req, res) => {
-  try {
-    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
-    const r = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.paymentId}`, {
-      headers: { 'Authorization': 'Bearer ' + ML.access }
-    });
-    if (!r.ok) return res.status(r.status).json({ error: `MP API: ${r.status}` });
-    res.json(await r.json());
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/debug-order/:orderId', async (req, res) => {
-  try {
-    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
-    const order = await mlGet(`/orders/${req.params.orderId}`);
-    const shipId = order.shipping?.id;
-    let shipment = null;
-    if (shipId) shipment = await mlGet(`/shipments/${shipId}`).catch(() => null);
-    // Devolver shipment completo para ver neighborhood, zip_code, etc
-    res.json({
-      order_id: order.id,
-      shipping_id: shipId,
-      receiver_address: shipment?.receiver_address,
-      logistic_type: shipment?.logistic_type
-    });
-  } catch (e) { res.status(500).json({ error: e.message }); }
 });
