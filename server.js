@@ -181,6 +181,38 @@ app.get('/ml/status', (_, res) => res.json({
 }));
 
 // ── MERCADO LIBRE — Sync ventas ──────────────────────────────────────
+
+// Calcular fecha de despacho Flex según reglas de MEF:
+// - Lun a Vie antes de 12:00 → mismo día
+// - Lun a Vie después de 12:00 → siguiente día hábil
+// - Viernes después de 12:00 → lunes
+// - Sábado y domingo → lunes
+function calcFechaDespachoFlex(fechaISO, horaStr) {
+  if (!fechaISO) return null;
+  const d = new Date(fechaISO + 'T' + (horaStr || '12:00:00'));
+  const dia = d.getDay(); // 0=dom, 1=lun, ..., 5=vie, 6=sab
+  const hora = d.getHours();
+
+  if (dia === 0) {
+    // Domingo → lunes
+    d.setDate(d.getDate() + 1);
+  } else if (dia === 6) {
+    // Sábado → lunes
+    d.setDate(d.getDate() + 2);
+  } else if (hora >= 12) {
+    // Lun-Vie después de 12:00 → siguiente día hábil
+    if (dia === 5) {
+      // Viernes → lunes
+      d.setDate(d.getDate() + 3);
+    } else {
+      d.setDate(d.getDate() + 1);
+    }
+  }
+  // Lun-Vie antes de 12:00 → mismo día (no hace nada)
+
+  return d.toISOString().split('T')[0];
+}
+
 async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null) {
   if (!ML.access) throw new Error('ML no autenticado. Conectá ML primero desde la app.');
 
@@ -257,6 +289,10 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
         const payment = o.payments?.find(p => p.status === 'approved') || o.payments?.[0] || {};
         const bruto   = o.total_amount     || 0;
         const fechaVenta = o.date_created?.split('T')[0];
+        // Extraer hora de venta de ML (viene como "2026-02-26T14:30:00.000-03:00")
+        // Tomamos solo HH:MM:SS (hora Argentina)
+        const horaMatch = o.date_created ? o.date_created.match(/T(\d{2}:\d{2}:\d{2})/) : null;
+        const horaVenta = horaMatch ? horaMatch[1] : null;
 
         const comisionReal = payment.marketplace_fee != null && payment.marketplace_fee !== 0
           ? Math.abs(payment.marketplace_fee)
@@ -296,6 +332,8 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             fecha_entrega:    null,
             ciudad_destino:   null,
             enviado:          false,
+            hora_venta:       horaVenta,
+            fecha_despacho_flex: null,  // se calcula después si es flex
             conciliado:       false,
             fecha_cobro:      null,
           }
@@ -408,6 +446,12 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
               + od.row.cargo_envio
               + od.row.costo_financiero
               + od.row.impuestos;
+          }
+
+          // Calcular fecha de despacho Flex según reglas MEF
+          // (antes de 12hs = mismo día, después = siguiente hábil, finde = lunes)
+          if (od.row.tipo_envio === 'flex') {
+            od.row.fecha_despacho_flex = calcFechaDespachoFlex(od.row.fecha, od.row.hora_venta);
           }
         }));
       }
