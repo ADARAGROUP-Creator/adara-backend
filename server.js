@@ -978,24 +978,33 @@ app.listen(PORT, async () => {
   await loadMLToken();
 });
 
-// ── DEBUG — Ver charges_details de un payment (temporal) ────────
-app.get('/debug-payment/:paymentId', async (req, res) => {
+// ── DEBUG — Ver datos completos de una orden ML (temporal) ──────
+app.get('/debug-order/:orderId', async (req, res) => {
   try {
     if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
-    const r = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.paymentId}`, {
-      headers: { 'Authorization': 'Bearer ' + ML.access }
-    });
-    if (!r.ok) return res.status(r.status).json({ error: `MP API: ${r.status}` });
-    const pay = await r.json();
+    const order = await mlGet(`/orders/${req.params.orderId}`);
+    const shipId = order.shipping?.id;
+    let shipment = null;
+    if (shipId) shipment = await mlGet(`/shipments/${shipId}`).catch(() => null);
     res.json({
-      payment_id: pay.id,
-      status: pay.status,
-      total: pay.transaction_amount,
-      net_received: pay.net_received_amount,
-      charges_details: pay.charges_details,
-      fee_details: pay.fee_details,
-      taxes_amount: pay.taxes_amount,
-      shipping_amount: pay.shipping_amount
+      order_id: order.id,
+      total_amount: order.total_amount,
+      paid_amount: order.paid_amount,
+      payments: order.payments?.map(p => ({
+        id: p.id,
+        total: p.total_paid_amount,
+        marketplace_fee: p.marketplace_fee,
+        shipping_cost: p.shipping_cost,
+        overpaid_amount: p.overpaid_amount,
+        coupon_amount: p.coupon_amount
+      })),
+      shipping_cost: order.shipping?.cost,
+      shipping_id: shipId,
+      shipment_logistic_type: shipment?.logistic_type,
+      shipment_cost: shipment?.shipping_option?.cost,
+      shipment_list_cost: shipment?.shipping_option?.list_cost,
+      shipment_base_cost: shipment?.base_cost,
+      shipment_tags: shipment?.tags
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
