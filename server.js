@@ -296,6 +296,8 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             fecha_entrega:    null,
             ciudad_destino:   null,
             enviado:          false,
+            conciliado:       false,
+            fecha_cobro:      null,
           }
         };
       });
