@@ -311,7 +311,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
         await Promise.all(batch.map(async (od) => {
           const promises = [];
 
-          // 1. Shipment (only for tipo_envio, ciudad, fecha — NOT for costs)
+          // 1. Shipment (tipo_envio, ciudad, fecha + bonificación Flex)
           if (od.shippingId) {
             promises.push(
               mlGet(`/shipments/${od.shippingId}`).then(ship => {
@@ -322,7 +322,16 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
                 od.row.fecha_entrega = ship.status_history?.date_delivered?.split('T')[0] || null;
                 od.row.ciudad_destino = ship.receiver_address?.city?.name || ship.receiver_address?.city || null;
                 od.row.enviado = ship.status === 'delivered';
-                // NOTE: Do NOT use ship cost — it's list price, not seller cost
+
+                // Bonificación Flex: ML devuelve base_cost - list_cost como bonificación
+                // Es un ingreso (positivo) porque el vendedor pone logística propia
+                if (ship.logistic_type === 'self_service') {
+                  const baseCost = ship.base_cost || 0;
+                  const listCost = ship.shipping_option?.list_cost || 0;
+                  if (baseCost > 0 && listCost > 0) {
+                    od.flexBonificacion = Math.round((baseCost - listCost) * 100) / 100;
+                  }
+                }
               }).catch(() => { od.row.tipo_envio = 'otro'; })
             );
           }
@@ -381,6 +390,25 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
           }
 
           await Promise.all(promises);
+
+          // Después de resolver shipment + payment:
+          // Si es Flex, cargo_envio = bonificación (positivo, es ingreso)
+          // Si es colecta/full, cargo_envio ya viene de charges_details (negativo)
+          if (od.flexBonificacion && od.flexBonificacion > 0) {
+            od.row.cargo_envio = od.flexBonificacion;
+
+            // Imp. Créd. y Déb. sobre bonificación de envío (0.6% de la bonificación)
+            // Este impuesto no viene en charges_details de MP, hay que calcularlo
+            const impBonificacion = Math.round(od.flexBonificacion * 0.006 * 100) / 100;
+            od.row.impuestos = (od.row.impuestos || 0) - impBonificacion;
+
+            // Recalcular por_cobrar incluyendo bonificación e impuesto
+            od.row.por_cobrar = od.row.importe_bruto
+              + od.row.cargo_venta
+              + od.row.cargo_envio
+              + od.row.costo_financiero
+              + od.row.impuestos;
+          }
         }));
       }
 
@@ -976,18 +1004,4 @@ app.listen(PORT, async () => {
   console.log(`   ML keys  : ${ML_CLIENT_ID  ? '✓' : '✗ FALTA variable ML_CLIENT_ID'}`);
   console.log(`   Tango    : ${TF_APP_KEY    ? '✓' : '✗ FALTA variable TF_APP_KEY (opcional)'}`);
   await loadMLToken();
-});
-
-// ── DEBUG — Ver charges_details COMPLETO (temporal) ─────────────
-app.get('/debug-payment-full/:paymentId', async (req, res) => {
-  try {
-    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
-    const r = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.paymentId}`, {
-      headers: { 'Authorization': 'Bearer ' + ML.access }
-    });
-    if (!r.ok) return res.status(r.status).json({ error: `MP API: ${r.status}` });
-    const pay = await r.json();
-    // Devolver TODO el objeto payment sin filtrar
-    res.json(pay);
-  } catch (e) { res.status(500).json({ error: e.message }); }
 });
