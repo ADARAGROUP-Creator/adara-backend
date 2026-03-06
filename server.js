@@ -1005,3 +1005,15 @@ app.listen(PORT, async () => {
   console.log(`   Tango    : ${TF_APP_KEY    ? '✓' : '✗ FALTA variable TF_APP_KEY (opcional)'}`);
   await loadMLToken();
 });
+
+// ── DEBUG (temporal) ────────────────────────────────────────────
+app.get('/debug-payment-full/:paymentId', async (req, res) => {
+  try {
+    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
+    const r = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.paymentId}`, {
+      headers: { 'Authorization': 'Bearer ' + ML.access }
+    });
+    if (!r.ok) return res.status(r.status).json({ error: `MP API: ${r.status}` });
+    res.json(await r.json());
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
