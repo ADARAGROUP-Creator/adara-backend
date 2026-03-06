@@ -974,3 +974,23 @@ app.listen(PORT, async () => {
   console.log(`   Tango    : ${TF_APP_KEY    ? '✓' : '✗ FALTA variable TF_APP_KEY (opcional)'}`);
   await loadMLToken();
 });
+
+app.get('/ml/debug-charges/:paymentId', async (req, res) => {
+  try {
+    const r = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.paymentId}`, {
+      headers: { 'Authorization': 'Bearer ' + ML.access }
+    });
+    const pay = await r.json();
+    res.json({
+      transaction_amount: pay.transaction_amount,
+      net_received_amount: pay.net_received_amount,
+      charges_details: pay.charges_details,
+      installments: pay.installments
+    });
+  } catch(e) { res.json({ error: e.message }); }
+});
+```
+
+Deployá y abrí con el payment ID de esa venta Flex (el que se ve en la tabla):
+```
+https://adara-backend-production.up.railway.app/ml/debug-charges/149104535258
