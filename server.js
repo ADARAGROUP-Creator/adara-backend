@@ -977,3 +977,25 @@ app.listen(PORT, async () => {
   console.log(`   Tango    : ${TF_APP_KEY    ? '✓' : '✗ FALTA variable TF_APP_KEY (opcional)'}`);
   await loadMLToken();
 });
+
+// ── DEBUG — Ver charges_details de un payment (temporal) ────────
+app.get('/debug-payment/:paymentId', async (req, res) => {
+  try {
+    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
+    const r = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.paymentId}`, {
+      headers: { 'Authorization': 'Bearer ' + ML.access }
+    });
+    if (!r.ok) return res.status(r.status).json({ error: `MP API: ${r.status}` });
+    const pay = await r.json();
+    res.json({
+      payment_id: pay.id,
+      status: pay.status,
+      total: pay.transaction_amount,
+      net_received: pay.net_received_amount,
+      charges_details: pay.charges_details,
+      fee_details: pay.fee_details,
+      taxes_amount: pay.taxes_amount,
+      shipping_amount: pay.shipping_amount
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
