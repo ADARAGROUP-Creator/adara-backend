@@ -300,23 +300,69 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
         };
       });
 
-      // Fetch shipment data in parallel (batches of 10)
-      // Fee desglose comes from settlement report (separate step)
+      // Fetch shipment + payment data in parallel (batches of 10)
+      // Shipments → tipo envío, ciudad, fecha entrega
+      // Collections → net_received_amount (neto real) → calculate taxes
       const PARALLEL = 10;
       for (let i = 0; i < orderData.length; i += PARALLEL) {
         const batch = orderData.slice(i, i + PARALLEL);
         await Promise.all(batch.map(async (od) => {
-          if (!od.shippingId) return;
-          try {
-            const ship = await mlGet(`/shipments/${od.shippingId}`);
-            od.row.tipo_envio = ship.logistic_type === 'self_service' ? 'flex'
-              : ship.logistic_type === 'fulfillment' ? 'fulfillment'
-              : ship.logistic_type === 'xd_drop_off' ? 'colecta'
-              : ship.logistic_type || 'otro';
-            od.row.fecha_entrega = ship.status_history?.date_delivered?.split('T')[0] || null;
-            od.row.ciudad_destino = ship.receiver_address?.city?.name || ship.receiver_address?.city || null;
-            od.row.enviado = ship.status === 'delivered';
-          } catch (e) { od.row.tipo_envio = 'otro'; }
+          const promises = [];
+
+          // 1. Shipment
+          if (od.shippingId) {
+            promises.push(
+              mlGet(`/shipments/${od.shippingId}`).then(ship => {
+                od.row.tipo_envio = ship.logistic_type === 'self_service' ? 'flex'
+                  : ship.logistic_type === 'fulfillment' ? 'fulfillment'
+                  : ship.logistic_type === 'xd_drop_off' ? 'colecta'
+                  : ship.logistic_type || 'otro';
+                od.row.fecha_entrega = ship.status_history?.date_delivered?.split('T')[0] || null;
+                od.row.ciudad_destino = ship.receiver_address?.city?.name || ship.receiver_address?.city || null;
+                od.row.enviado = ship.status === 'delivered';
+                // Shipping cost from shipment
+                const shipCost = ship.shipping_option?.cost || ship.base_cost || 0;
+                if (shipCost > 0) od.row.cargo_envio = -Math.abs(shipCost);
+              }).catch(() => { od.row.tipo_envio = 'otro'; })
+            );
+          }
+
+          // 2. Collections (neto real)
+          if (od.paymentId && od.row.ml_status !== 'cancelled') {
+            promises.push(
+              fetch(`https://api.mercadolibre.com/collections/${od.paymentId}`, {
+                headers: { 'Authorization': 'Bearer ' + ML.access }
+              }).then(r => r.ok ? r.json() : null).then(col => {
+                if (!col || !col.net_received_amount) return;
+                const netoReal = col.net_received_amount;
+                od.row.por_cobrar = netoReal;
+
+                // Calculate: impuestos+financiero = bruto - neto - comisión - envío
+                const comision = Math.abs(od.row.cargo_venta);
+                const envio = Math.abs(od.row.cargo_envio);
+                const totalDeducido = od.bruto - netoReal;
+                const otrosDescuentos = totalDeducido - comision - envio;
+
+                // Split: estimate financing from installments, rest is taxes
+                const cuotas = col.installments || 1;
+                if (cuotas > 1 && otrosDescuentos > 0) {
+                  // Approx: financing ~ 5-15% of bruto for 3-12 installments
+                  const financingEstimate = Math.min(otrosDescuentos * 0.4, od.bruto * 0.15);
+                  od.row.costo_financiero = -Math.abs(Math.round(financingEstimate));
+                  od.row.impuestos = -Math.abs(Math.round(otrosDescuentos - financingEstimate));
+                } else {
+                  // No installments: all other deductions are taxes
+                  od.row.impuestos = otrosDescuentos > 0 ? -Math.abs(Math.round(otrosDescuentos)) : 0;
+                }
+
+                // Mark as conciliado if we got real net
+                if (netoReal > 0) od.row.conciliado = true;
+                od.row.fecha_cobro = col.money_release_date?.split('T')[0] || col.date_approved?.split('T')[0] || null;
+              }).catch(() => {})
+            );
+          }
+
+          await Promise.all(promises);
         }));
       }
 
