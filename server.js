@@ -258,14 +258,10 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
         const bruto   = o.total_amount     || 0;
         const fechaVenta = o.date_created?.split('T')[0];
 
-        const comisionReal = payment.marketplace_fee != null
+        const comisionReal = payment.marketplace_fee != null && payment.marketplace_fee !== 0
           ? Math.abs(payment.marketplace_fee)
           : (item.sale_fee || bruto * 0.1375);
 
-        const shippingCost = payment.shipping_cost || 0;
-        const financingFee = payment.fee_details?.find(f => f.type === 'financing_fee')?.amount || 0;
-        const taxes = payment.taxes_amount || 0;
-        const porCobrar = payment.net_received_amount || (bruto - comisionReal - shippingCost - financingFee - taxes);
         const sellerSku = item.item?.seller_sku || item.item?.seller_custom_field || null;
         const lineaId = matchLinea(sellerSku, item.item?.title);
         const motivoCancelacion = o.status === 'cancelled'
@@ -274,6 +270,9 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
 
         return {
           shippingId: o.shipping?.id || null,
+          paymentId:  payment.id ? String(payment.id) : null,
+          bruto,
+          comision: comisionReal,
           row: {
             ml_order_id:      String(o.id),
             periodo:          fechaVenta ? fechaVenta.substring(0, 7) : null,
@@ -283,10 +282,10 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             cantidad:         item.quantity || 1,
             importe_bruto:    bruto,
             cargo_venta:      -Math.abs(comisionReal),
-            cargo_envio:      -Math.abs(shippingCost),
-            costo_financiero: -Math.abs(financingFee),
-            impuestos:        -Math.abs(taxes),
-            por_cobrar:       porCobrar,
+            cargo_envio:      0,
+            costo_financiero: 0,
+            impuestos:        0,
+            por_cobrar:       bruto - comisionReal,  // provisional, se actualiza con collections
             mp_payment_id:    payment.id ? String(payment.id) : null,
             ml_status:        o.status || 'unknown',
             motivo_cancelacion: motivoCancelacion,
@@ -302,21 +301,22 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
       });
 
       // Fetch shipment data in parallel (batches of 10)
+      // Fee desglose comes from settlement report (separate step)
       const PARALLEL = 10;
       for (let i = 0; i < orderData.length; i += PARALLEL) {
         const batch = orderData.slice(i, i + PARALLEL);
-        await Promise.all(batch.map(async ({ shippingId, row }) => {
-          if (!shippingId) return;
+        await Promise.all(batch.map(async (od) => {
+          if (!od.shippingId) return;
           try {
-            const ship = await mlGet(`/shipments/${shippingId}`);
-            row.tipo_envio = ship.logistic_type === 'self_service' ? 'flex'
+            const ship = await mlGet(`/shipments/${od.shippingId}`);
+            od.row.tipo_envio = ship.logistic_type === 'self_service' ? 'flex'
               : ship.logistic_type === 'fulfillment' ? 'fulfillment'
               : ship.logistic_type === 'xd_drop_off' ? 'colecta'
               : ship.logistic_type || 'otro';
-            row.fecha_entrega = ship.status_history?.date_delivered?.split('T')[0] || null;
-            row.ciudad_destino = ship.receiver_address?.city?.name || ship.receiver_address?.city || null;
-            row.enviado = ship.status === 'delivered';
-          } catch (e) { row.tipo_envio = 'otro'; }
+            od.row.fecha_entrega = ship.status_history?.date_delivered?.split('T')[0] || null;
+            od.row.ciudad_destino = ship.receiver_address?.city?.name || ship.receiver_address?.city || null;
+            od.row.enviado = ship.status === 'delivered';
+          } catch (e) { od.row.tipo_envio = 'otro'; }
         }));
       }
 
@@ -350,6 +350,165 @@ app.post('/ml/sync', async (req, res) => {
     );
     res.json({ ok: true, ...result });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── MERCADOPAGO — Settlement Report (desglose real de fees) ─────────
+// Helper: call MP API
+async function mpApi(path, opts = {}) {
+  const url = 'https://api.mercadopago.com' + path;
+  const r = await fetch(url, {
+    ...opts,
+    headers: { 'Authorization': 'Bearer ' + ML.access, 'Content-Type': 'application/json', ...(opts.headers || {}) }
+  });
+  if (!r.ok) throw new Error(`MP ${path}: ${r.status}`);
+  return r;
+}
+
+app.post('/mp/settlement-sync', async (req, res) => {
+  try {
+    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
+
+    const { desde, hasta } = req.body || {};
+    if (!desde || !hasta) return res.status(400).json({ error: 'Faltan desde/hasta (YYYY-MM-DD)' });
+
+    console.log(`MP Settlement: generando reporte ${desde} → ${hasta}...`);
+
+    // 1. Crear reporte
+    const createRes = await mpApi('/v1/account/settlement_report', {
+      method: 'POST',
+      body: JSON.stringify({
+        begin_date: `${desde}T00:00:00Z`,
+        end_date: `${hasta}T23:59:59Z`
+      })
+    });
+    const createData = await createRes.json();
+    const reportId = createData.id;
+    if (!reportId) return res.status(400).json({ error: 'No se pudo crear reporte', detail: createData });
+
+    console.log(`MP Settlement: reporte creado id=${reportId}, esperando...`);
+
+    // 2. Esperar a que esté listo (polling cada 5s, máx 2 min)
+    let fileUrl = null;
+    for (let i = 0; i < 24; i++) {
+      await new Promise(r => setTimeout(r, 5000));
+      try {
+        const checkRes = await mpApi(`/v1/account/settlement_report/${reportId}`);
+        const checkData = await checkRes.json();
+        if (checkData.status === 'ready' && checkData.download_url) {
+          fileUrl = checkData.download_url;
+          break;
+        }
+        if (checkData.status === 'error') {
+          return res.status(400).json({ error: 'Reporte falló', detail: checkData });
+        }
+        console.log(`MP Settlement: esperando... (${i+1}) status=${checkData.status}`);
+      } catch(e) {
+        // Some APIs return the file list differently
+        break;
+      }
+    }
+
+    // Alternative: list recent reports to find the file
+    if (!fileUrl) {
+      const listRes = await mpApi('/v1/account/settlement_report/list');
+      const list = await listRes.json();
+      const found = list.find(r => r.id === reportId) || list[0];
+      if (found?.download_url) fileUrl = found.download_url;
+    }
+
+    if (!fileUrl) return res.status(400).json({ error: 'Reporte no disponible aún, intentar de nuevo en unos minutos', reportId });
+
+    // 3. Descargar CSV
+    console.log(`MP Settlement: descargando ${fileUrl}...`);
+    const csvRes = await fetch(fileUrl, {
+      headers: { 'Authorization': 'Bearer ' + ML.access }
+    });
+    const csvText = await csvRes.text();
+    const lines = csvText.split('\n').filter(l => l.trim());
+    if (lines.length < 2) return res.status(400).json({ error: 'Reporte vacío' });
+
+    // 4. Parsear CSV
+    const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+    const col = (name) => headers.indexOf(name);
+
+    const iSourceId = col('SOURCE_ID');
+    const iType = col('TRANSACTION_TYPE');
+    const iAmount = col('TRANSACTION_AMOUNT');
+    const iNetAmount = col('SETTLEMENT_NET_AMOUNT');
+    const iFee = col('FEE_AMOUNT');
+    const iMkpFee = col('MKP_FEE_AMOUNT');
+    const iFinancing = col('FINANCING_FEE_AMOUNT');
+    const iShipping = col('SHIPPING_FEE_AMOUNT');
+    const iTaxes = col('TAXES_AMOUNT');
+    const iTaxDetail = col('TAXES_DISAGGREGATED');
+
+    const parseNum = (v) => {
+      if (!v) return 0;
+      const s = String(v).replace(/"/g, '').trim();
+      return parseFloat(s) || 0;
+    };
+
+    let updated = 0, skipped = 0;
+
+    for (let i = 1; i < lines.length; i++) {
+      // CSV parse (handle quoted values with commas)
+      const vals = [];
+      let current = '', inQuotes = false;
+      for (const ch of lines[i]) {
+        if (ch === '"') { inQuotes = !inQuotes; }
+        else if (ch === ',' && !inQuotes) { vals.push(current.trim()); current = ''; }
+        else { current += ch; }
+      }
+      vals.push(current.trim());
+
+      const tipo = (vals[iType] || '').replace(/"/g, '');
+      // Solo procesar pagos de ventas (no transferencias, etc.)
+      if (!tipo.includes('SETTLEMENT') && !tipo.includes('payment')) continue;
+
+      const sourceId = (vals[iSourceId] || '').replace(/"/g, '').trim();
+      if (!sourceId) continue;
+
+      const fee = parseNum(vals[iFee]);
+      const mkpFee = parseNum(vals[iMkpFee]);
+      const financing = parseNum(vals[iFinancing]);
+      const shipping = parseNum(vals[iShipping]);
+      const taxes = parseNum(vals[iTaxes]);
+      const netAmount = parseNum(vals[iNetAmount]);
+      const taxDetail = (vals[iTaxDetail] || '').replace(/"/g, '');
+
+      // Comisión = fee + mkp_fee (son complementarios)
+      const comisionTotal = Math.abs(fee) + Math.abs(mkpFee);
+
+      // Buscar venta por mp_payment_id = sourceId
+      const ventas = await sbGet('ventas_ml', `mp_payment_id=eq.${sourceId}&limit=1`);
+      if (!ventas?.length) { skipped++; continue; }
+
+      // Actualizar con desglose real
+      const updateData = {
+        cargo_venta: comisionTotal ? -Math.abs(comisionTotal) : ventas[0].cargo_venta,
+        cargo_envio: shipping ? -Math.abs(shipping) : ventas[0].cargo_envio,
+        costo_financiero: financing ? -Math.abs(financing) : ventas[0].costo_financiero,
+        impuestos: taxes ? -Math.abs(taxes) : ventas[0].impuestos,
+        por_cobrar: netAmount || ventas[0].por_cobrar,
+      };
+
+      // Si la venta no estaba conciliada, marcarla
+      if (netAmount > 0 && !ventas[0].conciliado) {
+        updateData.conciliado = true;
+        updateData.fecha_cobro = new Date().toISOString().split('T')[0];
+      }
+
+      await sbPatch('ventas_ml', `id=eq.${ventas[0].id}`, updateData);
+      updated++;
+    }
+
+    console.log(`✓ MP Settlement: ${updated} ventas actualizadas, ${skipped} no encontradas`);
+    res.json({ ok: true, updated, skipped, total_lines: lines.length - 1 });
+
+  } catch(e) {
+    console.error('MP Settlement:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── MERCADO PAGO — Parseo extracto XLSX ─────────────────────────────
@@ -753,14 +912,4 @@ app.listen(PORT, async () => {
   console.log(`   ML keys  : ${ML_CLIENT_ID  ? '✓' : '✗ FALTA variable ML_CLIENT_ID'}`);
   console.log(`   Tango    : ${TF_APP_KEY    ? '✓' : '✗ FALTA variable TF_APP_KEY (opcional)'}`);
   await loadMLToken();
-});
-
-app.get('/ml/debug-settlement', async (req, res) => {
-  try {
-    const r = await fetch('https://api.mercadopago.com/v1/account/settlement_report/config', {
-      headers: { 'Authorization': 'Bearer ' + ML.access }
-    });
-    const data = await r.json();
-    res.json({ status: r.status, data });
-  } catch(e) { res.json({ error: e.message }); }
 });
