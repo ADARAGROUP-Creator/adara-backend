@@ -335,13 +335,12 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
               }).then(r => r.ok ? r.json() : null).then(pay => {
                 if (!pay) return;
 
-                // Net received (the real final number)
+                // Net received (guardamos como referencia de lo que dice MP)
                 const netoReal = pay.net_received_amount || 0;
-                if (netoReal > 0) od.row.por_cobrar = netoReal;
 
                 // Parse charges_details
                 const charges = pay.charges_details || [];
-                let comision = 0, impuestos = 0, financiero = 0;
+                let comision = 0, impuestos = 0, financiero = 0, envio = 0;
 
                 for (const ch of charges) {
                   const amt = ch.amounts?.original || 0;
@@ -362,25 +361,21 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
                       comision += amt;
                     }
                   } else if (type === 'shipping') {
-                    // Explicit shipping charge (colecta/full) — handled via residual
+                    envio += amt;
                   }
                 }
 
                 if (comision > 0) od.row.cargo_venta = -comision;
                 if (impuestos > 0) od.row.impuestos = -impuestos;
                 if (financiero > 0) od.row.costo_financiero = -financiero;
+                if (envio > 0) od.row.cargo_envio = -envio;
 
-                // Envío/bonificación = residual (what's left after all known charges)
-                // Positive = bonification (Flex pays you), Negative = shipping charge
-                if (netoReal > 0) {
-                  const totalCargos = comision + financiero + impuestos;
-                  const envioResidual = netoReal - (od.bruto - totalCargos);
-                  od.row.cargo_envio = Math.round(envioResidual * 100) / 100;
-                }
+                // por_cobrar = bruto menos todos los cargos (no usar net_received_amount que viene incompleto)
+                od.row.por_cobrar = od.bruto - comision - financiero - impuestos - envio;
 
-                // Conciliation data
+                // fecha_cobro como referencia, pero NO marca conciliado
+                // La conciliación solo se hace via Account Statement
                 od.row.fecha_cobro = pay.money_release_date?.split('T')[0] || pay.date_approved?.split('T')[0] || null;
-                if (netoReal > 0 && pay.status === 'approved') od.row.conciliado = true;
               }).catch(() => {})
             );
           }
