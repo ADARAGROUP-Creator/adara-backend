@@ -311,7 +311,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
         await Promise.all(batch.map(async (od) => {
           const promises = [];
 
-          // 1. Shipment
+          // 1. Shipment (only for tipo_envio, ciudad, fecha — NOT for costs)
           if (od.shippingId) {
             promises.push(
               mlGet(`/shipments/${od.shippingId}`).then(ship => {
@@ -322,9 +322,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
                 od.row.fecha_entrega = ship.status_history?.date_delivered?.split('T')[0] || null;
                 od.row.ciudad_destino = ship.receiver_address?.city?.name || ship.receiver_address?.city || null;
                 od.row.enviado = ship.status === 'delivered';
-                // Shipping cost from shipment
-                const shipCost = ship.shipping_option?.cost || ship.base_cost || 0;
-                if (shipCost > 0) od.row.cargo_envio = -Math.abs(shipCost);
+                // NOTE: Do NOT use ship cost — it's list price, not seller cost
               }).catch(() => { od.row.tipo_envio = 'otro'; })
             );
           }
@@ -337,7 +335,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
               }).then(r => r.ok ? r.json() : null).then(pay => {
                 if (!pay) return;
 
-                // Net received
+                // Net received (this is the real number, includes all deductions + bonifications)
                 if (pay.net_received_amount) od.row.por_cobrar = pay.net_received_amount;
 
                 // Parse charges_details for real breakdown
@@ -346,29 +344,44 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
 
                 for (const ch of charges) {
                   const amt = ch.amounts?.original || 0;
+                  if (amt === 0) continue;
                   const name = (ch.name || '').toLowerCase();
                   const type = (ch.type || '').toLowerCase();
+                  const direction = ch.accounts?.from; // 'collector' = seller pays, 'ml' = ML pays
 
-                  if (name.includes('meli_percentage_fee') || name.includes('meli_fee') || name.includes('commission')) {
+                  // Skip charges not paid by seller
+                  if (type === 'coupon') continue;
+                  if (direction !== 'collector') continue; // only count what seller pays
+
+                  if (name.includes('meli_percentage_fee') || name.includes('meli_fee')) {
                     comision += amt;
+                  } else if (name.includes('financing') || name.includes('interest')) {
+                    financiero += amt;
                   } else if (name.includes('tax_withholding') || name.includes('iibb') || name.includes('sirtac') || name.includes('debitos_creditos') || type === 'tax') {
                     impuestos += amt;
                   } else if (name.includes('shp_') || name.includes('shipping') || type === 'shipping') {
                     envio += amt;
-                  } else if (name.includes('financing') || name.includes('interest')) {
-                    financiero += amt;
-                  } else if (name.includes('coupon') || name.includes('rebate')) {
-                    // cupones — no afectan los cargos del vendedor
                   } else {
-                    // Unknown charge → put in comision as safe default
+                    // Unknown seller charge → comision as default
                     comision += amt;
                   }
                 }
 
                 if (comision > 0) od.row.cargo_venta = -Math.abs(comision);
                 if (impuestos > 0) od.row.impuestos = -Math.abs(impuestos);
-                if (envio > 0) od.row.cargo_envio = -Math.abs(envio);
                 if (financiero > 0) od.row.costo_financiero = -Math.abs(financiero);
+
+                // Calculate shipping/bonification as residual
+                // residual = net - (bruto - comision - financiero - impuestos)
+                // Positive = bonification (Flex pays you), Negative = shipping charge (Colecta/Full)
+                const netoReal = pay.net_received_amount || 0;
+                if (netoReal > 0) {
+                  const sinEnvio = od.bruto - comision - financiero - impuestos;
+                  const residualEnvio = netoReal - sinEnvio;
+                  // residualEnvio > 0 means bonification (Flex), < 0 means shipping charge
+                  od.row.cargo_envio = Math.round(residualEnvio * 100) / 100;
+                }
+                if (envio > 0) od.row.cargo_envio = -Math.abs(envio); // override if explicit shipping charge exists
 
                 // Conciliation data
                 od.row.fecha_cobro = pay.money_release_date?.split('T')[0] || pay.date_approved?.split('T')[0] || null;
@@ -974,19 +987,3 @@ app.listen(PORT, async () => {
   console.log(`   Tango    : ${TF_APP_KEY    ? '✓' : '✗ FALTA variable TF_APP_KEY (opcional)'}`);
   await loadMLToken();
 });
-
-app.get('/ml/debug-charges/:paymentId', async (req, res) => {
-  try {
-    const r = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.paymentId}`, {
-      headers: { 'Authorization': 'Bearer ' + ML.access }
-    });
-    const pay = await r.json();
-    res.json({
-      transaction_amount: pay.transaction_amount,
-      net_received_amount: pay.net_received_amount,
-      charges_details: pay.charges_details,
-      installments: pay.installments
-    });
-  } catch(e) { res.json({ error: e.message }); }
-});
-
