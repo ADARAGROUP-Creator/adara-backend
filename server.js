@@ -1049,3 +1049,32 @@ app.listen(PORT, async () => {
   console.log(`   Tango    : ${TF_APP_KEY    ? '✓' : '✗ FALTA variable TF_APP_KEY (opcional)'}`);
   await loadMLToken();
 });
+
+// ── DEBUG (temporales — eliminar en producción) ─────────────────
+app.get('/debug-payment-full/:paymentId', async (req, res) => {
+  try {
+    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
+    const r = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.paymentId}`, {
+      headers: { 'Authorization': 'Bearer ' + ML.access }
+    });
+    if (!r.ok) return res.status(r.status).json({ error: `MP API: ${r.status}` });
+    res.json(await r.json());
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/debug-order/:orderId', async (req, res) => {
+  try {
+    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
+    const order = await mlGet(`/orders/${req.params.orderId}`);
+    const shipId = order.shipping?.id;
+    let shipment = null;
+    if (shipId) shipment = await mlGet(`/shipments/${shipId}`).catch(() => null);
+    // Devolver shipment completo para ver neighborhood, zip_code, etc
+    res.json({
+      order_id: order.id,
+      shipping_id: shipId,
+      receiver_address: shipment?.receiver_address,
+      logistic_type: shipment?.logistic_type
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
