@@ -335,57 +335,52 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
               }).then(r => r.ok ? r.json() : null).then(pay => {
                 if (!pay) return;
 
-                // Net received (this is the real number, includes all deductions + bonifications)
-                if (pay.net_received_amount) od.row.por_cobrar = pay.net_received_amount;
+                // Net received (the real final number)
+                const netoReal = pay.net_received_amount || 0;
+                if (netoReal > 0) od.row.por_cobrar = netoReal;
 
-                // Parse charges_details for real breakdown
+                // Parse charges_details
                 const charges = pay.charges_details || [];
-                let comision = 0, impuestos = 0, envio = 0, financiero = 0;
+                let comision = 0, impuestos = 0, financiero = 0;
 
                 for (const ch of charges) {
                   const amt = ch.amounts?.original || 0;
                   if (amt === 0) continue;
-                  const name = (ch.name || '').toLowerCase();
                   const type = (ch.type || '').toLowerCase();
-                  const direction = ch.accounts?.from; // 'collector' = seller pays, 'ml' = ML pays
+                  const name = (ch.name || '').toLowerCase();
 
-                  // Skip charges not paid by seller
-                  if (type === 'coupon') continue;
-                  if (direction !== 'collector') continue; // only count what seller pays
+                  // Skip buyer-side charges (coupons, discounts)
+                  if (type === 'coupon' || type === 'discount') continue;
+                  if (name.includes('coupon') || name.includes('rebate')) continue;
 
-                  if (name.includes('meli_percentage_fee') || name.includes('meli_fee')) {
-                    comision += amt;
-                  } else if (name.includes('financing') || name.includes('interest')) {
-                    financiero += amt;
-                  } else if (name.includes('tax_withholding') || name.includes('iibb') || name.includes('sirtac') || name.includes('debitos_creditos') || type === 'tax') {
+                  if (type === 'tax') {
                     impuestos += amt;
-                  } else if (name.includes('shp_') || name.includes('shipping') || type === 'shipping') {
-                    envio += amt;
-                  } else {
-                    // Unknown seller charge → comision as default
-                    comision += amt;
+                  } else if (type === 'fee') {
+                    if (name.includes('financing') || name.includes('interest') || name.includes('add_on')) {
+                      financiero += amt;
+                    } else {
+                      comision += amt;
+                    }
+                  } else if (type === 'shipping') {
+                    // Explicit shipping charge (colecta/full) — handled via residual
                   }
                 }
 
-                if (comision > 0) od.row.cargo_venta = -Math.abs(comision);
-                if (impuestos > 0) od.row.impuestos = -Math.abs(impuestos);
-                if (financiero > 0) od.row.costo_financiero = -Math.abs(financiero);
+                if (comision > 0) od.row.cargo_venta = -comision;
+                if (impuestos > 0) od.row.impuestos = -impuestos;
+                if (financiero > 0) od.row.costo_financiero = -financiero;
 
-                // Calculate shipping/bonification as residual
-                // residual = net - (bruto - comision - financiero - impuestos)
-                // Positive = bonification (Flex pays you), Negative = shipping charge (Colecta/Full)
-                const netoReal = pay.net_received_amount || 0;
+                // Envío/bonificación = residual (what's left after all known charges)
+                // Positive = bonification (Flex pays you), Negative = shipping charge
                 if (netoReal > 0) {
-                  const sinEnvio = od.bruto - comision - financiero - impuestos;
-                  const residualEnvio = netoReal - sinEnvio;
-                  // residualEnvio > 0 means bonification (Flex), < 0 means shipping charge
-                  od.row.cargo_envio = Math.round(residualEnvio * 100) / 100;
+                  const totalCargos = comision + financiero + impuestos;
+                  const envioResidual = netoReal - (od.bruto - totalCargos);
+                  od.row.cargo_envio = Math.round(envioResidual * 100) / 100;
                 }
-                if (envio > 0) od.row.cargo_envio = -Math.abs(envio); // override if explicit shipping charge exists
 
                 // Conciliation data
                 od.row.fecha_cobro = pay.money_release_date?.split('T')[0] || pay.date_approved?.split('T')[0] || null;
-                if (pay.net_received_amount > 0 && pay.status === 'approved') od.row.conciliado = true;
+                if (netoReal > 0 && pay.status === 'approved') od.row.conciliado = true;
               }).catch(() => {})
             );
           }
