@@ -182,33 +182,71 @@ app.get('/ml/status', (_, res) => res.json({
 
 // ── MERCADO LIBRE — Sync ventas ──────────────────────────────────────
 
+// ── Feriados Argentina (API nolaborables.com.ar) ─────────────────────
+let FERIADOS_CACHE = {}; // { '2026': Set(['2026-02-16','2026-02-17',...]) }
+
+async function loadFeriados(year) {
+  if (FERIADOS_CACHE[year]) return FERIADOS_CACHE[year];
+  try {
+    const r = await fetch(`https://nolaborables.com.ar/api/v2/feriados/${year}`);
+    if (!r.ok) throw new Error(`API feriados: ${r.status}`);
+    const data = await r.json();
+    const set = new Set();
+    for (const f of data) {
+      const mm = String(f.mes).padStart(2, '0');
+      const dd = String(f.dia).padStart(2, '0');
+      set.add(`${year}-${mm}-${dd}`);
+    }
+    FERIADOS_CACHE[year] = set;
+    console.log(`✓ Feriados ${year}: ${set.size} días cargados`);
+    return set;
+  } catch (e) {
+    console.warn('loadFeriados:', e.message);
+    FERIADOS_CACHE[year] = new Set();
+    return FERIADOS_CACHE[year];
+  }
+}
+
+function esFeriado(fechaStr) {
+  const year = fechaStr.substring(0, 4);
+  const set = FERIADOS_CACHE[year];
+  return set ? set.has(fechaStr) : false;
+}
+
+// Avanzar al siguiente día hábil (no finde, no feriado)
+function siguienteDiaHabil(d) {
+  let intentos = 0;
+  while (intentos < 10) {
+    const dia = d.getDay();
+    const fechaStr = d.toISOString().split('T')[0];
+    if (dia !== 0 && dia !== 6 && !esFeriado(fechaStr)) break;
+    d.setDate(d.getDate() + 1);
+    intentos++;
+  }
+  return d;
+}
+
 // Calcular fecha de despacho Flex según reglas de MEF:
-// - Lun a Vie antes de 12:00 → mismo día
-// - Lun a Vie después de 12:00 → siguiente día hábil
-// - Viernes después de 12:00 → lunes
-// - Sábado y domingo → lunes
+// - Lun a Vie (hábil) antes de 12:00 → mismo día
+// - Lun a Vie (hábil) después de 12:00 → siguiente día hábil
+// - Finde / feriado → siguiente día hábil
 function calcFechaDespachoFlex(fechaISO, horaStr) {
   if (!fechaISO) return null;
   const d = new Date(fechaISO + 'T' + (horaStr || '12:00:00'));
-  const dia = d.getDay(); // 0=dom, 1=lun, ..., 5=vie, 6=sab
+  const dia = d.getDay();
   const hora = d.getHours();
+  const fechaStr = d.toISOString().split('T')[0];
 
-  if (dia === 0) {
-    // Domingo → lunes
+  if (dia === 0 || dia === 6 || esFeriado(fechaStr)) {
+    // Finde o feriado → siguiente día hábil
     d.setDate(d.getDate() + 1);
-  } else if (dia === 6) {
-    // Sábado → lunes
-    d.setDate(d.getDate() + 2);
+    siguienteDiaHabil(d);
   } else if (hora >= 12) {
-    // Lun-Vie después de 12:00 → siguiente día hábil
-    if (dia === 5) {
-      // Viernes → lunes
-      d.setDate(d.getDate() + 3);
-    } else {
-      d.setDate(d.getDate() + 1);
-    }
+    // Día hábil después de 12:00 → siguiente día hábil
+    d.setDate(d.getDate() + 1);
+    siguienteDiaHabil(d);
   }
-  // Lun-Vie antes de 12:00 → mismo día (no hace nada)
+  // Día hábil antes de 12:00 → mismo día (no hace nada)
 
   return d.toISOString().split('T')[0];
 }
@@ -222,6 +260,13 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
   // Fechas: si se pasan explícitas, usarlas. Si no, usar diasAtras.
   const desde = fechaDesde || new Date(Date.now() - diasAtras * 86400000).toISOString().split('T')[0];
   const hasta = fechaHasta || new Date().toISOString().split('T')[0];
+
+  // Cargar feriados para los años del rango
+  const yearDesde = parseInt(desde.substring(0, 4));
+  const yearHasta = parseInt(hasta.substring(0, 4));
+  for (let y = yearDesde; y <= yearHasta; y++) {
+    await loadFeriados(y);
+  }
 
   // Cargar maestros para matching de línea por SKU
   const lineas = await sbGet('lineas_negocio', 'activa=eq.true');
@@ -1107,4 +1152,5 @@ app.listen(PORT, async () => {
   console.log(`   ML keys  : ${ML_CLIENT_ID  ? '✓' : '✗ FALTA variable ML_CLIENT_ID'}`);
   console.log(`   Tango    : ${TF_APP_KEY    ? '✓' : '✗ FALTA variable TF_APP_KEY (opcional)'}`);
   await loadMLToken();
+  await loadFeriados(new Date().getFullYear());
 });
