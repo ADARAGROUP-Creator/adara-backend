@@ -182,8 +182,14 @@ app.get('/ml/status', (_, res) => res.json({
 
 // ── MERCADO LIBRE — Sync ventas ──────────────────────────────────────
 
-// ── Feriados Argentina (API nolaborables.com.ar) ─────────────────────
+// ── Feriados Argentina (API nolaborables.com.ar + fallback hardcodeado) ───
 let FERIADOS_CACHE = {}; // { '2026': Set(['2026-02-16','2026-02-17',...]) }
+
+// Fallback: feriados nacionales Argentina (actualizar anualmente si la API falla)
+const FERIADOS_HARDCODED = {
+  '2025': ['01-01','02-03','02-04','03-24','04-02','04-18','04-19','05-01','05-25','06-16','06-20','07-09','08-17','10-12','11-20','11-24','12-08','12-25'],
+  '2026': ['01-01','02-16','02-17','03-24','04-02','04-03','04-04','05-01','05-25','06-15','06-20','07-09','08-17','10-12','11-23','12-08','12-25']
+};
 
 async function loadFeriados(year) {
   if (FERIADOS_CACHE[year]) return FERIADOS_CACHE[year];
@@ -198,12 +204,16 @@ async function loadFeriados(year) {
       set.add(`${year}-${mm}-${dd}`);
     }
     FERIADOS_CACHE[year] = set;
-    console.log(`✓ Feriados ${year}: ${set.size} días cargados`);
+    console.log(`✓ Feriados ${year}: ${set.size} días cargados (API)`);
     return set;
   } catch (e) {
-    console.warn('loadFeriados:', e.message);
-    FERIADOS_CACHE[year] = new Set();
-    return FERIADOS_CACHE[year];
+    console.warn('loadFeriados API falló:', e.message, '→ usando fallback hardcodeado');
+    const set = new Set();
+    const hc = FERIADOS_HARDCODED[String(year)];
+    if (hc) hc.forEach(d => set.add(`${year}-${d}`));
+    FERIADOS_CACHE[year] = set;
+    console.log(`✓ Feriados ${year}: ${set.size} días cargados (hardcoded)`);
+    return set;
   }
 }
 
