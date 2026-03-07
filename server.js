@@ -331,6 +331,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             tipo_envio:       null,
             fecha_entrega:    null,
             ciudad_destino:   null,
+            partido:          null,
             enviado:          false,
             hora_venta:       horaVenta,
             fecha_despacho_flex: null,  // se calcula después si es flex
@@ -358,12 +359,32 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
                   : ship.logistic_type === 'xd_drop_off' ? 'colecta'
                   : ship.logistic_type || 'otro';
                 od.row.fecha_entrega = ship.status_history?.date_delivered?.split('T')[0] || null;
-                // Ciudad destino: si es "La Matanza", usar neighborhood para distinguir norte (GBA1) vs sur (GBA2)
-                let ciudad = ship.receiver_address?.city?.name || ship.receiver_address?.city || null;
-                if (ciudad && ciudad.toLowerCase() === 'la matanza' && ship.receiver_address?.neighborhood?.name) {
-                  ciudad = ship.receiver_address.neighborhood.name;
+                
+                // Clasificar partido + ciudad_destino para Flex
+                // ML manda: state.id = "AR-C" para CABA, city.name = partido para GBA
+                // Para La Matanza: usar neighborhood para distinguir norte (GBA1) vs sur (GBA2)
+                const stateId = ship.receiver_address?.state?.id;
+                const cityName = ship.receiver_address?.city?.name || ship.receiver_address?.city || null;
+                const neighborhoodName = ship.receiver_address?.neighborhood?.name || null;
+                
+                const LA_MATANZA_SUR = ['isidro casanova', 'gregorio de laferrere', 'rafael castillo',
+                  'gonzález catán', 'gonzalez catan', 'gonzlez catan', 'ciudad evita', 'virrey del pino'];
+                
+                if (stateId === 'AR-C' || (cityName && ['capital federal', 'caba', 'buenos aires'].includes(cityName.toLowerCase()) && !neighborhoodName)) {
+                  // CABA: city.name es el barrio, no el partido
+                  od.row.partido = 'CABA';
+                  od.row.ciudad_destino = neighborhoodName || cityName;
+                } else if (cityName && cityName.toLowerCase() === 'la matanza') {
+                  // La Matanza: split norte/sur por localidad
+                  const localidad = (neighborhoodName || '').toLowerCase();
+                  od.row.partido = LA_MATANZA_SUR.includes(localidad) ? 'La Matanza Sur' : 'La Matanza Norte';
+                  od.row.ciudad_destino = neighborhoodName || 'La Matanza';
+                } else {
+                  // GBA: city.name es el partido (Quilmes, Morón, Vicente López, etc.)
+                  od.row.partido = cityName;
+                  od.row.ciudad_destino = neighborhoodName || cityName;
                 }
-                od.row.ciudad_destino = ciudad;
+                
                 od.row.enviado = ship.status === 'delivered';
 
                 // Bonificación Flex: ML devuelve base_cost - list_cost como bonificación
