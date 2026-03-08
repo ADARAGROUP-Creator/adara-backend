@@ -341,7 +341,10 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
       // Build base rows from orders
       const orderData = orders.map(o => {
         const item    = o.order_items?.[0] || {};
-        const payment = o.payments?.find(p => p.status === 'approved') || o.payments?.[0] || {};
+        // Split payments: recoger TODOS los pagos aprobados
+        const approvedPayments = o.payments?.filter(p => p.status === 'approved') || [];
+        const payment = approvedPayments[0] || o.payments?.[0] || {};
+        const allPaymentIds = approvedPayments.map(p => String(p.id));
         const bruto   = o.total_amount     || 0;
         const fechaVenta = o.date_created?.split('T')[0];
         // Extraer hora de venta de ML (viene como "2026-02-26T14:30:00.000-03:00")
@@ -361,6 +364,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
 
         return {
           shippingId: o.shipping?.id || null,
+          paymentIds: allPaymentIds,
           paymentId:  payment.id ? String(payment.id) : null,
           bruto,
           comision: comisionReal,
@@ -376,8 +380,10 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             cargo_envio:      0,
             costo_financiero: 0,
             impuestos:        0,
-            por_cobrar:       bruto - comisionReal,  // provisional, se actualiza con collections
+            por_cobrar:       bruto - comisionReal,  // provisional, se actualiza con charges
             mp_payment_id:    payment.id ? String(payment.id) : null,
+            mp_payment_ids:   allPaymentIds.length > 1 ? allPaymentIds.join(',') : null,
+            pagos_cantidad:   allPaymentIds.length || 1,
             ml_status:        o.status || 'unknown',
             motivo_cancelacion: motivoCancelacion,
             monto_devuelto:   montoDevuelto,
@@ -455,60 +461,69 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             );
           }
 
-          // 2. MP Payment details (real fee breakdown via charges_details)
-          if (od.paymentId && od.row.ml_status !== 'cancelled') {
-            promises.push(
-              fetch(`https://api.mercadopago.com/v1/payments/${od.paymentId}`, {
-                headers: { 'Authorization': 'Bearer ' + ML.access }
-              }).then(r => r.ok ? r.json() : null).then(pay => {
-                if (!pay) return;
+          // 2. MP Payment details — iterar TODOS los payments aprobados (split payment)
+          //    Los cargos se distribuyen entre payments, hay que sumarlos todos
+          if (od.paymentIds.length && od.row.ml_status !== 'cancelled') {
+            od._comision = 0; od._impuestos = 0; od._financiero = 0; od._envio = 0;
 
-                // Net received (guardamos como referencia de lo que dice MP)
-                const netoReal = pay.net_received_amount || 0;
+            for (const pid of od.paymentIds) {
+              promises.push(
+                fetch(`https://api.mercadopago.com/v1/payments/${pid}`, {
+                  headers: { 'Authorization': 'Bearer ' + ML.access }
+                }).then(r => r.ok ? r.json() : null).then(pay => {
+                  if (!pay) return;
 
-                // Parse charges_details
-                const charges = pay.charges_details || [];
-                let comision = 0, impuestos = 0, financiero = 0, envio = 0;
+                  // Parse charges_details de ESTE payment
+                  const charges = pay.charges_details || [];
 
-                for (const ch of charges) {
-                  const amt = ch.amounts?.original || 0;
-                  if (amt === 0) continue;
-                  const type = (ch.type || '').toLowerCase();
-                  const name = (ch.name || '').toLowerCase();
+                  for (const ch of charges) {
+                    const amt = ch.amounts?.original || 0;
+                    if (amt === 0) continue;
+                    const type = (ch.type || '').toLowerCase();
+                    const name = (ch.name || '').toLowerCase();
 
-                  // Skip buyer-side charges (coupons, discounts)
-                  if (type === 'coupon' || type === 'discount') continue;
-                  if (name.includes('coupon') || name.includes('rebate')) continue;
+                    // Skip buyer-side charges (coupons, discounts)
+                    if (type === 'coupon' || type === 'discount') continue;
+                    if (name.includes('coupon') || name.includes('rebate')) continue;
 
-                  if (type === 'tax') {
-                    impuestos += amt;
-                  } else if (type === 'fee') {
-                    if (name.includes('financing') || name.includes('interest') || name.includes('add_on')) {
-                      financiero += amt;
-                    } else {
-                      comision += amt;
+                    if (type === 'tax') {
+                      od._impuestos += amt;
+                    } else if (type === 'fee') {
+                      if (name.includes('financing') || name.includes('interest') || name.includes('add_on')) {
+                        od._financiero += amt;
+                      } else {
+                        od._comision += amt;
+                      }
+                    } else if (type === 'shipping') {
+                      od._envio += amt;
                     }
-                  } else if (type === 'shipping') {
-                    envio += amt;
                   }
-                }
 
-                if (comision > 0) od.row.cargo_venta = -comision;
-                if (impuestos > 0) od.row.impuestos = -impuestos;
-                if (financiero > 0) od.row.costo_financiero = -financiero;
-                if (envio > 0) od.row.cargo_envio = -envio;
-
-                // por_cobrar = bruto menos todos los cargos (no usar net_received_amount que viene incompleto)
-                od.row.por_cobrar = od.bruto - comision - financiero - impuestos - envio;
-
-                // fecha_cobro como referencia, pero NO marca conciliado
-                // La conciliación solo se hace via Account Statement
-                od.row.fecha_cobro = pay.money_release_date?.split('T')[0] || pay.date_approved?.split('T')[0] || null;
-              }).catch(() => {})
-            );
+                  // fecha_cobro: tomar del primer payment que tenga
+                  if (!od.row.fecha_cobro) {
+                    od.row.fecha_cobro = pay.money_release_date?.split('T')[0] || pay.date_approved?.split('T')[0] || null;
+                  }
+                }).catch(err => {
+                  console.warn(`⚠ Payment ${pid} fetch failed:`, err.message);
+                })
+              );
+            }
           }
 
           await Promise.all(promises);
+
+          // Aplicar totales acumulados de TODOS los payments (split payment support)
+          if (od._comision > 0) od.row.cargo_venta = -od._comision;
+          if (od._impuestos > 0) od.row.impuestos = -od._impuestos;
+          if (od._financiero > 0) od.row.costo_financiero = -od._financiero;
+          if (od._envio > 0) od.row.cargo_envio = -od._envio;
+
+          // por_cobrar = bruto menos todos los cargos (no usar net_received_amount)
+          if (od._comision > 0 || od._impuestos > 0 || od._financiero > 0 || od._envio > 0) {
+            od.row.por_cobrar = od.row.importe_bruto
+              - (od._comision || 0) - (od._financiero || 0)
+              - (od._impuestos || 0) - (od._envio || 0);
+          }
 
           // Después de resolver shipment + payment:
           // Si es Flex, cargo_envio = bonificación (positivo, es ingreso)
@@ -729,18 +744,50 @@ app.post('/mp/settlement-sync', async (req, res) => {
       // Comisión = fee + mkp_fee (son complementarios)
       const comisionTotal = Math.abs(fee) + Math.abs(mkpFee);
 
-      // Buscar venta por mp_payment_id = sourceId
-      const ventas = await sbGet('ventas_ml', `mp_payment_id=eq.${sourceId}&limit=1`);
+      // Buscar venta por mp_payment_id = sourceId (o en mp_payment_ids para split payments)
+      let ventas = await sbGet('ventas_ml', `mp_payment_id=eq.${sourceId}&limit=1`);
+      if (!ventas?.length) {
+        // Fallback: buscar en split payments
+        ventas = await sbGet('ventas_ml', `mp_payment_ids=like.*${sourceId}*&limit=1`).catch(() => []);
+      }
       if (!ventas?.length) { skipped++; continue; }
 
       // Actualizar con desglose real
-      const updateData = {
-        cargo_venta: comisionTotal ? -Math.abs(comisionTotal) : ventas[0].cargo_venta,
-        cargo_envio: shipping ? -Math.abs(shipping) : ventas[0].cargo_envio,
-        costo_financiero: financing ? -Math.abs(financing) : ventas[0].costo_financiero,
-        impuestos: taxes ? -Math.abs(taxes) : ventas[0].impuestos,
-        por_cobrar: netAmount || ventas[0].por_cobrar,
-      };
+      // Para split payments (pagos_cantidad > 1), los fees vienen en líneas separadas
+      // del CSV → hay que ACUMULAR en vez de sobrescribir
+      const isSplit = ventas[0].pagos_cantidad > 1;
+      const existing = ventas[0];
+
+      let updateData;
+      if (isSplit && existing.mp_payment_id !== sourceId) {
+        // Es el segundo (o N-ésimo) pago del split → acumular sobre lo existente
+        updateData = {
+          cargo_venta: comisionTotal
+            ? (existing.cargo_venta || 0) + (-Math.abs(comisionTotal))
+            : existing.cargo_venta,
+          cargo_envio: shipping
+            ? (existing.cargo_envio || 0) + (-Math.abs(shipping))
+            : existing.cargo_envio,
+          costo_financiero: financing
+            ? (existing.costo_financiero || 0) + (-Math.abs(financing))
+            : existing.costo_financiero,
+          impuestos: taxes
+            ? (existing.impuestos || 0) + (-Math.abs(taxes))
+            : existing.impuestos,
+          por_cobrar: netAmount
+            ? (existing.por_cobrar || 0) + netAmount
+            : existing.por_cobrar,
+        };
+      } else {
+        // Pago único o primer pago del split → sobrescribir como antes
+        updateData = {
+          cargo_venta: comisionTotal ? -Math.abs(comisionTotal) : existing.cargo_venta,
+          cargo_envio: shipping ? -Math.abs(shipping) : existing.cargo_envio,
+          costo_financiero: financing ? -Math.abs(financing) : existing.costo_financiero,
+          impuestos: taxes ? -Math.abs(taxes) : existing.impuestos,
+          por_cobrar: netAmount || existing.por_cobrar,
+        };
+      }
 
       // Si la venta no estaba conciliada, marcarla
       if (netAmount > 0 && !ventas[0].conciliado) {
@@ -953,11 +1000,22 @@ async function autoConciliarMP() {
   let nMovs = 0, nVentas = 0;
 
   // Crear índice de ventas por mp_payment_id para lookup rápido
+  // También indexar por cada ID dentro de mp_payment_ids (split payments)
   const ventasByPayment = {};
   for (const v of (ventas || [])) {
     if (v.mp_payment_id) {
       if (!ventasByPayment[v.mp_payment_id]) ventasByPayment[v.mp_payment_id] = [];
       ventasByPayment[v.mp_payment_id].push(v);
+    }
+    // Indexar split payments: cada payment_id individual apunta a la misma venta
+    if (v.mp_payment_ids) {
+      for (const pid of v.mp_payment_ids.split(',')) {
+        const trimmed = pid.trim();
+        if (trimmed && !ventasByPayment[trimmed]) {
+          ventasByPayment[trimmed] = [];
+        }
+        if (trimmed) ventasByPayment[trimmed].push(v);
+      }
     }
   }
 
