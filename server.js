@@ -465,6 +465,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
           //    Los cargos se distribuyen entre payments, hay que sumarlos todos
           if (od.paymentIds.length && od.row.ml_status !== 'cancelled') {
             od._comision = 0; od._impuestos = 0; od._financiero = 0; od._envio = 0;
+            od._shippingBuyerContrib = 0; // contribución del comprador al envío
 
             for (const pid of od.paymentIds) {
               promises.push(
@@ -499,6 +500,12 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
                     }
                   }
 
+                  // Acumular contribución del comprador al envío (shipping_amount)
+                  // Este monto se resta del cargo de envío para obtener el neto real
+                  if (pay.shipping_amount > 0) {
+                    od._shippingBuyerContrib += pay.shipping_amount;
+                  }
+
                   // fecha_cobro: tomar del primer payment que tenga
                   if (!od.row.fecha_cobro) {
                     od.row.fecha_cobro = pay.money_release_date?.split('T')[0] || pay.date_approved?.split('T')[0] || null;
@@ -516,13 +523,20 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
           if (od._comision > 0) od.row.cargo_venta = -od._comision;
           if (od._impuestos > 0) od.row.impuestos = -od._impuestos;
           if (od._financiero > 0) od.row.costo_financiero = -od._financiero;
-          if (od._envio > 0) od.row.cargo_envio = -od._envio;
+          // Envío neto = cargo de envío - contribución del comprador
+          // Ej: cargo $10,729.58 - buyer $5,346.59 = neto $5,382.99
+          if (od._envio > 0) {
+            const envioNeto = od._envio - (od._shippingBuyerContrib || 0);
+            od.row.cargo_envio = -Math.round(envioNeto * 100) / 100;
+          }
 
-          // por_cobrar = bruto menos todos los cargos (no usar net_received_amount)
+          // por_cobrar = bruto menos todos los cargos netos
           if (od._comision > 0 || od._impuestos > 0 || od._financiero > 0 || od._envio > 0) {
             od.row.por_cobrar = od.row.importe_bruto
-              - (od._comision || 0) - (od._financiero || 0)
-              - (od._impuestos || 0) - (od._envio || 0);
+              + od.row.cargo_venta
+              + od.row.cargo_envio
+              + od.row.costo_financiero
+              + od.row.impuestos;
           }
 
           // Después de resolver shipment + payment:
