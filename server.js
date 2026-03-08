@@ -988,8 +988,8 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
       insertados += batch.length;
     }
 
-    // Auto-conciliar con ventas ML
-    const conciliados = await autoConciliarMP();
+    // NO auto-conciliar acá (tarda demasiado con miles de registros y hace timeout)
+    // El usuario ejecuta la conciliación por separado con POST /mp/conciliar
 
     res.json({ 
       ok: true, 
@@ -997,7 +997,6 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
       total: movs.length, 
       liquidaciones: movs.filter(m => m.categoria === 'venta_ml').length,
       insertados, 
-      conciliados_automaticamente: conciliados,
       periodo: `${fechaMin} → ${fechaMax}`
     });
   } catch (e) {
@@ -1008,9 +1007,9 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
 
 async function autoConciliarMP() {
   // Traer movimientos MP tipo venta no conciliados
-  const movs   = await sbGet('movimientos_mp', 'conciliado=eq.false&categoria=eq.venta_ml&limit=5000');
+  const movs   = await sbGet('movimientos_mp', 'conciliado=eq.false&categoria=eq.venta_ml&limit=10000');
   // Traer TODAS las ventas ML no conciliadas
-  const ventas = await sbGet('ventas_ml', 'conciliado=eq.false&limit=5000');
+  const ventas = await sbGet('ventas_ml', 'conciliado=eq.false&limit=10000');
   let nMovs = 0, nVentas = 0;
 
   // Crear índice de ventas por mp_payment_id para lookup rápido
@@ -1021,7 +1020,6 @@ async function autoConciliarMP() {
       if (!ventasByPayment[v.mp_payment_id]) ventasByPayment[v.mp_payment_id] = [];
       ventasByPayment[v.mp_payment_id].push(v);
     }
-    // Indexar split payments: cada payment_id individual apunta a la misma venta
     if (v.mp_payment_ids) {
       for (const pid of v.mp_payment_ids.split(',')) {
         const trimmed = pid.trim();
@@ -1033,24 +1031,19 @@ async function autoConciliarMP() {
     }
   }
 
+  // Recolectar IDs para batch update en vez de PATCH individuales
+  const movIdsToConc = [];      // {id, venta_ml_id}
+  const ventaIdsToConc = new Set();
+
   for (const mov of (movs || [])) {
     if (!mov.referencia_mp) continue;
-
-    // Buscar ventas con este payment_id (exacto)
     const matches = ventasByPayment[mov.referencia_mp] || [];
 
     if (matches.length > 0) {
-      // Marcar movimiento MP como conciliado
-      await sbPatch('movimientos_mp', `id=eq.${mov.id}`, {
-        conciliado: true,
-        venta_ml_id: matches[0].id
-      });
-
-      // Marcar TODAS las ventas ML del pack como conciliadas
+      movIdsToConc.push({ id: mov.id, venta_ml_id: matches[0].id });
       for (const match of matches) {
-        if (!match.conciliado) {
-          await sbPatch('ventas_ml', `id=eq.${match.id}`, { conciliado: true });
-          match.conciliado = true;
+        if (!ventaIdsToConc.has(match.id)) {
+          ventaIdsToConc.add(match.id);
           nVentas++;
         }
       }
@@ -1058,7 +1051,29 @@ async function autoConciliarMP() {
     }
   }
 
-  console.log(`✓ Auto-conciliación MP: ${nMovs} movimientos → ${nVentas} ventas ML`);
+  // Batch update movimientos_mp (de a 50 IDs por query)
+  const movChunks = [];
+  const movArr = [...movIdsToConc];
+  for (let i = 0; i < movArr.length; i += 50) {
+    movChunks.push(movArr.slice(i, i + 50));
+  }
+  for (const chunk of movChunks) {
+    const ids = chunk.map(m => m.id).join(',');
+    await sbPatch('movimientos_mp', `id=in.(${ids})`, { conciliado: true }).catch(e => {
+      console.warn('Batch patch movimientos_mp:', e.message);
+    });
+  }
+
+  // Batch update ventas_ml (de a 50 IDs por query)
+  const ventaArr = [...ventaIdsToConc];
+  for (let i = 0; i < ventaArr.length; i += 50) {
+    const ids = ventaArr.slice(i, i + 50).join(',');
+    await sbPatch('ventas_ml', `id=in.(${ids})`, { conciliado: true }).catch(e => {
+      console.warn('Batch patch ventas_ml:', e.message);
+    });
+  }
+
+  console.log(`✓ Auto-conciliación MP: ${nMovs} movimientos → ${nVentas} ventas ML (batch mode)`);
   return { movimientos: nMovs, ventas: nVentas };
 }
 
