@@ -304,13 +304,13 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
   }
 
   // ML API tiene un tope de offset=1000. Para traer más, partimos por rangos de fecha.
-  // Estrategia: iterar por intervalos de 15 días.
+  // Estrategia: iterar por intervalos de 7 días (~500 ventas max por chunk).
   const dateChunks = [];
   let chunkStart = new Date(desde);
   const endDate  = new Date(hasta);
   while (chunkStart <= endDate) {
     let chunkEnd = new Date(chunkStart);
-    chunkEnd.setDate(chunkEnd.getDate() + 14); // 15 días por chunk
+    chunkEnd.setDate(chunkEnd.getDate() + 6); // 7 días por chunk
     if (chunkEnd > endDate) chunkEnd = new Date(endDate);
     dateChunks.push({
       from: chunkStart.toISOString().split('T')[0],
