@@ -770,27 +770,21 @@ app.get('/debug-return-reasons', async (req, res) => {
   try {
     if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
     
-    // Primero buscar un claim activo para obtener el claim_id
-    const r1 = await fetch('https://api.mercadolibre.com/post-purchase/v1/claims/search?status=opened&limit=1', {
-      headers: { 'Authorization': 'Bearer ' + ML.access }
-    });
-    const search = await r1.json();
-    const claimId = search.data?.[0]?.id;
-    if (!claimId) return res.json({ ok: false, error: 'No hay claims abiertos' });
-
-    // Traer reasons con claim_id
-    const r2 = await fetch(`https://api.mercadolibre.com/post-purchase/v1/returns/reasons?flow=return&claim_id=${claimId}`, {
-      headers: { 'Authorization': 'Bearer ' + ML.access }
-    });
-    const reasons = await r2.json();
+    const reasonIds = ['PDD9939', 'PDD9942', 'PDD9946', 'PDD9949', 'PDD9953'];
+    const results = {};
     
-    // También probar el detalle del claim para ver el reason_id con descripción
-    const r3 = await fetch(`https://api.mercadolibre.com/post-purchase/v1/claims/${claimId}`, {
-      headers: { 'Authorization': 'Bearer ' + ML.access }
-    });
-    const claimDetail = await r3.json();
-
-    res.json({ ok: true, claim_id: claimId, reasons, claim_reason: claimDetail.reason_id, claim_detail_keys: Object.keys(claimDetail) });
+    for (const rid of reasonIds) {
+      try {
+        const r = await fetch(`https://api.mercadolibre.com/post-purchase/v1/claims/reasons/${rid}`, {
+          headers: { 'Authorization': 'Bearer ' + ML.access }
+        });
+        results[rid] = await r.json();
+      } catch (e) {
+        results[rid] = { error: e.message };
+      }
+    }
+    
+    res.json({ ok: true, reasons: results });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
