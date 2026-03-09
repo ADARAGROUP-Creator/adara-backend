@@ -651,6 +651,58 @@ app.get('/debug-order/:orderId', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── DEBUG: Test Claims API (devoluciones) ─────────────────────────────
+app.get('/debug-claims', async (req, res) => {
+  try {
+    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
+    
+    // 1. Buscar claims abiertos tipo return
+    const searchUrl = `https://api.mercadolibre.com/post-purchase/v1/claims/search?status=opened&sort=date_created:desc&limit=5`;
+    const r1 = await fetch(searchUrl, {
+      headers: { 'Authorization': 'Bearer ' + ML.access }
+    });
+    const claims = await r1.json();
+    
+    // 2. Si hay claims, traer detalle del primero
+    let claimDetail = null;
+    let returnDetail = null;
+    if (claims.data?.length) {
+      const firstClaim = claims.data[0];
+      
+      // Detalle del claim
+      const r2 = await fetch(`https://api.mercadolibre.com/post-purchase/v1/claims/${firstClaim.id}`, {
+        headers: { 'Authorization': 'Bearer ' + ML.access }
+      });
+      claimDetail = await r2.json();
+      
+      // Detalle de la devolución
+      const r3 = await fetch(`https://api.mercadolibre.com/post-purchase/v2/claims/${firstClaim.id}/returns`, {
+        headers: { 'Authorization': 'Bearer ' + ML.access }
+      });
+      returnDetail = await r3.json();
+    }
+    
+    res.json({
+      ok: true,
+      search_status: r1.status,
+      total_claims: claims.paging?.total || claims.data?.length || 0,
+      claims_preview: (claims.data || []).map(c => ({
+        id: c.id,
+        type: c.type,
+        status: c.status,
+        stage: c.stage,
+        resource_id: c.resource_id,
+        reason_id: c.reason_id,
+        date_created: c.date_created,
+      })),
+      first_claim_detail: claimDetail,
+      first_claim_returns: returnDetail,
+    });
+  } catch (e) { 
+    res.status(500).json({ error: e.message, stack: e.stack?.split('\n').slice(0,3) }); 
+  }
+});
+
 // ── MERCADOPAGO — Settlement Report (desglose real de fees) ─────────
 // Helper: call MP API
 async function mpApi(path, opts = {}) {
