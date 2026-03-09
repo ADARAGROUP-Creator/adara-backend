@@ -396,8 +396,6 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             enviado:          false,
             hora_venta:       horaVenta,
             fecha_despacho_flex: null,  // se calcula después si es flex
-            conciliado:       false,
-            fecha_cobro:      null,
           }
         };
       });
@@ -568,6 +566,8 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
 
       const dbRows = orderData.map(d => d.row);
       if (dbRows.length) {
+        // No enviar conciliado en el upsert — si ya estaba conciliado, no pisar
+        dbRows.forEach(r => delete r.conciliado);
         await sbUpsert('ventas_ml', dbRows, 'ml_order_id');
         totalInsertados += dbRows.length;
       }
