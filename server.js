@@ -651,55 +651,117 @@ app.get('/debug-order/:orderId', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── DEBUG: Test Claims API (devoluciones) ─────────────────────────────
-app.get('/debug-claims', async (req, res) => {
+// ── DEVOLUCIONES ML (Claims API) ──────────────────────────────────────
+app.get('/ml/devoluciones', async (req, res) => {
   try {
     if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
     
-    // 1. Buscar claims abiertos tipo return
-    const searchUrl = `https://api.mercadolibre.com/post-purchase/v1/claims/search?status=opened&sort=date_created:desc&limit=5`;
-    const r1 = await fetch(searchUrl, {
-      headers: { 'Authorization': 'Bearer ' + ML.access }
-    });
-    const claims = await r1.json();
+    // 1. Buscar claims abiertos (limit 50)
+    const searchUrl = `https://api.mercadolibre.com/post-purchase/v1/claims/search?status=opened&sort=date_created:desc&limit=50`;
+    const r1 = await fetch(searchUrl, { headers: { 'Authorization': 'Bearer ' + ML.access } });
+    const searchData = await r1.json();
+    const claims = searchData.data || [];
     
-    // 2. Si hay claims, traer detalle del primero
-    let claimDetail = null;
-    let returnDetail = null;
-    if (claims.data?.length) {
-      const firstClaim = claims.data[0];
-      
-      // Detalle del claim
-      const r2 = await fetch(`https://api.mercadolibre.com/post-purchase/v1/claims/${firstClaim.id}`, {
-        headers: { 'Authorization': 'Bearer ' + ML.access }
-      });
-      claimDetail = await r2.json();
-      
-      // Detalle de la devolución
-      const r3 = await fetch(`https://api.mercadolibre.com/post-purchase/v2/claims/${firstClaim.id}/returns`, {
-        headers: { 'Authorization': 'Bearer ' + ML.access }
-      });
-      returnDetail = await r3.json();
+    if (!claims.length) {
+      return res.json({ ok: true, total: 0, devoluciones: [] });
     }
     
-    res.json({
-      ok: true,
-      search_status: r1.status,
-      total_claims: claims.paging?.total || claims.data?.length || 0,
-      claims_preview: (claims.data || []).map(c => ({
-        id: c.id,
-        type: c.type,
-        status: c.status,
-        stage: c.stage,
-        resource_id: c.resource_id,
-        reason_id: c.reason_id,
-        date_created: c.date_created,
-      })),
-      first_claim_detail: claimDetail,
-      first_claim_returns: returnDetail,
-    });
-  } catch (e) { 
-    res.status(500).json({ error: e.message, stack: e.stack?.split('\n').slice(0,3) }); 
+    // 2. Para cada claim, traer detalle de return (en paralelo, batches de 5)
+    const results = [];
+    for (let i = 0; i < claims.length; i += 5) {
+      const batch = claims.slice(i, i + 5);
+      await Promise.all(batch.map(async (claim) => {
+        try {
+          // Detalle del claim
+          const rClaim = await fetch(`https://api.mercadolibre.com/post-purchase/v1/claims/${claim.id}`, {
+            headers: { 'Authorization': 'Bearer ' + ML.access }
+          });
+          const claimDetail = await rClaim.json();
+          
+          // Detalle del return
+          let returnDetail = null;
+          if (claimDetail.related_entities?.includes('return')) {
+            const rRet = await fetch(`https://api.mercadolibre.com/post-purchase/v2/claims/${claim.id}/returns`, {
+              headers: { 'Authorization': 'Bearer ' + ML.access }
+            });
+            returnDetail = await rRet.json();
+          }
+          
+          const orderId = String(claim.resource_id);
+          const returnStatus = returnDetail?.status || null;
+          const returnShipStatus = returnDetail?.shipments?.[0]?.status || null;
+          const moneyStatus = returnDetail?.status_money || null;
+          
+          results.push({
+            claim_id: claim.id,
+            order_id: orderId,
+            type: claim.type,
+            stage: claimDetail.stage || claim.stage,
+            reason_id: claim.reason_id,
+            date_created: claim.date_created,
+            fulfilled: claimDetail.fulfilled,
+            quantity_type: claimDetail.quantity_type,
+            return_status: returnStatus,
+            return_ship_status: returnShipStatus,
+            money_status: moneyStatus,
+            seller_actions: (claimDetail.players || [])
+              .find(p => p.type === 'seller')?.available_actions?.map(a => a.action) || [],
+          });
+        } catch (e) {
+          console.warn(`Claim ${claim.id} fetch error:`, e.message);
+        }
+      }));
+    }
+    
+    // 3. Actualizar ventas_ml con datos de claims
+    let updated = 0;
+    for (const dev of results) {
+      const claimStatus = dev.return_ship_status === 'delivered' ? 'producto_recibido'
+        : dev.return_ship_status === 'shipped' ? 'en_transito'
+        : dev.return_status === 'label_generated' ? 'etiqueta_generada'
+        : 'abierto';
+      
+      try {
+        await sbPatch('ventas_ml', `ml_order_id=eq.${dev.order_id}`, {
+          claim_id: String(dev.claim_id),
+          claim_status: claimStatus,
+          motivo_devolucion: dev.reason_id,
+        });
+        updated++;
+      } catch (e) {
+        console.warn(`Patch venta ${dev.order_id}:`, e.message);
+      }
+    }
+    
+    // 4. Enriquecer con datos de ventas_ml
+    const orderIds = results.map(r => r.order_id);
+    let ventasMap = {};
+    if (orderIds.length) {
+      // Fetch in chunks of 20
+      for (let i = 0; i < orderIds.length; i += 20) {
+        const chunk = orderIds.slice(i, i + 20);
+        const ventas = await sbGet('ventas_ml', `ml_order_id=in.(${chunk.join(',')})&select=ml_order_id,titulo,sku,importe_bruto,tipo_envio,fecha,linea_negocio_id`);
+        for (const v of (ventas || [])) {
+          ventasMap[v.ml_order_id] = v;
+        }
+      }
+    }
+    
+    const devoluciones = results.map(r => ({
+      ...r,
+      titulo: ventasMap[r.order_id]?.titulo || null,
+      sku: ventasMap[r.order_id]?.sku || null,
+      importe: ventasMap[r.order_id]?.importe_bruto || null,
+      tipo_envio: ventasMap[r.order_id]?.tipo_envio || null,
+      fecha_venta: ventasMap[r.order_id]?.fecha || null,
+    }));
+    
+    console.log(`✓ Devoluciones ML: ${results.length} claims, ${updated} ventas actualizadas`);
+    res.json({ ok: true, total: results.length, updated, devoluciones });
+    
+  } catch (e) {
+    console.error('Devoluciones ML:', e);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -1095,21 +1157,23 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
 async function autoConciliarMP() {
   // Traer movimientos MP no conciliados: liquidaciones + canceladas + devoluciones
   const movs = await sbGet('movimientos_mp', 'conciliado=eq.false&categoria=in.(venta_ml,venta_cancelada,devolucion)&limit=10000');
-  // Traer TODAS las ventas ML no conciliadas (incluyendo canceladas)
-  const ventas = await sbGet('ventas_ml', 'conciliado=eq.false&limit=10000');
-  let nMovs = 0, nVentas = 0;
+  // Traer ventas ML no conciliadas
+  const ventasNoConc = await sbGet('ventas_ml', 'conciliado=eq.false&limit=10000');
+  // También traer ventas conciliadas para matchear devoluciones (la venta ya se cobró, ahora se devuelve)
+  const ventasConc = await sbGet('ventas_ml', 'conciliado=eq.true&devuelta=eq.false&limit=10000');
+  const allVentas = [...(ventasNoConc || []), ...(ventasConc || [])];
+  let nMovs = 0, nVentas = 0, nDevueltas = 0;
 
-  // Lookup línea ML para asignar si la venta no tiene
+  // Lookup línea ML
   let mlLineaId = null;
   try {
     const lineas = await sbGet('lineas_negocio', 'nombre=ilike.*mercado libre*&limit=1');
     if (lineas?.length) mlLineaId = lineas[0].id;
   } catch(e) {}
 
-  // Crear índice de ventas por mp_payment_id para lookup rápido
-  // También indexar por cada ID dentro de mp_payment_ids (split payments)
+  // Índice de ventas por payment_id
   const ventasByPayment = {};
-  for (const v of (ventas || [])) {
+  for (const v of allVentas) {
     if (v.mp_payment_id) {
       if (!ventasByPayment[v.mp_payment_id]) ventasByPayment[v.mp_payment_id] = [];
       ventasByPayment[v.mp_payment_id].push(v);
@@ -1117,37 +1181,45 @@ async function autoConciliarMP() {
     if (v.mp_payment_ids) {
       for (const pid of v.mp_payment_ids.split(',')) {
         const trimmed = pid.trim();
-        if (trimmed && !ventasByPayment[trimmed]) {
-          ventasByPayment[trimmed] = [];
+        if (trimmed) {
+          if (!ventasByPayment[trimmed]) ventasByPayment[trimmed] = [];
+          ventasByPayment[trimmed].push(v);
         }
-        if (trimmed) ventasByPayment[trimmed].push(v);
       }
     }
   }
 
-  // Recolectar IDs para batch update en vez de PATCH individuales
-  const movIdsToConc = [];      // {id, venta_ml_id, linea_negocio_id}
+  const movIdsToConc = [];
   const ventaIdsToConc = new Set();
+  const ventaIdsDevuelta = [];  // {id, monto}
 
   for (const mov of (movs || [])) {
     if (!mov.referencia_mp) continue;
     const matches = ventasByPayment[mov.referencia_mp] || [];
+    if (!matches.length) continue;
 
-    if (matches.length > 0) {
-      const lineaId = matches[0].linea_negocio_id || mlLineaId || null;
-      movIdsToConc.push({ id: mov.id, venta_ml_id: matches[0].id, linea_negocio_id: lineaId });
+    const lineaId = matches[0].linea_negocio_id || mlLineaId || null;
+    movIdsToConc.push({ id: mov.id, linea_negocio_id: lineaId });
+
+    // Si es devolución o cancelada → marcar la venta como devuelta
+    if (['devolucion', 'venta_cancelada'].includes(mov.categoria)) {
       for (const match of matches) {
-        if (!ventaIdsToConc.has(match.id)) {
+        ventaIdsDevuelta.push({ id: match.id, monto: Math.abs(mov.monto_neto || 0) });
+        nDevueltas++;
+      }
+    } else {
+      // Liquidación normal → marcar como conciliada
+      for (const match of matches) {
+        if (!match.conciliado && !ventaIdsToConc.has(match.id)) {
           ventaIdsToConc.add(match.id);
           nVentas++;
         }
       }
-      nMovs++;
     }
+    nMovs++;
   }
 
-  // Batch update movimientos_mp (de a 50 IDs por query)
-  // Agrupar por linea_negocio_id para hacer patch eficiente
+  // Batch update movimientos_mp
   const movsByLinea = {};
   for (const m of movIdsToConc) {
     const key = m.linea_negocio_id || '__null__';
@@ -1165,7 +1237,7 @@ async function autoConciliarMP() {
     }
   }
 
-  // Batch update ventas_ml (de a 50 IDs por query)
+  // Batch update ventas_ml conciliadas (liquidaciones normales)
   const ventaArr = [...ventaIdsToConc];
   for (let i = 0; i < ventaArr.length; i += 50) {
     const ids = ventaArr.slice(i, i + 50).join(',');
@@ -1174,8 +1246,18 @@ async function autoConciliarMP() {
     });
   }
 
-  console.log(`✓ Auto-conciliación MP: ${nMovs} movimientos → ${nVentas} ventas ML (batch mode, línea=${mlLineaId||'none'})`);
-  return { movimientos: nMovs, ventas: nVentas };
+  // Marcar ventas devueltas
+  for (const dev of ventaIdsDevuelta) {
+    await sbPatch('ventas_ml', `id=eq.${dev.id}`, { 
+      devuelta: true, 
+      monto_reembolso: dev.monto 
+    }).catch(e => {
+      console.warn('Patch devuelta:', e.message);
+    });
+  }
+
+  console.log(`✓ Auto-conciliación MP: ${nMovs} movs → ${nVentas} ventas conciliadas, ${nDevueltas} devoluciones (línea=${mlLineaId||'none'})`);
+  return { movimientos: nMovs, ventas: nVentas, devoluciones: nDevueltas };
 }
 
 app.post('/mp/conciliar', async (_, res) => {
