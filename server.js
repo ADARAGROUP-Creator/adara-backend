@@ -395,7 +395,8 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             partido:          null,
             enviado:          false,
             hora_venta:       horaVenta,
-            fecha_despacho_flex: null,  // se calcula después si es flex
+            fecha_despacho_flex: null,
+            estado_envio:     'no_preparado',
           }
         };
       });
@@ -445,6 +446,13 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
                 }
                 
                 od.row.enviado = ship.status === 'delivered';
+
+                // Estado físico del envío para cancelaciones/devoluciones
+                const ss = ship.status || 'pending';
+                od.row.estado_envio = ss === 'delivered' ? 'entregado'
+                  : ['shipped', 'not_delivered'].includes(ss) ? 'despachado'
+                  : ss === 'ready_to_ship' ? 'preparado'
+                  : 'no_preparado';
 
                 // Bonificación Flex: ML devuelve base_cost - list_cost como bonificación
                 // Es un ingreso (positivo) porque el vendedor pone logística propia
@@ -566,8 +574,11 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
 
       const dbRows = orderData.map(d => d.row);
       if (dbRows.length) {
-        // No enviar conciliado en el upsert — si ya estaba conciliado, no pisar
-        dbRows.forEach(r => delete r.conciliado);
+        // No enviar campos que el usuario gestiona manualmente
+        dbRows.forEach(r => {
+          delete r.conciliado;
+          delete r.estado_cancelacion; // se gestiona desde UI, no pisar en re-sync
+        });
         await sbUpsert('ventas_ml', dbRows, 'ml_order_id');
         totalInsertados += dbRows.length;
       }
@@ -1021,9 +1032,9 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
 });
 
 async function autoConciliarMP() {
-  // Traer movimientos MP tipo venta no conciliados
-  const movs   = await sbGet('movimientos_mp', 'conciliado=eq.false&categoria=eq.venta_ml&limit=10000');
-  // Traer TODAS las ventas ML no conciliadas
+  // Traer movimientos MP no conciliados: liquidaciones + canceladas + devoluciones
+  const movs = await sbGet('movimientos_mp', 'conciliado=eq.false&categoria=in.(venta_ml,venta_cancelada,devolucion)&limit=10000');
+  // Traer TODAS las ventas ML no conciliadas (incluyendo canceladas)
   const ventas = await sbGet('ventas_ml', 'conciliado=eq.false&limit=10000');
   let nMovs = 0, nVentas = 0;
 
