@@ -969,7 +969,22 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'No se encontraron movimientos válidos en el archivo' });
     }
 
-    // ─── Insertar en Supabase (sin on_conflict porque no hay PK única en referencia_mp, puede repetir) ────
+    // ─── Auto-asignar línea de negocio ML a categorías ML ─────────
+    const ML_CATS = ['venta_ml', 'bonificacion_envio', 'devolucion', 'venta_cancelada'];
+    let mlLineaId = null;
+    try {
+      const lineas = await sbGet('lineas_negocio', 'nombre=ilike.*mercado libre*&limit=1');
+      if (lineas?.length) mlLineaId = lineas[0].id;
+    } catch(e) { console.warn('No se pudo obtener línea ML:', e.message); }
+
+    if (mlLineaId) {
+      for (const m of movs) {
+        if (ML_CATS.includes(m.categoria)) m.linea_negocio_id = mlLineaId;
+      }
+      console.log(`MP extracto: línea ML ${mlLineaId} asignada a ${movs.filter(m => m.linea_negocio_id).length} movimientos`);
+    }
+
+    // ─── Insertar en Supabase ─────────────────────────────────────
     // Primero limpiamos movimientos previos del mismo período para evitar duplicados
     const fechaMin = movs.reduce((min, m) => m.fecha < min ? m.fecha : min, movs[0].fecha);
     const fechaMax = movs.reduce((max, m) => m.fecha > max ? m.fecha : max, movs[0].fecha);
@@ -1012,6 +1027,13 @@ async function autoConciliarMP() {
   const ventas = await sbGet('ventas_ml', 'conciliado=eq.false&limit=10000');
   let nMovs = 0, nVentas = 0;
 
+  // Lookup línea ML para asignar si la venta no tiene
+  let mlLineaId = null;
+  try {
+    const lineas = await sbGet('lineas_negocio', 'nombre=ilike.*mercado libre*&limit=1');
+    if (lineas?.length) mlLineaId = lineas[0].id;
+  } catch(e) {}
+
   // Crear índice de ventas por mp_payment_id para lookup rápido
   // También indexar por cada ID dentro de mp_payment_ids (split payments)
   const ventasByPayment = {};
@@ -1032,7 +1054,7 @@ async function autoConciliarMP() {
   }
 
   // Recolectar IDs para batch update en vez de PATCH individuales
-  const movIdsToConc = [];      // {id, venta_ml_id}
+  const movIdsToConc = [];      // {id, venta_ml_id, linea_negocio_id}
   const ventaIdsToConc = new Set();
 
   for (const mov of (movs || [])) {
@@ -1040,7 +1062,8 @@ async function autoConciliarMP() {
     const matches = ventasByPayment[mov.referencia_mp] || [];
 
     if (matches.length > 0) {
-      movIdsToConc.push({ id: mov.id, venta_ml_id: matches[0].id });
+      const lineaId = matches[0].linea_negocio_id || mlLineaId || null;
+      movIdsToConc.push({ id: mov.id, venta_ml_id: matches[0].id, linea_negocio_id: lineaId });
       for (const match of matches) {
         if (!ventaIdsToConc.has(match.id)) {
           ventaIdsToConc.add(match.id);
@@ -1052,16 +1075,22 @@ async function autoConciliarMP() {
   }
 
   // Batch update movimientos_mp (de a 50 IDs por query)
-  const movChunks = [];
-  const movArr = [...movIdsToConc];
-  for (let i = 0; i < movArr.length; i += 50) {
-    movChunks.push(movArr.slice(i, i + 50));
+  // Agrupar por linea_negocio_id para hacer patch eficiente
+  const movsByLinea = {};
+  for (const m of movIdsToConc) {
+    const key = m.linea_negocio_id || '__null__';
+    if (!movsByLinea[key]) movsByLinea[key] = [];
+    movsByLinea[key].push(m.id);
   }
-  for (const chunk of movChunks) {
-    const ids = chunk.map(m => m.id).join(',');
-    await sbPatch('movimientos_mp', `id=in.(${ids})`, { conciliado: true }).catch(e => {
-      console.warn('Batch patch movimientos_mp:', e.message);
-    });
+  for (const [key, ids] of Object.entries(movsByLinea)) {
+    const patchData = { conciliado: true };
+    if (key !== '__null__') patchData.linea_negocio_id = key;
+    for (let i = 0; i < ids.length; i += 50) {
+      const chunk = ids.slice(i, i + 50).join(',');
+      await sbPatch('movimientos_mp', `id=in.(${chunk})`, patchData).catch(e => {
+        console.warn('Batch patch movimientos_mp:', e.message);
+      });
+    }
   }
 
   // Batch update ventas_ml (de a 50 IDs por query)
@@ -1073,7 +1102,7 @@ async function autoConciliarMP() {
     });
   }
 
-  console.log(`✓ Auto-conciliación MP: ${nMovs} movimientos → ${nVentas} ventas ML (batch mode)`);
+  console.log(`✓ Auto-conciliación MP: ${nMovs} movimientos → ${nVentas} ventas ML (batch mode, línea=${mlLineaId||'none'})`);
   return { movimientos: nMovs, ventas: nVentas };
 }
 
