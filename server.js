@@ -765,6 +765,18 @@ app.get('/ml/devoluciones', async (req, res) => {
   }
 });
 
+// ── DEBUG: Return reasons ──────────────────────────────────────────────
+app.get('/debug-return-reasons', async (req, res) => {
+  try {
+    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
+    const r = await fetch('https://api.mercadolibre.com/post-purchase/v1/returns/reasons?flow=return', {
+      headers: { 'Authorization': 'Bearer ' + ML.access }
+    });
+    const reasons = await r.json();
+    res.json({ ok: true, status: r.status, reasons });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── MERCADOPAGO — Settlement Report (desglose real de fees) ─────────
 // Helper: call MP API
 async function mpApi(path, opts = {}) {
