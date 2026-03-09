@@ -397,6 +397,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             hora_venta:       horaVenta,
             fecha_despacho_flex: null,
             estado_envio:     'no_preparado',
+            fecha_cobro:      null,
           }
         };
       });
@@ -463,7 +464,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
                     od.flexBonificacion = Math.round((baseCost - listCost) * 100) / 100;
                   }
                 }
-              }).catch(() => { od.row.tipo_envio = 'otro'; })
+              }).catch(() => { od.row.tipo_envio = 'otro'; od.row.estado_envio = 'no_preparado'; })
             );
           }
 
