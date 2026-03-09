@@ -575,12 +575,20 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
 
       const dbRows = orderData.map(d => d.row);
       if (dbRows.length) {
-        // No enviar campos que el usuario gestiona manualmente
-        dbRows.forEach(r => {
-          delete r.conciliado;
-          delete r.estado_cancelacion; // se gestiona desde UI, no pisar en re-sync
+        // Normalizar: todas las filas deben tener exactamente las mismas keys
+        // Supabase PGRST102: "All object keys must match"
+        const allKeys = new Set();
+        dbRows.forEach(r => Object.keys(r).forEach(k => allKeys.add(k)));
+        // Remover campos que no deben pisarse en re-sync
+        allKeys.delete('conciliado');
+        allKeys.delete('estado_cancelacion');
+        const keyList = [...allKeys];
+        const normalized = dbRows.map(r => {
+          const obj = {};
+          keyList.forEach(k => obj[k] = r[k] !== undefined ? r[k] : null);
+          return obj;
         });
-        await sbUpsert('ventas_ml', dbRows, 'ml_order_id');
+        await sbUpsert('ventas_ml', normalized, 'ml_order_id');
         totalInsertados += dbRows.length;
       }
 
