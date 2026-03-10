@@ -1073,6 +1073,8 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
       if (t.includes('liquidación de dinero') && !t.includes('cancelada'))  return 'venta_ml';
       if (t.includes('liquidación') && t.includes('cancelada'))             return 'venta_cancelada';
       if (t.includes('bonificación'))                                       return 'bonificacion_envio';
+      // Cargo envío devolución ANTES del check genérico de devolución
+      if (t.includes('cargo') && t.includes('devolución'))                  return 'cargo_envio_devolucion';
       if (t.includes('devolución'))                                         return 'devolucion';
       if (t.includes('transferencia enviada') || t.includes('transferencia programada')) return 'transferencia_salida';
       if (t.includes('transferencia recibida') || t.includes('entrada'))    return 'transferencia_entrada';
@@ -1127,7 +1129,7 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
     }
 
     // ─── Auto-asignar línea de negocio ML a categorías ML ─────────
-    const ML_CATS = ['venta_ml', 'bonificacion_envio', 'devolucion', 'venta_cancelada'];
+    const ML_CATS = ['venta_ml', 'bonificacion_envio', 'devolucion', 'venta_cancelada', 'cargo_envio_devolucion'];
     let mlLineaId = null;
     try {
       const lineas = await sbGet('lineas_negocio', 'nombre=ilike.*mercado libre*&limit=1');
@@ -1178,8 +1180,8 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
 });
 
 async function autoConciliarMP() {
-  // Traer movimientos MP no conciliados: liquidaciones + canceladas + devoluciones
-  const movs = await sbGet('movimientos_mp', 'conciliado=eq.false&categoria=in.(venta_ml,venta_cancelada,devolucion)&limit=10000');
+  // Traer movimientos MP no conciliados: liquidaciones + canceladas + devoluciones + cargo envío devol
+  const movs = await sbGet('movimientos_mp', 'conciliado=eq.false&categoria=in.(venta_ml,venta_cancelada,devolucion,cargo_envio_devolucion)&limit=10000');
   // Traer ventas ML no conciliadas
   const ventasNoConc = await sbGet('ventas_ml', 'conciliado=eq.false&limit=10000');
   // También traer ventas conciliadas para matchear devoluciones (la venta ya se cobró, ahora se devuelve)
@@ -1215,6 +1217,7 @@ async function autoConciliarMP() {
   const movIdsToConc = [];
   const ventaIdsToConc = new Set();
   const ventaIdsDevuelta = [];  // {id, monto}
+  const ventaIdsCargoEnvio = []; // {id, monto} cargo envío devolución
 
   for (const mov of (movs || [])) {
     if (!mov.referencia_mp) continue;
@@ -1224,8 +1227,13 @@ async function autoConciliarMP() {
     const lineaId = matches[0].linea_negocio_id || mlLineaId || null;
     movIdsToConc.push({ id: mov.id, linea_negocio_id: lineaId });
 
-    // Si es devolución o cancelada → marcar la venta como devuelta
-    if (['devolucion', 'venta_cancelada'].includes(mov.categoria)) {
+    if (mov.categoria === 'cargo_envio_devolucion') {
+      // Cargo envío devolución → guardar monto en la venta
+      for (const match of matches) {
+        ventaIdsCargoEnvio.push({ id: match.id, monto: mov.monto_neto || 0 });
+      }
+    } else if (['devolucion', 'venta_cancelada'].includes(mov.categoria)) {
+      // Devolución o cancelada → marcar la venta como devuelta
       for (const match of matches) {
         ventaIdsDevuelta.push({ id: match.id, monto: Math.abs(mov.monto_neto || 0) });
         nDevueltas++;
@@ -1279,8 +1287,17 @@ async function autoConciliarMP() {
     });
   }
 
-  console.log(`✓ Auto-conciliación MP: ${nMovs} movs → ${nVentas} ventas conciliadas, ${nDevueltas} devoluciones (línea=${mlLineaId||'none'})`);
-  return { movimientos: nMovs, ventas: nVentas, devoluciones: nDevueltas };
+  // Guardar cargo envío devolución
+  for (const ce of ventaIdsCargoEnvio) {
+    await sbPatch('ventas_ml', `id=eq.${ce.id}`, { 
+      cargo_envio_devolucion: ce.monto 
+    }).catch(e => {
+      console.warn('Patch cargo_envio_devolucion:', e.message);
+    });
+  }
+
+  console.log(`✓ Auto-conciliación MP: ${nMovs} movs → ${nVentas} ventas conciliadas, ${nDevueltas} devoluciones, ${ventaIdsCargoEnvio.length} cargos envío devol (línea=${mlLineaId||'none'})`);
+  return { movimientos: nMovs, ventas: nVentas, devoluciones: nDevueltas, cargos_envio: ventaIdsCargoEnvio.length };
 }
 
 app.post('/mp/conciliar', async (_, res) => {
