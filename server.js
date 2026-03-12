@@ -1258,6 +1258,17 @@ async function autoConciliarMP() {
     nMovs++;
   }
 
+  // ─── Helper: ejecutar promises en paralelo con límite de concurrencia ──
+  const parallel = async (tasks, concurrency = 15) => {
+    const results = [];
+    for (let i = 0; i < tasks.length; i += concurrency) {
+      const batch = tasks.slice(i, i + concurrency);
+      const batchResults = await Promise.allSettled(batch.map(fn => fn()));
+      results.push(...batchResults);
+    }
+    return results;
+  };
+
   // ─── Batch update movimientos_mp: conciliado + venta_ml_id ────────
   // Agrupar por venta_id + linea_id para minimizar calls
   const movGroups = {};
@@ -1266,45 +1277,47 @@ async function autoConciliarMP() {
     if (!movGroups[key]) movGroups[key] = { venta_id: m.venta_id, linea_id: m.linea_id, ids: [] };
     movGroups[key].ids.push(m.mov_id);
   }
+  
+  // Paralelizar patches de movimientos
+  const movTasks = [];
   for (const g of Object.values(movGroups)) {
     const patchData = { conciliado: true, venta_ml_id: g.venta_id };
     if (g.linea_id) patchData.linea_negocio_id = g.linea_id;
     for (let i = 0; i < g.ids.length; i += 50) {
       const chunk = g.ids.slice(i, i + 50).join(',');
-      await sbPatch('movimientos_mp', `id=in.(${chunk})`, patchData).catch(e => {
+      movTasks.push(() => sbPatch('movimientos_mp', `id=in.(${chunk})`, patchData).catch(e => {
         console.warn('Batch patch movimientos_mp:', e.message);
-      });
+      }));
     }
   }
+  await parallel(movTasks);
+  console.log(`  → ${movTasks.length} patches movimientos_mp en paralelo`);
 
   // ─── Batch update ventas_ml conciliadas (liquidaciones normales) ──
   const ventaArr = [...ventaIdsToConc];
+  const ventaConcTasks = [];
   for (let i = 0; i < ventaArr.length; i += 50) {
     const ids = ventaArr.slice(i, i + 50).join(',');
-    await sbPatch('ventas_ml', `id=in.(${ids})`, { conciliado: true, estado_conciliacion: 'conciliado' }).catch(e => {
+    ventaConcTasks.push(() => sbPatch('ventas_ml', `id=in.(${ids})`, { conciliado: true, estado_conciliacion: 'conciliado' }).catch(e => {
       console.warn('Batch patch ventas_ml conc:', e.message);
-    });
+    }));
   }
+  await parallel(ventaConcTasks);
 
-  // ─── Marcar ventas devueltas ──────────────────────────────────────
+  // ─── Marcar ventas devueltas + cargo envío (paralelizado) ─────────
+  const devTasks = [];
   for (const [ventaId, monto] of Object.entries(ventaDevuelta)) {
-    await sbPatch('ventas_ml', `id=eq.${ventaId}`, { 
-      devuelta: true, 
-      monto_reembolso: monto,
-      estado_conciliacion: 'conciliado'
-    }).catch(e => {
-      console.warn('Patch devuelta:', e.message);
-    });
+    devTasks.push(() => sbPatch('ventas_ml', `id=eq.${ventaId}`, { 
+      devuelta: true, monto_reembolso: monto, estado_conciliacion: 'conciliado'
+    }).catch(e => console.warn('Patch devuelta:', e.message)));
   }
-
-  // ─── Guardar cargo envío devolución ───────────────────────────────
   for (const [ventaId, monto] of Object.entries(ventaCargoEnvio)) {
-    await sbPatch('ventas_ml', `id=eq.${ventaId}`, { 
+    devTasks.push(() => sbPatch('ventas_ml', `id=eq.${ventaId}`, { 
       cargo_envio_devolucion: monto 
-    }).catch(e => {
-      console.warn('Patch cargo_envio_devolucion:', e.message);
-    });
+    }).catch(e => console.warn('Patch cargo_envio_devolucion:', e.message)));
   }
+  await parallel(devTasks);
+  console.log(`  → ${devTasks.length} patches devueltas+cargo en paralelo`);
 
   // Balance se calcula al final unificado (después del segundo pase de bonificaciones)
 
@@ -1380,17 +1393,19 @@ async function autoConciliarMP() {
         }
       }
       
-      // 6. Batch update bonificaciones agrupadas por venta_id (misma lógica que primer pase)
+      // 6. Batch update bonificaciones agrupadas por venta_id (paralelizado)
+      const bonifTasks = [];
       for (const [ventaId, movIds] of Object.entries(bonifByVenta)) {
         const patchData = { conciliado: true, venta_ml_id: ventaId };
         if (mlLineaId) patchData.linea_negocio_id = mlLineaId;
         for (let i = 0; i < movIds.length; i += 50) {
           const chunk = movIds.slice(i, i + 50).join(',');
-          await sbPatch('movimientos_mp', `id=in.(${chunk})`, patchData).catch(e => {
+          bonifTasks.push(() => sbPatch('movimientos_mp', `id=in.(${chunk})`, patchData).catch(e => {
             console.warn('Batch patch bonif adyacencia:', e.message);
-          });
+          }));
         }
       }
+      await parallel(bonifTasks);
       
       console.log(`✓ Bonificaciones por adyacencia: ${nBonifAdyacencia} de ${bonifSinVinc.length} vinculadas`);
     }
@@ -1435,19 +1450,22 @@ async function autoConciliarMP() {
     }
     
     // Batch update conciliadas (balance 0)
+    const balConcTasks = [];
     for (let i = 0; i < conciliadoIds.length; i += 50) {
       const chunk = conciliadoIds.slice(i, i + 50).join(',');
-      await sbPatch('ventas_ml', `id=in.(${chunk})`, {
+      balConcTasks.push(() => sbPatch('ventas_ml', `id=in.(${chunk})`, {
         balance_conciliacion: 0, estado_conciliacion: 'conciliado', conciliado: true
-      }).catch(e => console.warn('Batch balance conc:', e.message));
+      }).catch(e => console.warn('Batch balance conc:', e.message)));
     }
+    await parallel(balConcTasks);
     
-    // Parciales van individuales (cada una tiene balance distinto)
-    for (const upd of parcialUpdates) {
-      await sbPatch('ventas_ml', `id=eq.${upd.id}`, {
+    // Parciales en paralelo (cada una tiene balance distinto)
+    const parcialTasks = parcialUpdates.map(upd => () => 
+      sbPatch('ventas_ml', `id=eq.${upd.id}`, {
         balance_conciliacion: upd.balance, estado_conciliacion: 'parcial', conciliado: false
-      }).catch(e => console.warn('Patch balance parcial:', e.message));
-    }
+      }).catch(e => console.warn('Patch balance parcial:', e.message))
+    );
+    await parallel(parcialTasks);
   }
 
   const result = { 
