@@ -1156,6 +1156,25 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
       console.log(`MP extracto: borrados movimientos previos ${fechaMin} → ${fechaMax}`);
     } catch(e) { console.warn('Delete previos:', e.message); }
 
+    // Resetear estado de conciliación de ventas del período
+    // Al re-subir extracto, los movimientos viejos se borraron → ventas quedan huérfanas
+    const periodos = new Set();
+    periodos.add(fechaMin.substring(0, 7));
+    periodos.add(fechaMax.substring(0, 7));
+    for (const per of periodos) {
+      try {
+        await sbPatch('ventas_ml', `periodo=eq.${per}&estado_conciliacion=neq.descartada`, {
+          estado_conciliacion: 'pendiente',
+          conciliado: false,
+          balance_conciliacion: 0,
+          devuelta: false,
+          monto_reembolso: 0,
+          cargo_envio_devolucion: 0
+        });
+        console.log(`MP extracto: reset estado conciliación ventas período ${per}`);
+      } catch(e) { console.warn('Reset ventas:', e.message); }
+    }
+
     // Normalizar keys (PGRST102: all object keys must match)
     const allKeys = new Set();
     for (const m of movs) { for (const k of Object.keys(m)) allKeys.add(k); }
@@ -1178,7 +1197,8 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
       total: movs.length, 
       liquidaciones: movs.filter(m => m.categoria === 'venta_ml').length,
       insertados, 
-      periodo: `${fechaMin} → ${fechaMax}`
+      periodo: `${fechaMin} → ${fechaMax}`,
+      periodos_reseteados: [...periodos]
     });
   } catch (e) {
     console.error('MP extracto:', e);
