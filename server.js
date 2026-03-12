@@ -1150,36 +1150,43 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
     const fechaMin = movs.reduce((min, m) => m.fecha < min ? m.fecha : min, movs[0].fecha);
     const fechaMax = movs.reduce((max, m) => m.fecha > max ? m.fecha : max, movs[0].fecha);
     
-    // Delete previos del mismo rango
+    // Resetear estado de conciliación SOLO de ventas que pierden sus movimientos
+    // Al borrar movimientos del rango, algunas ventas quedan con links huérfanos
+    // Resetear solo esas, no todo el período (para no romper conciliaciones de extractos anteriores)
+    
+    // 1. ANTES de borrar: guardar los venta_ml_id de movimientos que se van a eliminar
+    let ventasAResetear = [];
+    try {
+      const movsABorrar = await sbGet('movimientos_mp', 
+        `fecha=gte.${fechaMin}&fecha=lte.${fechaMax}&venta_ml_id=not.is.null&select=venta_ml_id&limit=10000`
+      );
+      ventasAResetear = [...new Set((movsABorrar || []).map(m => m.venta_ml_id).filter(Boolean))];
+      console.log(`MP extracto: ${ventasAResetear.length} ventas vinculadas a movimientos que se van a borrar`);
+    } catch(e) { console.warn('Pre-reset query:', e.message); }
+
+    // 2. Borrar movimientos previos del rango
     try {
       await sb('DELETE', 'movimientos_mp', null, `fecha=gte.${fechaMin}&fecha=lte.${fechaMax}`);
       console.log(`MP extracto: borrados movimientos previos ${fechaMin} → ${fechaMax}`);
     } catch(e) { console.warn('Delete previos:', e.message); }
 
-    // Resetear estado de conciliación de ventas del período
-    // Al re-subir extracto, los movimientos viejos se borraron → ventas quedan huérfanas
-    // Supabase PATCH no soporta limit → traemos IDs y parcheamos por lotes
-    const periodos = new Set();
-    periodos.add(fechaMin.substring(0, 7));
-    periodos.add(fechaMax.substring(0, 7));
-    const resetData = {
-      estado_conciliacion: 'pendiente',
-      conciliado: false,
-      balance_conciliacion: 0,
-      devuelta: false,
-      monto_reembolso: 0,
-      cargo_envio_devolucion: 0
-    };
-    for (const per of periodos) {
-      try {
-        const ventas = await sbGet('ventas_ml', `periodo=eq.${per}&estado_conciliacion=neq.descartada&select=id&limit=5000`);
-        if (!ventas?.length) continue;
-        for (let i = 0; i < ventas.length; i += 50) {
-          const ids = ventas.slice(i, i + 50).map(v => v.id).join(',');
-          await sbPatch('ventas_ml', `id=in.(${ids})`, resetData);
-        }
-        console.log(`MP extracto: reset ${ventas.length} ventas período ${per}`);
-      } catch(e) { console.warn('Reset ventas:', e.message); }
+    // 3. Resetear SOLO las ventas afectadas (de cualquier período)
+    if (ventasAResetear.length) {
+      const resetData = {
+        estado_conciliacion: 'pendiente',
+        conciliado: false,
+        balance_conciliacion: 0,
+        devuelta: false,
+        monto_reembolso: 0,
+        cargo_envio_devolucion: 0
+      };
+      for (let i = 0; i < ventasAResetear.length; i += 50) {
+        const ids = ventasAResetear.slice(i, i + 50).join(',');
+        await sbPatch('ventas_ml', `id=in.(${ids})`, resetData).catch(e => {
+          console.warn('Reset ventas afectadas:', e.message);
+        });
+      }
+      console.log(`MP extracto: reset ${ventasAResetear.length} ventas afectadas`);
     }
 
     // Normalizar keys (PGRST102: all object keys must match)
@@ -1205,7 +1212,7 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
       liquidaciones: movs.filter(m => m.categoria === 'venta_ml').length,
       insertados, 
       periodo: `${fechaMin} → ${fechaMax}`,
-      periodos_reseteados: [...periodos]
+      ventas_reseteadas: ventasAResetear.length
     });
   } catch (e) {
     console.error('MP extracto:', e);
