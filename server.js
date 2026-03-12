@@ -1306,34 +1306,7 @@ async function autoConciliarMP() {
     });
   }
 
-  // ─── Calcular balance para ventas tocadas ─────────────────────────
-  let nBalanceOk = 0, nBalanceDiff = 0;
-  for (const ventaId of ventasTocadas) {
-    // Si ya fue procesada como conciliada/devuelta arriba, skip balance individual
-    if (ventaIdsToConc.has(ventaId) || ventaDevuelta[ventaId]) continue;
-    
-    // Ventas que solo tienen bonificaciones vinculadas → marcar parcial
-    try {
-      const movsVenta = await sbGet('movimientos_mp', `venta_ml_id=eq.${ventaId}&select=monto_neto`);
-      const sumMovs = (movsVenta || []).reduce((s, m) => s + (m.monto_neto || 0), 0);
-      const venta = allVentas.find(v => v.id === ventaId);
-      if (!venta) continue;
-      
-      const esperado = venta.por_cobrar || 0;
-      const balance = Math.round((sumMovs - esperado) * 100) / 100;
-      const estado = balance === 0 ? 'conciliado' : (sumMovs !== 0 ? 'parcial' : 'pendiente');
-      
-      await sbPatch('ventas_ml', `id=eq.${ventaId}`, {
-        balance_conciliacion: balance,
-        estado_conciliacion: estado,
-        conciliado: estado === 'conciliado'
-      });
-      if (estado === 'conciliado') nBalanceOk++;
-      else nBalanceDiff++;
-    } catch(e) {
-      console.warn('Balance calc:', e.message);
-    }
-  }
+  // Balance se calcula al final unificado (después del segundo pase de bonificaciones)
 
   // ─── SEGUNDO PASE: bonificaciones por adyacencia ──────────────────
   // Las bonificaciones Flex no usan payment_id como referencia.
@@ -1347,7 +1320,7 @@ async function autoConciliarMP() {
     );
     
     if (bonifSinVinc?.length) {
-      // 2. Obtener las posiciones vecinas que necesitamos consultar
+      // 2. Obtener las posiciones vecinas
       const posicionesVecinas = new Set();
       for (const b of bonifSinVinc) {
         if (b.posicion > 1) posicionesVecinas.add(b.posicion - 1);
@@ -1365,35 +1338,23 @@ async function autoConciliarMP() {
         if (batch?.length) vecinos.push(...batch);
       }
       
-      // Index vecinos por posicion
       const vecinoByPos = {};
-      for (const v of vecinos) {
-        vecinoByPos[v.posicion] = v;
-      }
+      for (const v of vecinos) { vecinoByPos[v.posicion] = v; }
       
-      // 4. Para cada bonificación, buscar vecino vinculado a venta Flex con monto matching
-      // Necesitamos las ventas Flex con su cargo_envio
-      const ventasFlexById = {};
-      for (const v of (allVentas || [])) {
-        ventasFlexById[v.id] = v;
-      }
-      
-      // Traer cargo_envio de ventas (no viene en el select original)
+      // 4. Traer cargo_envio de ventas candidatas (batch)
       const ventaIdsNecesarios = [...new Set(vecinos.map(v => v.venta_ml_id))];
       const ventasConCargo = {};
       for (let i = 0; i < ventaIdsNecesarios.length; i += 200) {
         const chunk = ventaIdsNecesarios.slice(i, i + 200).join(',');
         const batch = await sbGet('ventas_ml', `id=in.(${chunk})&select=id,cargo_envio,tipo_envio`);
-        for (const v of (batch || [])) {
-          ventasConCargo[v.id] = v;
-        }
+        for (const v of (batch || [])) { ventasConCargo[v.id] = v; }
       }
       
-      const bonifToLink = []; // {mov_id, venta_id, linea_id}
-      const ventasYaUsadas = new Set(); // evitar vincular 2 bonificaciones a la misma venta
+      // 5. Matching en memoria (sin calls)
+      const ventasYaUsadas = new Set();
+      const bonifByVenta = {}; // venta_id → [mov_ids]
       
       for (const bonif of bonifSinVinc) {
-        // Buscar vecino: primero anterior (posicion - 1), luego siguiente (posicion + 1)
         const candidatos = [
           vecinoByPos[bonif.posicion - 1],
           vecinoByPos[bonif.posicion + 1]
@@ -1401,57 +1362,92 @@ async function autoConciliarMP() {
         
         for (const vecino of candidatos) {
           if (ventasYaUsadas.has(vecino.venta_ml_id)) continue;
-          
           const venta = ventasConCargo[vecino.venta_ml_id];
-          if (!venta) continue;
-          if (venta.tipo_envio !== 'flex') continue;
+          if (!venta || venta.tipo_envio !== 'flex') continue;
           
-          // Verificar monto: bonif.monto_neto ≈ venta.cargo_envio (tolerancia 0.02)
           const bonifMonto = Math.abs(bonif.monto_neto || 0);
           const ventaBonif = Math.abs(venta.cargo_envio || 0);
           if (ventaBonif === 0) continue;
           
           if (Math.abs(bonifMonto - ventaBonif) <= 0.02) {
-            bonifToLink.push({ mov_id: bonif.id, venta_id: venta.id, linea_id: mlLineaId });
+            if (!bonifByVenta[venta.id]) bonifByVenta[venta.id] = [];
+            bonifByVenta[venta.id].push(bonif.id);
             ventasYaUsadas.add(venta.id);
             ventasTocadas.add(venta.id);
             nBonifAdyacencia++;
-            break; // esta bonificación ya matcheó
+            break;
           }
         }
       }
       
-      // 5. Batch update bonificaciones vinculadas
-      for (const link of bonifToLink) {
-        const patchData = { conciliado: true, venta_ml_id: link.venta_id };
-        if (link.linea_id) patchData.linea_negocio_id = link.linea_id;
-        await sbPatch('movimientos_mp', `id=eq.${link.mov_id}`, patchData).catch(e => {
-          console.warn('Patch bonif adyacencia:', e.message);
-        });
-      }
-      
-      // 6. Recalcular balance de ventas que recibieron bonificaciones
-      for (const ventaId of ventasYaUsadas) {
-        try {
-          const movsVenta = await sbGet('movimientos_mp', `venta_ml_id=eq.${ventaId}&select=monto_neto`);
-          const sumMovs = (movsVenta || []).reduce((s, m) => s + (m.monto_neto || 0), 0);
-          const venta = allVentas.find(v => v.id === ventaId);
-          if (!venta) continue;
-          const esperado = venta.por_cobrar || 0;
-          const balance = Math.round((sumMovs - esperado) * 100) / 100;
-          const estado = balance === 0 ? 'conciliado' : 'parcial';
-          await sbPatch('ventas_ml', `id=eq.${ventaId}`, {
-            balance_conciliacion: balance,
-            estado_conciliacion: estado,
-            conciliado: estado === 'conciliado'
+      // 6. Batch update bonificaciones agrupadas por venta_id (misma lógica que primer pase)
+      for (const [ventaId, movIds] of Object.entries(bonifByVenta)) {
+        const patchData = { conciliado: true, venta_ml_id: ventaId };
+        if (mlLineaId) patchData.linea_negocio_id = mlLineaId;
+        for (let i = 0; i < movIds.length; i += 50) {
+          const chunk = movIds.slice(i, i + 50).join(',');
+          await sbPatch('movimientos_mp', `id=in.(${chunk})`, patchData).catch(e => {
+            console.warn('Batch patch bonif adyacencia:', e.message);
           });
-        } catch(e) { console.warn('Balance bonif:', e.message); }
+        }
       }
       
       console.log(`✓ Bonificaciones por adyacencia: ${nBonifAdyacencia} de ${bonifSinVinc.length} vinculadas`);
     }
   } catch(e) {
     console.warn('Segundo pase bonificaciones:', e.message);
+  }
+
+  // ─── Recalcular balance para TODAS las ventas tocadas (ambos pases) ──
+  // Hacemos esto una sola vez al final para evitar calls duplicados
+  let nBalanceOk = 0, nBalanceDiff = 0;
+  const ventasParaBalance = [...ventasTocadas].filter(id => !ventaIdsToConc.has(id) && !ventaDevuelta[id]);
+  
+  if (ventasParaBalance.length) {
+    // Traer todos los movimientos vinculados de estas ventas en batch
+    const ventaMontosMap = {}; // venta_id → suma de montos
+    for (let i = 0; i < ventasParaBalance.length; i += 200) {
+      const chunk = ventasParaBalance.slice(i, i + 200).join(',');
+      const movsChunk = await sbGet('movimientos_mp', `venta_ml_id=in.(${chunk})&select=venta_ml_id,monto_neto&limit=10000`);
+      for (const m of (movsChunk || [])) {
+        ventaMontosMap[m.venta_ml_id] = (ventaMontosMap[m.venta_ml_id] || 0) + (m.monto_neto || 0);
+      }
+    }
+    
+    // Calcular balance y agrupar por estado para batch update
+    const conciliadoIds = [];
+    const parcialUpdates = []; // {id, balance}
+    
+    for (const ventaId of ventasParaBalance) {
+      const sumMovs = ventaMontosMap[ventaId] || 0;
+      const venta = allVentas.find(v => v.id === ventaId);
+      if (!venta) continue;
+      const esperado = venta.por_cobrar || 0;
+      const balance = Math.round((sumMovs - esperado) * 100) / 100;
+      
+      if (balance === 0) {
+        conciliadoIds.push(ventaId);
+        nBalanceOk++;
+      } else if (sumMovs !== 0) {
+        parcialUpdates.push({ id: ventaId, balance });
+        nBalanceDiff++;
+      }
+    }
+    
+    // Batch update conciliadas (balance 0)
+    for (let i = 0; i < conciliadoIds.length; i += 50) {
+      const chunk = conciliadoIds.slice(i, i + 50).join(',');
+      await sbPatch('ventas_ml', `id=in.(${chunk})`, {
+        balance_conciliacion: 0, estado_conciliacion: 'conciliado', conciliado: true
+      }).catch(e => console.warn('Batch balance conc:', e.message));
+    }
+    
+    // Parciales van individuales (cada una tiene balance distinto)
+    for (const upd of parcialUpdates) {
+      await sbPatch('ventas_ml', `id=eq.${upd.id}`, {
+        balance_conciliacion: upd.balance, estado_conciliacion: 'parcial', conciliado: false
+      }).catch(e => console.warn('Patch balance parcial:', e.message));
+    }
   }
 
   const result = { 
