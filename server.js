@@ -726,6 +726,7 @@ app.get('/ml/devoluciones', async (req, res) => {
           claim_id: String(dev.claim_id),
           claim_status: claimStatus,
           motivo_devolucion: dev.reason_id,
+          fecha_devolucion: dev.date_created ? dev.date_created.substring(0, 10) : null,
         });
         updated++;
       } catch (e) {
@@ -1180,14 +1181,16 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
 });
 
 async function autoConciliarMP() {
-  // Traer movimientos MP no conciliados: liquidaciones + canceladas + devoluciones + cargo envío devol
-  const movs = await sbGet('movimientos_mp', 'conciliado=eq.false&categoria=in.(venta_ml,venta_cancelada,devolucion,cargo_envio_devolucion)&limit=10000');
-  // Traer ventas ML no conciliadas
-  const ventasNoConc = await sbGet('ventas_ml', 'conciliado=eq.false&limit=10000');
-  // También traer ventas conciliadas para matchear devoluciones (la venta ya se cobró, ahora se devuelve)
-  const ventasConc = await sbGet('ventas_ml', 'conciliado=eq.true&devuelta=eq.false&limit=10000');
-  const allVentas = [...(ventasNoConc || []), ...(ventasConc || [])];
-  let nMovs = 0, nVentas = 0, nDevueltas = 0;
+  // ─── V2: incluye bonificaciones + venta_ml_id + balance ───────────
+  const CATS_AUTO = 'venta_ml,venta_cancelada,devolucion,cargo_envio_devolucion,bonificacion_envio';
+  
+  // Solo movimientos sin venta vinculada (no pisar links manuales)
+  const movs = await sbGet('movimientos_mp', `conciliado=eq.false&venta_ml_id=is.null&categoria=in.(${CATS_AUTO})&limit=10000`);
+  
+  // Traer TODAS las ventas (para matchear devoluciones de ventas ya conciliadas)
+  const allVentas = await sbGet('ventas_ml', 'limit=50000&select=id,mp_payment_id,mp_payment_ids,conciliado,devuelta,linea_negocio_id,por_cobrar,ml_status,fecha_entrega');
+
+  let nMovs = 0, nVentas = 0, nDevueltas = 0, nBonif = 0;
 
   // Lookup línea ML
   let mlLineaId = null;
@@ -1198,7 +1201,7 @@ async function autoConciliarMP() {
 
   // Índice de ventas por payment_id
   const ventasByPayment = {};
-  for (const v of allVentas) {
+  for (const v of (allVentas || [])) {
     if (v.mp_payment_id) {
       if (!ventasByPayment[v.mp_payment_id]) ventasByPayment[v.mp_payment_id] = [];
       ventasByPayment[v.mp_payment_id].push(v);
@@ -1214,95 +1217,215 @@ async function autoConciliarMP() {
     }
   }
 
-  const movIdsToConc = [];
+  // ─── Matching: vincular movimientos a ventas ──────────────────────
+  // Acumuladores agrupados por venta_ml_id para batch updates
+  const movToVenta = [];          // {mov_id, venta_id, linea_id}
   const ventaIdsToConc = new Set();
-  const ventaIdsDevuelta = [];  // {id, monto}
-  const ventaIdsCargoEnvio = []; // {id, monto} cargo envío devolución
+  const ventaDevuelta = {};       // venta_id → monto acumulado
+  const ventaCargoEnvio = {};     // venta_id → monto
+  const ventasTocadas = new Set(); // para recalcular balance después
 
   for (const mov of (movs || [])) {
     if (!mov.referencia_mp) continue;
     const matches = ventasByPayment[mov.referencia_mp] || [];
     if (!matches.length) continue;
 
-    const lineaId = matches[0].linea_negocio_id || mlLineaId || null;
-    movIdsToConc.push({ id: mov.id, linea_negocio_id: lineaId });
+    const venta = matches[0];
+    const lineaId = venta.linea_negocio_id || mlLineaId || null;
+    movToVenta.push({ mov_id: mov.id, venta_id: venta.id, linea_id: lineaId });
+    ventasTocadas.add(venta.id);
 
     if (mov.categoria === 'cargo_envio_devolucion') {
-      // Cargo envío devolución → guardar monto en la venta
-      for (const match of matches) {
-        ventaIdsCargoEnvio.push({ id: match.id, monto: mov.monto_neto || 0 });
-      }
+      ventaCargoEnvio[venta.id] = (ventaCargoEnvio[venta.id] || 0) + (mov.monto_neto || 0);
     } else if (['devolucion', 'venta_cancelada'].includes(mov.categoria)) {
-      // Devolución o cancelada → marcar la venta como devuelta
-      for (const match of matches) {
-        ventaIdsDevuelta.push({ id: match.id, monto: Math.abs(mov.monto_neto || 0) });
-        nDevueltas++;
-      }
+      ventaDevuelta[venta.id] = (ventaDevuelta[venta.id] || 0) + Math.abs(mov.monto_neto || 0);
+      nDevueltas++;
+    } else if (mov.categoria === 'bonificacion_envio') {
+      nBonif++;
     } else {
-      // Liquidación normal → marcar como conciliada
-      for (const match of matches) {
-        if (!match.conciliado && !ventaIdsToConc.has(match.id)) {
-          ventaIdsToConc.add(match.id);
-          nVentas++;
-        }
+      // venta_ml (liquidación normal)
+      if (!venta.conciliado && !ventaIdsToConc.has(venta.id)) {
+        ventaIdsToConc.add(venta.id);
+        nVentas++;
       }
     }
     nMovs++;
   }
 
-  // Batch update movimientos_mp
-  const movsByLinea = {};
-  for (const m of movIdsToConc) {
-    const key = m.linea_negocio_id || '__null__';
-    if (!movsByLinea[key]) movsByLinea[key] = [];
-    movsByLinea[key].push(m.id);
+  // ─── Batch update movimientos_mp: conciliado + venta_ml_id ────────
+  // Agrupar por venta_id + linea_id para minimizar calls
+  const movGroups = {};
+  for (const m of movToVenta) {
+    const key = `${m.venta_id}|${m.linea_id || ''}`;
+    if (!movGroups[key]) movGroups[key] = { venta_id: m.venta_id, linea_id: m.linea_id, ids: [] };
+    movGroups[key].ids.push(m.mov_id);
   }
-  for (const [key, ids] of Object.entries(movsByLinea)) {
-    const patchData = { conciliado: true };
-    if (key !== '__null__') patchData.linea_negocio_id = key;
-    for (let i = 0; i < ids.length; i += 50) {
-      const chunk = ids.slice(i, i + 50).join(',');
+  for (const g of Object.values(movGroups)) {
+    const patchData = { conciliado: true, venta_ml_id: g.venta_id };
+    if (g.linea_id) patchData.linea_negocio_id = g.linea_id;
+    for (let i = 0; i < g.ids.length; i += 50) {
+      const chunk = g.ids.slice(i, i + 50).join(',');
       await sbPatch('movimientos_mp', `id=in.(${chunk})`, patchData).catch(e => {
         console.warn('Batch patch movimientos_mp:', e.message);
       });
     }
   }
 
-  // Batch update ventas_ml conciliadas (liquidaciones normales)
+  // ─── Batch update ventas_ml conciliadas (liquidaciones normales) ──
   const ventaArr = [...ventaIdsToConc];
   for (let i = 0; i < ventaArr.length; i += 50) {
     const ids = ventaArr.slice(i, i + 50).join(',');
-    await sbPatch('ventas_ml', `id=in.(${ids})`, { conciliado: true }).catch(e => {
-      console.warn('Batch patch ventas_ml:', e.message);
+    await sbPatch('ventas_ml', `id=in.(${ids})`, { conciliado: true, estado_conciliacion: 'conciliado' }).catch(e => {
+      console.warn('Batch patch ventas_ml conc:', e.message);
     });
   }
 
-  // Marcar ventas devueltas
-  for (const dev of ventaIdsDevuelta) {
-    await sbPatch('ventas_ml', `id=eq.${dev.id}`, { 
+  // ─── Marcar ventas devueltas ──────────────────────────────────────
+  for (const [ventaId, monto] of Object.entries(ventaDevuelta)) {
+    await sbPatch('ventas_ml', `id=eq.${ventaId}`, { 
       devuelta: true, 
-      monto_reembolso: dev.monto 
+      monto_reembolso: monto,
+      estado_conciliacion: 'conciliado'
     }).catch(e => {
       console.warn('Patch devuelta:', e.message);
     });
   }
 
-  // Guardar cargo envío devolución
-  for (const ce of ventaIdsCargoEnvio) {
-    await sbPatch('ventas_ml', `id=eq.${ce.id}`, { 
-      cargo_envio_devolucion: ce.monto 
+  // ─── Guardar cargo envío devolución ───────────────────────────────
+  for (const [ventaId, monto] of Object.entries(ventaCargoEnvio)) {
+    await sbPatch('ventas_ml', `id=eq.${ventaId}`, { 
+      cargo_envio_devolucion: monto 
     }).catch(e => {
       console.warn('Patch cargo_envio_devolucion:', e.message);
     });
   }
 
-  console.log(`✓ Auto-conciliación MP: ${nMovs} movs → ${nVentas} ventas conciliadas, ${nDevueltas} devoluciones, ${ventaIdsCargoEnvio.length} cargos envío devol (línea=${mlLineaId||'none'})`);
-  return { movimientos: nMovs, ventas: nVentas, devoluciones: nDevueltas, cargos_envio: ventaIdsCargoEnvio.length };
+  // ─── Calcular balance para ventas tocadas ─────────────────────────
+  let nBalanceOk = 0, nBalanceDiff = 0;
+  for (const ventaId of ventasTocadas) {
+    // Si ya fue procesada como conciliada/devuelta arriba, skip balance individual
+    if (ventaIdsToConc.has(ventaId) || ventaDevuelta[ventaId]) continue;
+    
+    // Ventas que solo tienen bonificaciones vinculadas → marcar parcial
+    try {
+      const movsVenta = await sbGet('movimientos_mp', `venta_ml_id=eq.${ventaId}&select=monto_neto`);
+      const sumMovs = (movsVenta || []).reduce((s, m) => s + (m.monto_neto || 0), 0);
+      const venta = allVentas.find(v => v.id === ventaId);
+      if (!venta) continue;
+      
+      const esperado = venta.por_cobrar || 0;
+      const balance = Math.round((sumMovs - esperado) * 100) / 100;
+      const estado = balance === 0 ? 'conciliado' : (sumMovs !== 0 ? 'parcial' : 'pendiente');
+      
+      await sbPatch('ventas_ml', `id=eq.${ventaId}`, {
+        balance_conciliacion: balance,
+        estado_conciliacion: estado,
+        conciliado: estado === 'conciliado'
+      });
+      if (estado === 'conciliado') nBalanceOk++;
+      else nBalanceDiff++;
+    } catch(e) {
+      console.warn('Balance calc:', e.message);
+    }
+  }
+
+  const result = { 
+    movimientos: nMovs, ventas: nVentas, devoluciones: nDevueltas, 
+    bonificaciones: nBonif, cargos_envio: Object.keys(ventaCargoEnvio).length,
+    balance_ok: nBalanceOk, balance_diff: nBalanceDiff
+  };
+  console.log(`✓ Auto-conciliación V2: ${nMovs} movs → ${nVentas} ventas, ${nDevueltas} devol, ${nBonif} bonif, ${Object.keys(ventaCargoEnvio).length} cargo envío, balance ok=${nBalanceOk} diff=${nBalanceDiff}`);
+  return result;
 }
 
 app.post('/mp/conciliar', async (_, res) => {
   try { res.json({ ok: true, conciliados: await autoConciliarMP() }); }
   catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Movimientos vinculados a una venta ────────────────────────────────
+app.get('/mp/movimientos-venta/:ventaId', async (req, res) => {
+  try {
+    const movs = await sbGet('movimientos_mp', `venta_ml_id=eq.${req.params.ventaId}&order=fecha.asc`);
+    res.json({ ok: true, movimientos: movs || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Conciliación manual: vincular movimiento a venta ──────────────────
+app.post('/mp/vincular', async (req, res) => {
+  try {
+    const { movimiento_id, venta_id } = req.body;
+    if (!movimiento_id || !venta_id) return res.status(400).json({ error: 'Faltan movimiento_id y venta_id' });
+
+    // Vincular movimiento
+    await sbPatch('movimientos_mp', `id=eq.${movimiento_id}`, { 
+      conciliado: true, 
+      venta_ml_id: venta_id 
+    });
+
+    // Recalcular balance de la venta
+    const movsVenta = await sbGet('movimientos_mp', `venta_ml_id=eq.${venta_id}&select=monto_neto`);
+    const sumMovs = (movsVenta || []).reduce((s, m) => s + (m.monto_neto || 0), 0);
+    const venta = await sbGet('ventas_ml', `id=eq.${venta_id}&select=por_cobrar,conciliado`);
+    
+    if (venta?.length) {
+      const esperado = venta[0].por_cobrar || 0;
+      const balance = Math.round((sumMovs - esperado) * 100) / 100;
+      const estado = balance === 0 ? 'conciliado' : 'parcial';
+      await sbPatch('ventas_ml', `id=eq.${venta_id}`, {
+        balance_conciliacion: balance,
+        estado_conciliacion: estado,
+        conciliado: estado === 'conciliado'
+      });
+    }
+
+    res.json({ ok: true, balance: sumMovs });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Conciliación manual: desvincular movimiento de venta ──────────────
+app.post('/mp/desvincular', async (req, res) => {
+  try {
+    const { movimiento_id, venta_id } = req.body;
+    if (!movimiento_id) return res.status(400).json({ error: 'Falta movimiento_id' });
+
+    await sbPatch('movimientos_mp', `id=eq.${movimiento_id}`, { 
+      conciliado: false, 
+      venta_ml_id: null 
+    });
+
+    // Recalcular balance si se pasó venta_id
+    if (venta_id) {
+      const movsVenta = await sbGet('movimientos_mp', `venta_ml_id=eq.${venta_id}&select=monto_neto`);
+      const sumMovs = (movsVenta || []).reduce((s, m) => s + (m.monto_neto || 0), 0);
+      const venta = await sbGet('ventas_ml', `id=eq.${venta_id}&select=por_cobrar`);
+      if (venta?.length) {
+        const esperado = venta[0].por_cobrar || 0;
+        const balance = Math.round((sumMovs - esperado) * 100) / 100;
+        const hasMov = (movsVenta || []).length > 0;
+        const estado = !hasMov ? 'pendiente' : (balance === 0 ? 'conciliado' : 'parcial');
+        await sbPatch('ventas_ml', `id=eq.${venta_id}`, {
+          balance_conciliacion: balance,
+          estado_conciliacion: estado,
+          conciliado: estado === 'conciliado'
+        });
+      }
+    }
+
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Descartar movimiento (irrelevante/duplicado) ──────────────────────
+app.post('/mp/descartar', async (req, res) => {
+  try {
+    const { movimiento_id } = req.body;
+    if (!movimiento_id) return res.status(400).json({ error: 'Falta movimiento_id' });
+    // Marca conciliado=true sin venta_ml_id → descartado
+    // Se distingue de "pasado a gasto" porque ese tiene movimiento_mp_id en tabla gastos
+    await sbPatch('movimientos_mp', `id=eq.${movimiento_id}`, { conciliado: true });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── EXTRACTO BANCARIO (Supervielle / Galicia) ────────────────────────
