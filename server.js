@@ -1157,10 +1157,17 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
     // 1. ANTES de borrar: guardar los venta_ml_id de movimientos que se van a eliminar
     let ventasAResetear = [];
     try {
-      const movsABorrar = await sbGet('movimientos_mp', 
-        `fecha=gte.${fechaMin}&fecha=lte.${fechaMax}&venta_ml_id=not.is.null&select=venta_ml_id&limit=10000`
-      );
-      ventasAResetear = [...new Set((movsABorrar || []).map(m => m.venta_ml_id).filter(Boolean))];
+      let rOffset = 0;
+      while (true) {
+        const page = await sbGet('movimientos_mp', 
+          `fecha=gte.${fechaMin}&fecha=lte.${fechaMax}&venta_ml_id=not.is.null&select=venta_ml_id&limit=1000&offset=${rOffset}&order=id`
+        );
+        if (!page?.length) break;
+        for (const m of page) { if (m.venta_ml_id) ventasAResetear.push(m.venta_ml_id); }
+        if (page.length < 1000) break;
+        rOffset += 1000;
+      }
+      ventasAResetear = [...new Set(ventasAResetear)];
       console.log(`MP extracto: ${ventasAResetear.length} ventas vinculadas a movimientos que se van a borrar`);
     } catch(e) { console.warn('Pre-reset query:', e.message); }
 
@@ -1227,10 +1234,31 @@ async function autoConciliarMP() {
   // Solo quedan afuera: bonificaciones (otra referencia → segundo pase por monto) y movimientos sin referencia.
   
   // Solo movimientos sin venta vinculada (no pisar links manuales)
-  const movs = await sbGet('movimientos_mp', `conciliado=eq.false&venta_ml_id=is.null&limit=10000`);
+  // Paginado para evitar límite de 1000 rows de Supabase
+  let movs = [];
+  let movOffset = 0;
+  while (true) {
+    const page = await sbGet('movimientos_mp', `conciliado=eq.false&venta_ml_id=is.null&limit=1000&offset=${movOffset}&order=id`);
+    if (!page?.length) break;
+    movs.push(...page);
+    if (page.length < 1000) break;
+    movOffset += 1000;
+  }
+  console.log(`  → ${movs.length} movimientos sin conciliar cargados`);
   
   // Traer TODAS las ventas (para matchear devoluciones de ventas ya conciliadas)
-  const allVentas = await sbGet('ventas_ml', 'limit=50000&select=id,mp_payment_id,mp_payment_ids,conciliado,devuelta,linea_negocio_id,por_cobrar,ml_status,fecha_entrega');
+  // Supabase puede limitar a 1000 por default → paginamos si es necesario
+  let allVentas = [];
+  let offset = 0;
+  const VPS = 1000; // ventas per page
+  while (true) {
+    const page = await sbGet('ventas_ml', `select=id,mp_payment_id,mp_payment_ids,conciliado,devuelta,linea_negocio_id,por_cobrar,ml_status,fecha_entrega&limit=${VPS}&offset=${offset}&order=id`);
+    if (!page?.length) break;
+    allVentas.push(...page);
+    if (page.length < VPS) break;
+    offset += VPS;
+  }
+  console.log(`  → ${allVentas.length} ventas cargadas para matching`);
 
   let nMovs = 0, nVentas = 0, nDevueltas = 0, nBonif = 0, nOtrosVinculados = 0;
 
@@ -1307,15 +1335,12 @@ async function autoConciliarMP() {
   };
 
   // ─── Batch update movimientos_mp: conciliado + venta_ml_id ────────
-  // Agrupar por venta_id + linea_id para minimizar calls
   const movGroups = {};
   for (const m of movToVenta) {
     const key = `${m.venta_id}|${m.linea_id || ''}`;
     if (!movGroups[key]) movGroups[key] = { venta_id: m.venta_id, linea_id: m.linea_id, ids: [] };
     movGroups[key].ids.push(m.mov_id);
   }
-  
-  // Paralelizar patches de movimientos
   const movTasks = [];
   for (const g of Object.values(movGroups)) {
     const patchData = { conciliado: true, venta_ml_id: g.venta_id };
@@ -1328,44 +1353,22 @@ async function autoConciliarMP() {
     }
   }
   await parallel(movTasks);
-  console.log(`  → ${movTasks.length} patches movimientos_mp en paralelo`);
+  console.log(`  → ${movTasks.length} patches movimientos_mp`);
 
-  // ─── Batch update ventas_ml conciliadas (liquidaciones normales) ──
-  const ventaArr = [...ventaIdsToConc];
-  console.log(`  → ${ventaArr.length} ventas a marcar como conciliadas`);
-  let ventaConcOk = 0, ventaConcFail = 0;
-  const ventaConcTasks = [];
-  for (let i = 0; i < ventaArr.length; i += 20) {
-    const ids = ventaArr.slice(i, i + 20).join(',');
-    ventaConcTasks.push(async () => {
-      try {
-        await sbPatch('ventas_ml', `id=in.(${ids})`, { conciliado: true, estado_conciliacion: 'conciliado' });
-        ventaConcOk += Math.min(20, ventaArr.length - i);
-      } catch(e) {
-        ventaConcFail += Math.min(20, ventaArr.length - i);
-        console.warn('Batch patch ventas_ml conc FAILED:', e.message);
-      }
-    });
-  }
-  await parallel(ventaConcTasks);
-  console.log(`  → ventas conciliadas: ${ventaConcOk} ok, ${ventaConcFail} fail de ${ventaArr.length}`);
-
-  // ─── Marcar ventas devueltas + cargo envío (paralelizado) ─────────
+  // ─── Marcar devueltas + cargo envío ─────────────────────────────────
   const devTasks = [];
   for (const [ventaId, monto] of Object.entries(ventaDevuelta)) {
     devTasks.push(() => sbPatch('ventas_ml', `id=eq.${ventaId}`, { 
-      devuelta: true, monto_reembolso: monto, estado_conciliacion: 'conciliado'
+      devuelta: true, monto_reembolso: monto
     }).catch(e => console.warn('Patch devuelta:', e.message)));
   }
   for (const [ventaId, monto] of Object.entries(ventaCargoEnvio)) {
     devTasks.push(() => sbPatch('ventas_ml', `id=eq.${ventaId}`, { 
       cargo_envio_devolucion: monto 
-    }).catch(e => console.warn('Patch cargo_envio_devolucion:', e.message)));
+    }).catch(e => console.warn('Patch cargo_envio:', e.message)));
   }
   await parallel(devTasks);
-  console.log(`  → ${devTasks.length} patches devueltas+cargo en paralelo`);
-
-  // Balance se calcula al final unificado (después del segundo pase de bonificaciones)
+  console.log(`  → ${devTasks.length} patches devueltas+cargo`);
 
   // ─── SEGUNDO PASE: bonificaciones por monto ────────────────────────
   // Las bonificaciones Flex no usan payment_id. Cada venta Flex tiene exactamente
@@ -1373,24 +1376,44 @@ async function autoConciliarMP() {
   // Bonificaciones de ventas que no están en el sistema (ej: diciembre) quedan pendientes.
   let nBonifMonto = 0;
   try {
-    // 1. Bonificaciones sin vincular
-    const bonifSinVinc = await sbGet('movimientos_mp', 
-      `conciliado=eq.false&venta_ml_id=is.null&categoria=eq.bonificacion_envio&limit=5000&select=id,monto_neto,posicion`
-    );
+    // 1. Bonificaciones sin vincular (paginado)
+    let bonifSinVinc = [];
+    let bOffset = 0;
+    while (true) {
+      const page = await sbGet('movimientos_mp', 
+        `conciliado=eq.false&venta_ml_id=is.null&categoria=eq.bonificacion_envio&select=id,monto_neto,posicion&limit=1000&offset=${bOffset}&order=id`
+      );
+      if (!page?.length) break;
+      bonifSinVinc.push(...page);
+      if (page.length < 1000) break;
+      bOffset += 1000;
+    }
     
-    if (bonifSinVinc?.length) {
-      // 2. Ventas Flex con cargo_envio > 0 (candidatas a recibir bonificación)
-      const ventasFlex = await sbGet('ventas_ml', 
-        `tipo_envio=eq.flex&cargo_envio=gt.0&select=id,cargo_envio&limit=10000`
-      );
+    if (bonifSinVinc.length) {
+      // 2. Ventas Flex con cargo_envio > 0 (paginado)
+      let ventasFlex = [];
+      let vfOffset = 0;
+      while (true) {
+        const page = await sbGet('ventas_ml', 
+          `tipo_envio=eq.flex&cargo_envio=gt.0&select=id,cargo_envio&limit=1000&offset=${vfOffset}&order=id`
+        );
+        if (!page?.length) break;
+        ventasFlex.push(...page);
+        if (page.length < 1000) break;
+        vfOffset += 1000;
+      }
       
-      // 3. Ventas que YA tienen bonificación vinculada (excluir)
+      // 3. Ventas que YA tienen bonificación vinculada (paginado)
       const ventasConBonif = new Set();
-      const movsConBonif = await sbGet('movimientos_mp', 
-        `categoria=eq.bonificacion_envio&venta_ml_id=not.is.null&select=venta_ml_id&limit=10000`
-      );
-      for (const m of (movsConBonif || [])) {
-        if (m.venta_ml_id) ventasConBonif.add(m.venta_ml_id);
+      let cbOffset = 0;
+      while (true) {
+        const page = await sbGet('movimientos_mp', 
+          `categoria=eq.bonificacion_envio&venta_ml_id=not.is.null&select=venta_ml_id&limit=1000&offset=${cbOffset}&order=id`
+        );
+        if (!page?.length) break;
+        for (const m of page) { if (m.venta_ml_id) ventasConBonif.add(m.venta_ml_id); }
+        if (page.length < 1000) break;
+        cbOffset += 1000;
       }
       
       // 4. Filtrar: ventas Flex que NO tienen bonificación todavía
@@ -1448,59 +1471,72 @@ async function autoConciliarMP() {
     console.warn('Segundo pase bonificaciones:', e.message);
   }
 
-  // ─── Recalcular balance para TODAS las ventas tocadas (ambos pases) ──
-  // Hacemos esto una sola vez al final para evitar calls duplicados
-  let nBalanceOk = 0, nBalanceDiff = 0;
-  const ventasParaBalance = [...ventasTocadas].filter(id => !ventaIdsToConc.has(id) && !ventaDevuelta[id]);
+  // ─── PASO FINAL: calcular balance y estado para TODAS las ventas tocadas ──
+  // Un solo paso que consulta la DB directamente, sin depender de estado previo.
+  // Esto evita problemas de pasos que se sobreescriben entre sí.
   
-  if (ventasParaBalance.length) {
-    // Traer todos los movimientos vinculados de estas ventas en batch
+  let nBalanceOk = 0, nBalanceDiff = 0;
+  const allTocadas = [...ventasTocadas];
+  console.log(`  → ${allTocadas.length} ventas tocadas, calculando balance...`);
+
+  if (allTocadas.length) {
+    // 1. Traer movimientos vinculados agrupados por venta
     const ventaMontosMap = {}; // venta_id → suma de montos
-    for (let i = 0; i < ventasParaBalance.length; i += 200) {
-      const chunk = ventasParaBalance.slice(i, i + 200).join(',');
-      const movsChunk = await sbGet('movimientos_mp', `venta_ml_id=in.(${chunk})&select=venta_ml_id,monto_neto&limit=10000`);
+    for (let i = 0; i < allTocadas.length; i += 100) {
+      const chunk = allTocadas.slice(i, i + 100).join(',');
+      const movsChunk = await sbGet('movimientos_mp', `venta_ml_id=in.(${chunk})&select=venta_ml_id,monto_neto&limit=1000`);
       for (const m of (movsChunk || [])) {
         ventaMontosMap[m.venta_ml_id] = (ventaMontosMap[m.venta_ml_id] || 0) + (m.monto_neto || 0);
       }
     }
     
-    // Calcular balance y agrupar por estado para batch update
+    // 2. Traer por_cobrar de las ventas tocadas (fresh from DB)
+    const ventaPorCobrar = {};
+    for (let i = 0; i < allTocadas.length; i += 200) {
+      const chunk = allTocadas.slice(i, i + 200).join(',');
+      const ventasChunk = await sbGet('ventas_ml', `id=in.(${chunk})&select=id,por_cobrar&limit=1000`);
+      for (const v of (ventasChunk || [])) {
+        ventaPorCobrar[v.id] = v.por_cobrar || 0;
+      }
+    }
+    
+    // 3. Calcular balance y agrupar
     const conciliadoIds = [];
     const parcialUpdates = []; // {id, balance}
     
-    for (const ventaId of ventasParaBalance) {
+    for (const ventaId of allTocadas) {
       const sumMovs = ventaMontosMap[ventaId] || 0;
-      const venta = allVentas.find(v => v.id === ventaId);
-      if (!venta) continue;
-      const esperado = venta.por_cobrar || 0;
+      const esperado = ventaPorCobrar[ventaId] || 0;
       const balance = Math.round((sumMovs - esperado) * 100) / 100;
       
-      if (balance === 0) {
+      if (Math.abs(balance) < 0.02) {
         conciliadoIds.push(ventaId);
         nBalanceOk++;
-      } else if (sumMovs !== 0) {
+      } else {
         parcialUpdates.push({ id: ventaId, balance });
         nBalanceDiff++;
       }
     }
     
-    // Batch update conciliadas (balance 0)
-    const balConcTasks = [];
-    for (let i = 0; i < conciliadoIds.length; i += 50) {
-      const chunk = conciliadoIds.slice(i, i + 50).join(',');
-      balConcTasks.push(() => sbPatch('ventas_ml', `id=in.(${chunk})`, {
+    // 4. Batch update conciliadas
+    const concTasks = [];
+    for (let i = 0; i < conciliadoIds.length; i += 20) {
+      const ids = conciliadoIds.slice(i, i + 20).join(',');
+      concTasks.push(() => sbPatch('ventas_ml', `id=in.(${ids})`, {
         balance_conciliacion: 0, estado_conciliacion: 'conciliado', conciliado: true
-      }).catch(e => console.warn('Batch balance conc:', e.message)));
+      }).catch(e => console.warn('Final conc:', e.message)));
     }
-    await parallel(balConcTasks);
+    await parallel(concTasks);
     
-    // Parciales en paralelo (cada una tiene balance distinto)
-    const parcialTasks = parcialUpdates.map(upd => () => 
+    // 5. Batch update parciales
+    const parcTasks = parcialUpdates.map(upd => () => 
       sbPatch('ventas_ml', `id=eq.${upd.id}`, {
         balance_conciliacion: upd.balance, estado_conciliacion: 'parcial', conciliado: false
-      }).catch(e => console.warn('Patch balance parcial:', e.message))
+      }).catch(e => console.warn('Final parcial:', e.message))
     );
-    await parallel(parcialTasks);
+    await parallel(parcTasks);
+    
+    console.log(`  → balance: ${nBalanceOk} conciliadas, ${nBalanceDiff} parciales`);
   }
 
   const result = { 
