@@ -1158,7 +1158,7 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
 
     // Resetear estado de conciliación de ventas del período
     // Al re-subir extracto, los movimientos viejos se borraron → ventas quedan huérfanas
-    // Supabase PATCH limita a 1000 filas por request → loop hasta completar
+    // Supabase PATCH no soporta limit → traemos IDs y parcheamos por lotes
     const periodos = new Set();
     periodos.add(fechaMin.substring(0, 7));
     periodos.add(fechaMax.substring(0, 7));
@@ -1172,14 +1172,13 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
     };
     for (const per of periodos) {
       try {
-        let more = true;
-        while (more) {
-          // Patchear solo las que NO están en pendiente ni descartada
-          await sbPatch('ventas_ml', `periodo=eq.${per}&estado_conciliacion=not.in.(pendiente,descartada)&limit=1000`, resetData);
-          const remaining = await sbGet('ventas_ml', `periodo=eq.${per}&estado_conciliacion=not.in.(pendiente,descartada)&select=id&limit=1`);
-          more = remaining?.length > 0;
+        const ventas = await sbGet('ventas_ml', `periodo=eq.${per}&estado_conciliacion=neq.descartada&select=id&limit=5000`);
+        if (!ventas?.length) continue;
+        for (let i = 0; i < ventas.length; i += 50) {
+          const ids = ventas.slice(i, i + 50).map(v => v.id).join(',');
+          await sbPatch('ventas_ml', `id=in.(${ids})`, resetData);
         }
-        console.log(`MP extracto: reset estado conciliación ventas período ${per}`);
+        console.log(`MP extracto: reset ${ventas.length} ventas período ${per}`);
       } catch(e) { console.warn('Reset ventas:', e.message); }
     }
 
