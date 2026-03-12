@@ -1387,11 +1387,15 @@ async function autoConciliarMP() {
       // 4. Filtrar: ventas Flex que NO tienen bonificación todavía
       const ventasSinBonif = (ventasFlex || []).filter(v => !ventasConBonif.has(v.id));
       
-      // 5. Agrupar por monto redondeado para matching rápido
-      // Key: monto redondeado a 2 decimales → array de ventas
+      // 5. Agrupar por monto NETO de bonificación para matching
+      // El AS trae bonificación neta (después del impuesto Créd/Déb 0.6%)
+      // cargo_envio en ventas_ml es bruto. Fórmula: neto = cargo_envio - round(cargo_envio * 0.006, 2)
       const ventasByMonto = {};
       for (const v of ventasSinBonif) {
-        const key = Math.abs(Math.round((v.cargo_envio || 0) * 100));
+        const bruto = Math.abs(v.cargo_envio || 0);
+        const impuesto = Math.round(bruto * 0.006 * 100) / 100;
+        const neto = Math.round((bruto - impuesto) * 100) / 100;
+        const key = Math.round(neto * 100); // centavos como key
         if (!ventasByMonto[key]) ventasByMonto[key] = [];
         ventasByMonto[key].push(v);
       }
@@ -1400,7 +1404,7 @@ async function autoConciliarMP() {
       const bonifByVenta = {}; // venta_id → bonif_mov_id
       
       for (const bonif of bonifSinVinc) {
-        const bonifKey = Math.abs(Math.round((bonif.monto_neto || 0) * 100));
+        const bonifKey = Math.round(Math.abs(bonif.monto_neto || 0) * 100); // centavos
         const candidatas = ventasByMonto[bonifKey];
         if (!candidatas?.length) continue;
         
