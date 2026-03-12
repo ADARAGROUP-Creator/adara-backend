@@ -1158,19 +1158,27 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
 
     // Resetear estado de conciliación de ventas del período
     // Al re-subir extracto, los movimientos viejos se borraron → ventas quedan huérfanas
+    // Supabase PATCH limita a 1000 filas por request → loop hasta completar
     const periodos = new Set();
     periodos.add(fechaMin.substring(0, 7));
     periodos.add(fechaMax.substring(0, 7));
+    const resetData = {
+      estado_conciliacion: 'pendiente',
+      conciliado: false,
+      balance_conciliacion: 0,
+      devuelta: false,
+      monto_reembolso: 0,
+      cargo_envio_devolucion: 0
+    };
     for (const per of periodos) {
       try {
-        await sbPatch('ventas_ml', `periodo=eq.${per}&estado_conciliacion=neq.descartada`, {
-          estado_conciliacion: 'pendiente',
-          conciliado: false,
-          balance_conciliacion: 0,
-          devuelta: false,
-          monto_reembolso: 0,
-          cargo_envio_devolucion: 0
-        });
+        let more = true;
+        while (more) {
+          // Patchear solo las que NO están en pendiente ni descartada
+          await sbPatch('ventas_ml', `periodo=eq.${per}&estado_conciliacion=not.in.(pendiente,descartada)&limit=1000`, resetData);
+          const remaining = await sbGet('ventas_ml', `periodo=eq.${per}&estado_conciliacion=not.in.(pendiente,descartada)&select=id&limit=1`);
+          more = remaining?.length > 0;
+        }
         console.log(`MP extracto: reset estado conciliación ventas período ${per}`);
       } catch(e) { console.warn('Reset ventas:', e.message); }
     }
