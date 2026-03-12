@@ -1156,6 +1156,11 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
       console.log(`MP extracto: borrados movimientos previos ${fechaMin} → ${fechaMax}`);
     } catch(e) { console.warn('Delete previos:', e.message); }
 
+    // Normalizar keys (PGRST102: all object keys must match)
+    const allKeys = new Set();
+    for (const m of movs) { for (const k of Object.keys(m)) allKeys.add(k); }
+    for (const m of movs) { for (const k of allKeys) { if (!(k in m)) m[k] = null; } }
+
     // Insertar todos
     let insertados = 0;
     for (let i = 0; i < movs.length; i += 100) {
