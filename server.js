@@ -1119,7 +1119,8 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
         monto_neto: neto,
         estado: 'approved',
         referencia_mp: ref || null,
-        conciliado: false
+        conciliado: false,
+        posicion: movs.length + 1
       });
     }
 
@@ -1329,12 +1330,132 @@ async function autoConciliarMP() {
     }
   }
 
+  // ─── SEGUNDO PASE: bonificaciones por adyacencia ──────────────────
+  // Las bonificaciones Flex no usan payment_id como referencia.
+  // En el Account Statement, la bonificación siempre está al lado de la
+  // liquidación de la misma venta. Matcheamos por posición + verificación de monto.
+  let nBonifAdyacencia = 0;
+  try {
+    // 1. Bonificaciones sin vincular que tengan posicion
+    const bonifSinVinc = await sbGet('movimientos_mp', 
+      `conciliado=eq.false&venta_ml_id=is.null&categoria=eq.bonificacion_envio&posicion=not.is.null&limit=5000&select=id,posicion,monto_neto,fecha`
+    );
+    
+    if (bonifSinVinc?.length) {
+      // 2. Obtener las posiciones vecinas que necesitamos consultar
+      const posicionesVecinas = new Set();
+      for (const b of bonifSinVinc) {
+        if (b.posicion > 1) posicionesVecinas.add(b.posicion - 1);
+        posicionesVecinas.add(b.posicion + 1);
+      }
+      
+      // 3. Traer movimientos vecinos que YA están vinculados a ventas
+      const vecArr = [...posicionesVecinas];
+      const vecinos = [];
+      for (let i = 0; i < vecArr.length; i += 200) {
+        const chunk = vecArr.slice(i, i + 200).join(',');
+        const batch = await sbGet('movimientos_mp', 
+          `posicion=in.(${chunk})&venta_ml_id=not.is.null&select=id,posicion,venta_ml_id`
+        );
+        if (batch?.length) vecinos.push(...batch);
+      }
+      
+      // Index vecinos por posicion
+      const vecinoByPos = {};
+      for (const v of vecinos) {
+        vecinoByPos[v.posicion] = v;
+      }
+      
+      // 4. Para cada bonificación, buscar vecino vinculado a venta Flex con monto matching
+      // Necesitamos las ventas Flex con su cargo_envio
+      const ventasFlexById = {};
+      for (const v of (allVentas || [])) {
+        ventasFlexById[v.id] = v;
+      }
+      
+      // Traer cargo_envio de ventas (no viene en el select original)
+      const ventaIdsNecesarios = [...new Set(vecinos.map(v => v.venta_ml_id))];
+      const ventasConCargo = {};
+      for (let i = 0; i < ventaIdsNecesarios.length; i += 200) {
+        const chunk = ventaIdsNecesarios.slice(i, i + 200).join(',');
+        const batch = await sbGet('ventas_ml', `id=in.(${chunk})&select=id,cargo_envio,tipo_envio`);
+        for (const v of (batch || [])) {
+          ventasConCargo[v.id] = v;
+        }
+      }
+      
+      const bonifToLink = []; // {mov_id, venta_id, linea_id}
+      const ventasYaUsadas = new Set(); // evitar vincular 2 bonificaciones a la misma venta
+      
+      for (const bonif of bonifSinVinc) {
+        // Buscar vecino: primero anterior (posicion - 1), luego siguiente (posicion + 1)
+        const candidatos = [
+          vecinoByPos[bonif.posicion - 1],
+          vecinoByPos[bonif.posicion + 1]
+        ].filter(Boolean);
+        
+        for (const vecino of candidatos) {
+          if (ventasYaUsadas.has(vecino.venta_ml_id)) continue;
+          
+          const venta = ventasConCargo[vecino.venta_ml_id];
+          if (!venta) continue;
+          if (venta.tipo_envio !== 'flex') continue;
+          
+          // Verificar monto: bonif.monto_neto ≈ venta.cargo_envio (tolerancia 0.02)
+          const bonifMonto = Math.abs(bonif.monto_neto || 0);
+          const ventaBonif = Math.abs(venta.cargo_envio || 0);
+          if (ventaBonif === 0) continue;
+          
+          if (Math.abs(bonifMonto - ventaBonif) <= 0.02) {
+            bonifToLink.push({ mov_id: bonif.id, venta_id: venta.id, linea_id: mlLineaId });
+            ventasYaUsadas.add(venta.id);
+            ventasTocadas.add(venta.id);
+            nBonifAdyacencia++;
+            break; // esta bonificación ya matcheó
+          }
+        }
+      }
+      
+      // 5. Batch update bonificaciones vinculadas
+      for (const link of bonifToLink) {
+        const patchData = { conciliado: true, venta_ml_id: link.venta_id };
+        if (link.linea_id) patchData.linea_negocio_id = link.linea_id;
+        await sbPatch('movimientos_mp', `id=eq.${link.mov_id}`, patchData).catch(e => {
+          console.warn('Patch bonif adyacencia:', e.message);
+        });
+      }
+      
+      // 6. Recalcular balance de ventas que recibieron bonificaciones
+      for (const ventaId of ventasYaUsadas) {
+        try {
+          const movsVenta = await sbGet('movimientos_mp', `venta_ml_id=eq.${ventaId}&select=monto_neto`);
+          const sumMovs = (movsVenta || []).reduce((s, m) => s + (m.monto_neto || 0), 0);
+          const venta = allVentas.find(v => v.id === ventaId);
+          if (!venta) continue;
+          const esperado = venta.por_cobrar || 0;
+          const balance = Math.round((sumMovs - esperado) * 100) / 100;
+          const estado = balance === 0 ? 'conciliado' : 'parcial';
+          await sbPatch('ventas_ml', `id=eq.${ventaId}`, {
+            balance_conciliacion: balance,
+            estado_conciliacion: estado,
+            conciliado: estado === 'conciliado'
+          });
+        } catch(e) { console.warn('Balance bonif:', e.message); }
+      }
+      
+      console.log(`✓ Bonificaciones por adyacencia: ${nBonifAdyacencia} de ${bonifSinVinc.length} vinculadas`);
+    }
+  } catch(e) {
+    console.warn('Segundo pase bonificaciones:', e.message);
+  }
+
   const result = { 
     movimientos: nMovs, ventas: nVentas, devoluciones: nDevueltas, 
-    bonificaciones: nBonif, cargos_envio: Object.keys(ventaCargoEnvio).length,
+    bonificaciones: nBonif, bonificaciones_adyacencia: nBonifAdyacencia,
+    cargos_envio: Object.keys(ventaCargoEnvio).length,
     balance_ok: nBalanceOk, balance_diff: nBalanceDiff
   };
-  console.log(`✓ Auto-conciliación V2: ${nMovs} movs → ${nVentas} ventas, ${nDevueltas} devol, ${nBonif} bonif, ${Object.keys(ventaCargoEnvio).length} cargo envío, balance ok=${nBalanceOk} diff=${nBalanceDiff}`);
+  console.log(`✓ Auto-conciliación V2: ${nMovs} movs → ${nVentas} ventas, ${nDevueltas} devol, ${nBonif} bonif (payment_id) + ${nBonifAdyacencia} bonif (adyacencia), ${Object.keys(ventaCargoEnvio).length} cargo envío, balance ok=${nBalanceOk} diff=${nBalanceDiff}`);
   return result;
 }
 
