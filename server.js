@@ -1332,14 +1332,23 @@ async function autoConciliarMP() {
 
   // ─── Batch update ventas_ml conciliadas (liquidaciones normales) ──
   const ventaArr = [...ventaIdsToConc];
+  console.log(`  → ${ventaArr.length} ventas a marcar como conciliadas`);
+  let ventaConcOk = 0, ventaConcFail = 0;
   const ventaConcTasks = [];
-  for (let i = 0; i < ventaArr.length; i += 50) {
-    const ids = ventaArr.slice(i, i + 50).join(',');
-    ventaConcTasks.push(() => sbPatch('ventas_ml', `id=in.(${ids})`, { conciliado: true, estado_conciliacion: 'conciliado' }).catch(e => {
-      console.warn('Batch patch ventas_ml conc:', e.message);
-    }));
+  for (let i = 0; i < ventaArr.length; i += 20) {
+    const ids = ventaArr.slice(i, i + 20).join(',');
+    ventaConcTasks.push(async () => {
+      try {
+        await sbPatch('ventas_ml', `id=in.(${ids})`, { conciliado: true, estado_conciliacion: 'conciliado' });
+        ventaConcOk += Math.min(20, ventaArr.length - i);
+      } catch(e) {
+        ventaConcFail += Math.min(20, ventaArr.length - i);
+        console.warn('Batch patch ventas_ml conc FAILED:', e.message);
+      }
+    });
   }
   await parallel(ventaConcTasks);
+  console.log(`  → ventas conciliadas: ${ventaConcOk} ok, ${ventaConcFail} fail de ${ventaArr.length}`);
 
   // ─── Marcar ventas devueltas + cargo envío (paralelizado) ─────────
   const devTasks = [];
