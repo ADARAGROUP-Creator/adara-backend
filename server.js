@@ -1481,15 +1481,20 @@ async function autoConciliarMP() {
 
   if (allTocadas.length) {
     // 1. Traer movimientos vinculados agrupados por venta (paginado)
+    // Incluye categoria para separar bonificaciones del esperado
     const ventaMontosMap = {}; // venta_id → suma de montos
+    const ventaBonifMap = {};  // venta_id → suma de bonificaciones
     for (let i = 0; i < allTocadas.length; i += 100) {
       const chunk = allTocadas.slice(i, i + 100).join(',');
       let mOffset = 0;
       while (true) {
-        const movsChunk = await sbGet('movimientos_mp', `venta_ml_id=in.(${chunk})&select=venta_ml_id,monto_neto&limit=1000&offset=${mOffset}&order=id`);
+        const movsChunk = await sbGet('movimientos_mp', `venta_ml_id=in.(${chunk})&select=venta_ml_id,monto_neto,categoria&limit=1000&offset=${mOffset}&order=id`);
         if (!movsChunk?.length) break;
         for (const m of movsChunk) {
           ventaMontosMap[m.venta_ml_id] = (ventaMontosMap[m.venta_ml_id] || 0) + (m.monto_neto || 0);
+          if (m.categoria === 'bonificacion_envio') {
+            ventaBonifMap[m.venta_ml_id] = (ventaBonifMap[m.venta_ml_id] || 0) + (m.monto_neto || 0);
+          }
         }
         if (movsChunk.length < 1000) break;
         mOffset += 1000;
@@ -1513,12 +1518,16 @@ async function autoConciliarMP() {
     }
     
     // 3. Calcular balance y agrupar
+    // esperado = por_cobrar + bonificación vinculada (la bonificación Flex es ingreso real
+    // pero no está incluida en por_cobrar porque es un pago separado de ML)
     const conciliadoIds = [];
     const parcialUpdates = []; // {id, balance}
     
     for (const ventaId of allTocadas) {
       const sumMovs = ventaMontosMap[ventaId] || 0;
-      const esperado = ventaPorCobrar[ventaId] || 0;
+      const porCobrar = ventaPorCobrar[ventaId] || 0;
+      const bonif = ventaBonifMap[ventaId] || 0;
+      const esperado = porCobrar + bonif;
       const balance = Math.round((sumMovs - esperado) * 100) / 100;
       
       if (Math.abs(balance) < 0.02) {
