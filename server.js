@@ -1480,23 +1480,35 @@ async function autoConciliarMP() {
   console.log(`  → ${allTocadas.length} ventas tocadas, calculando balance...`);
 
   if (allTocadas.length) {
-    // 1. Traer movimientos vinculados agrupados por venta
+    // 1. Traer movimientos vinculados agrupados por venta (paginado)
     const ventaMontosMap = {}; // venta_id → suma de montos
     for (let i = 0; i < allTocadas.length; i += 100) {
       const chunk = allTocadas.slice(i, i + 100).join(',');
-      const movsChunk = await sbGet('movimientos_mp', `venta_ml_id=in.(${chunk})&select=venta_ml_id,monto_neto&limit=1000`);
-      for (const m of (movsChunk || [])) {
-        ventaMontosMap[m.venta_ml_id] = (ventaMontosMap[m.venta_ml_id] || 0) + (m.monto_neto || 0);
+      let mOffset = 0;
+      while (true) {
+        const movsChunk = await sbGet('movimientos_mp', `venta_ml_id=in.(${chunk})&select=venta_ml_id,monto_neto&limit=1000&offset=${mOffset}&order=id`);
+        if (!movsChunk?.length) break;
+        for (const m of movsChunk) {
+          ventaMontosMap[m.venta_ml_id] = (ventaMontosMap[m.venta_ml_id] || 0) + (m.monto_neto || 0);
+        }
+        if (movsChunk.length < 1000) break;
+        mOffset += 1000;
       }
     }
     
-    // 2. Traer por_cobrar de las ventas tocadas (fresh from DB)
+    // 2. Traer por_cobrar de las ventas tocadas (fresh from DB, paginado)
     const ventaPorCobrar = {};
     for (let i = 0; i < allTocadas.length; i += 200) {
       const chunk = allTocadas.slice(i, i + 200).join(',');
-      const ventasChunk = await sbGet('ventas_ml', `id=in.(${chunk})&select=id,por_cobrar&limit=1000`);
-      for (const v of (ventasChunk || [])) {
-        ventaPorCobrar[v.id] = v.por_cobrar || 0;
+      let pcOffset = 0;
+      while (true) {
+        const ventasChunk = await sbGet('ventas_ml', `id=in.(${chunk})&select=id,por_cobrar&limit=1000&offset=${pcOffset}&order=id`);
+        if (!ventasChunk?.length) break;
+        for (const v of ventasChunk) {
+          ventaPorCobrar[v.id] = v.por_cobrar || 0;
+        }
+        if (ventasChunk.length < 1000) break;
+        pcOffset += 1000;
       }
     }
     
