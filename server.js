@@ -1370,11 +1370,12 @@ async function autoConciliarMP() {
   await parallel(devTasks);
   console.log(`  → ${devTasks.length} patches devueltas+cargo`);
 
-  // ─── SEGUNDO PASE: bonificaciones por monto ────────────────────────
-  // Las bonificaciones Flex no usan payment_id. Cada venta Flex tiene exactamente
-  // 1 bonificación en el Account Statement. Matcheamos por monto: |bonif| ≈ |cargo_envio|.
-  // Bonificaciones de ventas que no están en el sistema (ej: diciembre) quedan pendientes.
-  let nBonifMonto = 0;
+  // ─── SEGUNDO PASE: bonificaciones por posición en AS + fallback por monto ──
+  // Las bonificaciones Flex no usan payment_id como referencia.
+  // En el Account Statement, la bonificación aparece justo después de su liquidación.
+  // Paso A: matching por posición (determinístico, sin ambigüedad)
+  // Paso B: fallback por monto neto para las que no matchearon por posición
+  let nBonifPos = 0, nBonifMonto = 0;
   try {
     // 1. Bonificaciones sin vincular (paginado)
     let bonifSinVinc = [];
@@ -1390,20 +1391,33 @@ async function autoConciliarMP() {
     }
     
     if (bonifSinVinc.length) {
-      // 2. Ventas Flex con cargo_envio > 0 (paginado)
-      let ventasFlex = [];
+      // 2. Todos los movimientos YA vinculados: posicion → venta_ml_id (paginado)
+      const posByVenta = {}; // posicion → venta_ml_id
+      let lpOffset = 0;
+      while (true) {
+        const page = await sbGet('movimientos_mp', 
+          `venta_ml_id=not.is.null&posicion=not.is.null&select=posicion,venta_ml_id&limit=1000&offset=${lpOffset}&order=id`
+        );
+        if (!page?.length) break;
+        for (const m of page) posByVenta[m.posicion] = m.venta_ml_id;
+        if (page.length < 1000) break;
+        lpOffset += 1000;
+      }
+      
+      // 3. Set de ventas Flex (para validar destino)
+      const ventasFlexSet = new Set();
       let vfOffset = 0;
       while (true) {
         const page = await sbGet('ventas_ml', 
-          `tipo_envio=eq.flex&cargo_envio=gt.0&select=id,cargo_envio&limit=1000&offset=${vfOffset}&order=id`
+          `tipo_envio=eq.flex&select=id&limit=1000&offset=${vfOffset}&order=id`
         );
         if (!page?.length) break;
-        ventasFlex.push(...page);
+        for (const v of page) ventasFlexSet.add(v.id);
         if (page.length < 1000) break;
         vfOffset += 1000;
       }
       
-      // 3. Ventas que YA tienen bonificación vinculada (paginado)
+      // 4. Ventas que YA tienen bonificación vinculada (paginado)
       const ventasConBonif = new Set();
       let cbOffset = 0;
       while (true) {
@@ -1416,42 +1430,75 @@ async function autoConciliarMP() {
         cbOffset += 1000;
       }
       
-      // 4. Filtrar: ventas Flex que NO tienen bonificación todavía
-      const ventasSinBonif = (ventasFlex || []).filter(v => !ventasConBonif.has(v.id));
-      
-      // 5. Agrupar por monto NETO de bonificación para matching
-      // El AS trae bonificación neta (después del impuesto Créd/Déb 0.6%)
-      // cargo_envio en ventas_ml es bruto. Fórmula: neto = cargo_envio - round(cargo_envio * 0.006, 2)
-      const ventasByMonto = {};
-      for (const v of ventasSinBonif) {
-        const bruto = Math.abs(v.cargo_envio || 0);
-        const impuesto = Math.round(bruto * 0.006 * 100) / 100;
-        const neto = Math.round((bruto - impuesto) * 100) / 100;
-        const key = Math.round(neto * 100); // centavos como key
-        if (!ventasByMonto[key]) ventasByMonto[key] = [];
-        ventasByMonto[key].push(v);
-      }
-      
-      // 6. Matching 1:1 por monto
+      // ─── PASO A: matching por posición ───
+      // La bonificación en posición N → buscar liquidación vinculada en N-1 (más común), N-2, N+1
       const bonifByVenta = {}; // venta_id → bonif_mov_id
+      const bonifSinMatch = []; // para fallback por monto
       
       for (const bonif of bonifSinVinc) {
-        const bonifKey = Math.round(Math.abs(bonif.monto_neto || 0) * 100); // centavos
-        const candidatas = ventasByMonto[bonifKey];
-        if (!candidatas?.length) continue;
+        if (bonif.posicion == null) { bonifSinMatch.push(bonif); continue; }
         
-        // Tomar la primera disponible (pop para no reutilizar)
-        const venta = candidatas.shift();
-        if (candidatas.length === 0) delete ventasByMonto[bonifKey];
+        let ventaId = null;
+        for (const delta of [-1, -2, 1, -3, 2]) {
+          const candidata = posByVenta[bonif.posicion + delta];
+          if (candidata && ventasFlexSet.has(candidata) && !ventasConBonif.has(candidata)) {
+            ventaId = candidata;
+            break;
+          }
+        }
         
-        bonifByVenta[venta.id] = bonif.id;
-        ventasTocadas.add(venta.id);
-        nBonifMonto++;
+        if (ventaId) {
+          bonifByVenta[ventaId] = bonif.id;
+          ventasConBonif.add(ventaId);
+          ventasTocadas.add(ventaId);
+          nBonifPos++;
+        } else {
+          bonifSinMatch.push(bonif);
+        }
+      }
+      
+      // ─── PASO B: fallback por monto neto para las que no matchearon ───
+      if (bonifSinMatch.length) {
+        // Ventas Flex sin bonificación con cargo_envio > 0
+        let ventasFlexSinBonif = [];
+        let vf2Offset = 0;
+        while (true) {
+          const page = await sbGet('ventas_ml', 
+            `tipo_envio=eq.flex&cargo_envio=gt.0&select=id,cargo_envio&limit=1000&offset=${vf2Offset}&order=id`
+          );
+          if (!page?.length) break;
+          ventasFlexSinBonif.push(...page);
+          if (page.length < 1000) break;
+          vf2Offset += 1000;
+        }
+        ventasFlexSinBonif = ventasFlexSinBonif.filter(v => !ventasConBonif.has(v.id));
+        
+        // Agrupar por monto neto esperado
+        const ventasByMonto = {};
+        for (const v of ventasFlexSinBonif) {
+          const bruto = Math.abs(v.cargo_envio || 0);
+          const impuesto = Math.round(bruto * 0.006 * 100) / 100;
+          const neto = Math.round((bruto - impuesto) * 100) / 100;
+          const key = Math.round(neto * 100);
+          if (!ventasByMonto[key]) ventasByMonto[key] = [];
+          ventasByMonto[key].push(v);
+        }
+        
+        for (const bonif of bonifSinMatch) {
+          const bonifKey = Math.round(Math.abs(bonif.monto_neto || 0) * 100);
+          const candidatas = ventasByMonto[bonifKey];
+          if (!candidatas?.length) continue;
+          const venta = candidatas.shift();
+          if (candidatas.length === 0) delete ventasByMonto[bonifKey];
+          bonifByVenta[venta.id] = bonif.id;
+          ventasConBonif.add(venta.id);
+          ventasTocadas.add(venta.id);
+          nBonifMonto++;
+        }
       }
       
       // 7. Batch update: vincular bonificaciones a ventas (paralelizado)
       const bonifTasks = [];
-      // Agrupar por bloques de 50 para batch
       const entries = Object.entries(bonifByVenta);
       for (let i = 0; i < entries.length; i += 50) {
         const batch = entries.slice(i, i + 50);
@@ -1459,13 +1506,13 @@ async function autoConciliarMP() {
           const patchData = { conciliado: true, venta_ml_id: ventaId };
           if (mlLineaId) patchData.linea_negocio_id = mlLineaId;
           bonifTasks.push(() => sbPatch('movimientos_mp', `id=eq.${movId}`, patchData).catch(e => {
-            console.warn('Patch bonif monto:', e.message);
+            console.warn('Patch bonif:', e.message);
           }));
         }
       }
       await parallel(bonifTasks);
       
-      console.log(`✓ Bonificaciones por monto: ${nBonifMonto} de ${bonifSinVinc.length} vinculadas (${ventasSinBonif.length} ventas Flex sin bonif)`);
+      console.log(`✓ Bonificaciones: ${nBonifPos} por posición, ${nBonifMonto} por monto, ${bonifSinVinc.length - nBonifPos - nBonifMonto} sin match`);
     }
   } catch(e) {
     console.warn('Segundo pase bonificaciones:', e.message);
@@ -1555,12 +1602,12 @@ async function autoConciliarMP() {
 
   const result = { 
     movimientos: nMovs, ventas: nVentas, devoluciones: nDevueltas, 
-    bonificaciones: nBonif, bonificaciones_monto: nBonifMonto,
+    bonificaciones: nBonif, bonif_posicion: nBonifPos, bonif_monto: nBonifMonto,
     otros_vinculados: nOtrosVinculados,
     cargos_envio: Object.keys(ventaCargoEnvio).length,
     balance_ok: nBalanceOk, balance_diff: nBalanceDiff
   };
-  console.log(`✓ Auto-conciliación: ${nMovs} movs → ${nVentas} ventas, ${nDevueltas} devol, ${nBonifMonto} bonif, ${nOtrosVinculados} otros, balance ok=${nBalanceOk} diff=${nBalanceDiff}`);
+  console.log(`✓ Auto-conciliación: ${nMovs} movs → ${nVentas} ventas, ${nDevueltas} devol, ${nBonifPos}+${nBonifMonto} bonif (pos+monto), ${nOtrosVinculados} otros, balance ok=${nBalanceOk} diff=${nBalanceDiff}`);
   return result;
 }
 
