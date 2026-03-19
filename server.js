@@ -147,6 +147,42 @@ app.get('/health', async (_, res) => {
   res.json({ ok: Object.values(c).every(Boolean), checks: c });
 });
 
+// ── DEBUG — Inspección de charges_details de un payment ─────────────
+// GET /debug/charges/:paymentId
+// Retorna: amounts, net, installments y charges_details crudos de ML
+// Útil para distinguir financiero real (financing/interest) vs informativo (add_on)
+app.get('/debug/charges/:paymentId', async (req, res) => {
+  try {
+    const data = await mlGet(`/v1/payments/${req.params.paymentId}`);
+    const charges = (data.charges_details || []).map(ch => ({
+      type: ch.type,
+      name: ch.name,
+      original_amount: ch.amounts?.original,
+      payer: ch.client_id,
+    }));
+    res.json({
+      payment_id:          data.id,
+      order_id:            data.order?.id,
+      status:              data.status,
+      installments:        data.installments,
+      transaction_amount:  data.transaction_amount,
+      net_received_amount: data.net_received_amount,
+      shipping_amount:     data.shipping_amount,
+      charges_details:     charges,
+      // Cálculo manual para comparar con por_cobrar de ADARA
+      _analisis: {
+        fee:        charges.filter(c => c.type === 'fee' && !['financing','interest','add_on'].some(n => c.name?.includes(n))).reduce((s, c) => s + (c.original_amount || 0), 0),
+        financing:  charges.filter(c => c.type === 'fee' && ['financing','interest'].some(n => c.name?.includes(n))).reduce((s, c) => s + (c.original_amount || 0), 0),
+        add_on:     charges.filter(c => c.type === 'fee' && c.name?.includes('add_on')).reduce((s, c) => s + (c.original_amount || 0), 0),
+        tax:        charges.filter(c => c.type === 'tax').reduce((s, c) => s + (c.original_amount || 0), 0),
+        shipping:   charges.filter(c => c.type === 'shipping').reduce((s, c) => s + (c.original_amount || 0), 0),
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── MERCADO LIBRE — OAuth ────────────────────────────────────────────
 app.get('/ml/auth', (_, res) => {
   const url = `https://auth.mercadolibre.com.ar/authorization?response_type=code&client_id=${ML_CLIENT_ID}&redirect_uri=${encodeURIComponent(ML_REDIRECT_URI)}`;
@@ -537,12 +573,12 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             od.row.cargo_envio = -Math.round(envioNeto * 100) / 100;
           }
 
-          // por_cobrar = bruto menos todos los cargos netos
+          // por_cobrar = bruto menos cargos reales que ML descuenta de la liquidación
+          // costo_financiero NO se incluye: ML lo informa en charges_details pero no lo descuenta
           if (od._comision > 0 || od._impuestos > 0 || od._financiero > 0 || od._envio > 0) {
             od.row.por_cobrar = od.row.importe_bruto
               + od.row.cargo_venta
               + od.row.cargo_envio
-              + od.row.costo_financiero
               + od.row.impuestos;
           }
 
@@ -558,10 +594,10 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             od.row.impuestos = (od.row.impuestos || 0) - impBonificacion;
 
             // Recalcular por_cobrar incluyendo bonificación e impuesto
+            // costo_financiero NO se incluye (ver comentario arriba)
             od.row.por_cobrar = od.row.importe_bruto
               + od.row.cargo_venta
               + od.row.cargo_envio
-              + od.row.costo_financiero
               + od.row.impuestos;
           }
 
