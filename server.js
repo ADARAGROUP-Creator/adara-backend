@@ -1404,15 +1404,15 @@ async function autoConciliarMP() {
         lpOffset += 1000;
       }
       
-      // 3. Set de ventas Flex (para validar destino)
-      const ventasFlexSet = new Set();
+      // 3. Ventas Flex con cargo_envio (para validar destino + monto)
+      const ventasFlexMap = {}; // id → cargo_envio
       let vfOffset = 0;
       while (true) {
         const page = await sbGet('ventas_ml', 
-          `tipo_envio=eq.flex&select=id&limit=1000&offset=${vfOffset}&order=id`
+          `tipo_envio=eq.flex&cargo_envio=gt.0&select=id,cargo_envio&limit=1000&offset=${vfOffset}&order=id`
         );
         if (!page?.length) break;
-        for (const v of page) ventasFlexSet.add(v.id);
+        for (const v of page) ventasFlexMap[v.id] = v.cargo_envio;
         if (page.length < 1000) break;
         vfOffset += 1000;
       }
@@ -1430,18 +1430,33 @@ async function autoConciliarMP() {
         cbOffset += 1000;
       }
       
-      // ─── PASO A: matching por posición ───
-      // La bonificación en posición N → buscar liquidación vinculada en N-1 (más común), N-2, N+1
+      // Helper: calcular neto esperado de bonificación desde cargo_envio bruto
+      const netoEsperado = (cargoEnvio) => {
+        const bruto = Math.abs(cargoEnvio || 0);
+        const imp = Math.round(bruto * 0.006 * 100) / 100;
+        return Math.round((bruto - imp) * 100) / 100;
+      };
+      
+      // ─── PASO A: matching por posición + validación de monto ───
+      // La bonificación en posición N → buscar liquidación vinculada cercana
+      // PERO solo vincular si el monto de la bonificación coincide con el neto esperado
+      // del cargo_envio de la venta candidata. Esto evita vincular a la venta equivocada
+      // cuando hay varias liquidaciones consecutivas de distintas zonas.
       const bonifByVenta = {}; // venta_id → bonif_mov_id
       const bonifSinMatch = []; // para fallback por monto
       
       for (const bonif of bonifSinVinc) {
         if (bonif.posicion == null) { bonifSinMatch.push(bonif); continue; }
         
+        const bonifMonto = Math.round(Math.abs(bonif.monto_neto || 0) * 100); // centavos
         let ventaId = null;
-        for (const delta of [-1, -2, 1, -3, 2]) {
+        for (const delta of [-1, -2, 1, -3, 2, -4, 3]) {
           const candidata = posByVenta[bonif.posicion + delta];
-          if (candidata && ventasFlexSet.has(candidata) && !ventasConBonif.has(candidata)) {
+          // Validar: es Flex + tiene liquidación del primer pase + no tiene bonif ya + monto coincide
+          if (!candidata || !ventasFlexMap[candidata] || ventasConBonif.has(candidata)) continue;
+          if (!ventasTocadas.has(candidata)) continue; // solo ventas con liquidación vinculada
+          const netoExp = Math.round(netoEsperado(ventasFlexMap[candidata]) * 100);
+          if (netoExp === bonifMonto) {
             ventaId = candidata;
             break;
           }
@@ -1458,27 +1473,21 @@ async function autoConciliarMP() {
       }
       
       // ─── PASO B: fallback por monto neto para las que no matchearon ───
+      // SOLO ventas que ya tienen liquidación del primer pase (ventasTocadas)
+      // Esto evita asignar bonificaciones a ventas de otros meses
       if (bonifSinMatch.length) {
-        // Ventas Flex sin bonificación con cargo_envio > 0
-        let ventasFlexSinBonif = [];
-        let vf2Offset = 0;
-        while (true) {
-          const page = await sbGet('ventas_ml', 
-            `tipo_envio=eq.flex&cargo_envio=gt.0&select=id,cargo_envio&limit=1000&offset=${vf2Offset}&order=id`
-          );
-          if (!page?.length) break;
-          ventasFlexSinBonif.push(...page);
-          if (page.length < 1000) break;
-          vf2Offset += 1000;
+        // Usar ventasFlexMap (ya cargado) filtrado por ventasTocadas y sin bonificación
+        const ventasFlexSinBonif = [];
+        for (const [id, cargoEnvio] of Object.entries(ventasFlexMap)) {
+          if (ventasTocadas.has(id) && !ventasConBonif.has(id)) {
+            ventasFlexSinBonif.push({ id, cargo_envio: cargoEnvio });
+          }
         }
-        ventasFlexSinBonif = ventasFlexSinBonif.filter(v => !ventasConBonif.has(v.id));
         
         // Agrupar por monto neto esperado
         const ventasByMonto = {};
         for (const v of ventasFlexSinBonif) {
-          const bruto = Math.abs(v.cargo_envio || 0);
-          const impuesto = Math.round(bruto * 0.006 * 100) / 100;
-          const neto = Math.round((bruto - impuesto) * 100) / 100;
+          const neto = netoEsperado(v.cargo_envio);
           const key = Math.round(neto * 100);
           if (!ventasByMonto[key]) ventasByMonto[key] = [];
           ventasByMonto[key].push(v);
