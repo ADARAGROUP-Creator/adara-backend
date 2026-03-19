@@ -147,6 +147,37 @@ app.get('/health', async (_, res) => {
   res.json({ ok: Object.values(c).every(Boolean), checks: c });
 });
 
+
+// ── DEBUG — Inspección directa de payment via MP API (mismo path que sync) ──
+// GET /debug/payment/:paymentId
+app.get('/debug/payment/:paymentId', async (req, res) => {
+  try {
+    const r = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.paymentId}`, {
+      headers: { 'Authorization': 'Bearer ' + ML.access }
+    });
+    if (!r.ok) return res.status(r.status).json({ error: `MP ${r.status}` });
+    const data = await r.json();
+    const charges = (data.charges_details || []).map(ch => ({
+      type: ch.type, name: ch.name,
+      original_amount: ch.amounts?.original,
+    }));
+    res.json({
+      payment_id:          data.id,
+      installments:        data.installments,
+      transaction_amount:  data.transaction_amount,
+      net_received_amount: data.net_received_amount,
+      shipping_amount:     data.shipping_amount,
+      charges_details:     charges,
+      _analisis: {
+        financing: charges.filter(c => c.type==='fee' && ['financing','interest'].some(n=>c.name?.includes(n))).reduce((s,c)=>s+(c.original_amount||0),0),
+        add_on:    charges.filter(c => c.type==='fee' && c.name?.includes('add_on')).reduce((s,c)=>s+(c.original_amount||0),0),
+        fee:       charges.filter(c => c.type==='fee' && !['financing','interest','add_on'].some(n=>c.name?.includes(n))).reduce((s,c)=>s+(c.original_amount||0),0),
+        tax:       charges.filter(c => c.type==='tax').reduce((s,c)=>s+(c.original_amount||0),0),
+      }
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── DEBUG — Inspección de charges_details de un payment ─────────────
 // GET /debug/charges/:paymentId
 // Retorna: amounts, net, installments y charges_details crudos de ML
