@@ -537,8 +537,9 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
                         // Financiero REAL: cuotas con interés. ML sí lo descuenta del pago.
                         od._financiero += amt;
                       } else if (name.includes('add_on')) {
-                        // add_on: informativo. ML lo reporta pero NO lo descuenta del pago real.
-                        // Se guarda en costo_financiero para visibilidad pero NO afecta por_cobrar.
+                        // add_on: ruido informativo de ML. No es costo del vendedor.
+                        // ML absorbe el costo de financiar cuotas sin interés al comprador.
+                        // Se acumula en _financiero_info pero NO se guarda en ningún campo de la venta.
                         od._financiero_info += amt;
                       } else {
                         od._comision += amt;
@@ -570,11 +571,10 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
           // Aplicar totales acumulados de TODOS los payments (split payment support)
           if (od._comision > 0) od.row.cargo_venta = -od._comision;
           if (od._impuestos > 0) od.row.impuestos = -od._impuestos;
-          // financing/interest = cargo REAL de cuotas (ML lo descuenta del pago)
-          // add_on = informativo (ML lo reporta en charges pero NO lo descuenta del Account Statement)
-          // Se guarda en costo_financiero para visibilidad. add_on NO va en por_cobrar.
+          // financing/interest = cargo REAL de cuotas con interés (ML sí lo descuenta del pago).
+          // add_on = ruido informativo de ML. No es un costo del vendedor. ML absorbe ese costo.
+          //          No se guarda en ningún campo. No afecta por_cobrar.
           if (od._financiero > 0) od.row.costo_financiero = -od._financiero;
-          else if (od._financiero_info > 0) od.row.costo_financiero = -od._financiero_info;
           // Envío neto = cargo de envío - contribución del comprador
           // Ej: cargo $10,729.58 - buyer $5,346.59 = neto $5,382.99
           if (od._envio > 0) {
@@ -585,7 +585,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
           // por_cobrar = bruto menos cargos reales que ML descuenta de la liquidación
           // costo_financiero (financing/interest real) NO se incluye en por_cobrar.
           // add_on informativo tampoco: ML reporta el charge pero no lo descuenta del pago real.
-          if (od._comision > 0 || od._impuestos > 0 || od._financiero > 0 || od._financiero_info > 0 || od._envio > 0) {
+          if (od._comision > 0 || od._impuestos > 0 || od._financiero > 0 || od._envio > 0) {
             od.row.por_cobrar = od.row.importe_bruto
               + od.row.cargo_venta
               + od.row.cargo_envio
