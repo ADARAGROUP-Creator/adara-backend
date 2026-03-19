@@ -609,13 +609,13 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
                     if (type === 'tax') {
                       od._impuestos += amt;
                     } else if (type === 'fee') {
-                      if (name.includes('financing') || name.includes('interest')) {
-                        // Financiero REAL: cuotas con interés. ML sí lo descuenta del pago.
+                      if (name === 'financing_add_on_fee') {
+                        // VOS ofrecés las cuotas: ML te descuenta este costo de la liquidación.
+                        // Nombre exacto: "financing_add_on_fee" → va en costo_financiero y en por_cobrar.
                         od._financiero += amt;
-                      } else if (name.includes('add_on')) {
-                        // add_on: ruido informativo de ML. No es costo del vendedor.
-                        // ML absorbe el costo de financiar cuotas sin interés al comprador.
-                        // Se acumula en _financiero_info pero NO se guarda en ningún campo de la venta.
+                      } else if (name === 'financing_fee') {
+                        // ML ofrece las cuotas: ML lo absorbe internamente.
+                        // Nombre exacto: "financing_fee" → informativo, NO afecta por_cobrar.
                         od._financiero_info += amt;
                       } else {
                         od._comision += amt;
