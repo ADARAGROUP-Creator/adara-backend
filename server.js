@@ -183,6 +183,51 @@ app.get('/debug/charges/:paymentId', async (req, res) => {
   }
 });
 
+
+// ── DEBUG — Inspección de order + payments con charges_details ───────
+// GET /debug/order/:orderId
+// Llama a /orders/:id para obtener los payments y luego a cada payment
+// para ver charges_details, installments y net_received_amount real.
+app.get('/debug/order/:orderId', async (req, res) => {
+  try {
+    const order = await mlGet(`/v1/orders/${req.params.orderId}`);
+    const payments = order.payments || [];
+    const result = [];
+    for (const p of payments) {
+      let payDetail = null;
+      try {
+        payDetail = await mlGet(`/v1/payments/${p.id}`);
+      } catch(e) {
+        payDetail = { error: e.message };
+      }
+      const charges = (payDetail.charges_details || []).map(ch => ({
+        type: ch.type,
+        name: ch.name,
+        original_amount: ch.amounts?.original,
+      }));
+      result.push({
+        payment_id:          p.id,
+        status:              p.status,
+        installments:        payDetail.installments,
+        transaction_amount:  p.total_paid_amount || payDetail.transaction_amount,
+        net_received_amount: payDetail.net_received_amount,
+        shipping_amount:     payDetail.shipping_amount,
+        charges_details:     charges,
+        _analisis: {
+          fee:       charges.filter(c => c.type==='fee' && !['financing','interest','add_on'].some(n=>c.name?.includes(n))).reduce((s,c)=>s+(c.original_amount||0),0),
+          financing: charges.filter(c => c.type==='fee' && ['financing','interest'].some(n=>c.name?.includes(n))).reduce((s,c)=>s+(c.original_amount||0),0),
+          add_on:    charges.filter(c => c.type==='fee' && c.name?.includes('add_on')).reduce((s,c)=>s+(c.original_amount||0),0),
+          tax:       charges.filter(c => c.type==='tax').reduce((s,c)=>s+(c.original_amount||0),0),
+          shipping:  charges.filter(c => c.type==='shipping').reduce((s,c)=>s+(c.original_amount||0),0),
+        }
+      });
+    }
+    res.json({ order_id: order.id, status: order.status, total_amount: order.total_amount, payments: result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── MERCADO LIBRE — OAuth ────────────────────────────────────────────
 app.get('/ml/auth', (_, res) => {
   const url = `https://auth.mercadolibre.com.ar/authorization?response_type=code&client_id=${ML_CLIENT_ID}&redirect_uri=${encodeURIComponent(ML_REDIRECT_URI)}`;
