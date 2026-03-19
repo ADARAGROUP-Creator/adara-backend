@@ -190,13 +190,13 @@ app.get('/debug/charges/:paymentId', async (req, res) => {
 // para ver charges_details, installments y net_received_amount real.
 app.get('/debug/order/:orderId', async (req, res) => {
   try {
-    const order = await mlGet(`/v1/orders/${req.params.orderId}`);
+    const order = await mlGet(`/orders/${req.params.orderId}`);
     const payments = order.payments || [];
     const result = [];
     for (const p of payments) {
       let payDetail = null;
       try {
-        payDetail = await mlGet(`/v1/payments/${p.id}`);
+        payDetail = await mlGet(`/payments/${p.id}`);
       } catch(e) {
         payDetail = { error: e.message };
       }
