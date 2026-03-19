@@ -1927,6 +1927,38 @@ app.post('/mp/descartar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Pasar venta pendiente al mes siguiente ───────────────────────────
+// Mueve periodo_cobro al mes siguiente para que aparezca en la conciliación de ese mes.
+// No toca periodo (mes de venta) ni el P&L.
+app.post('/mp/pasar-mes', async (req, res) => {
+  try {
+    const { venta_id } = req.body;
+    if (!venta_id) return res.status(400).json({ error: 'Falta venta_id' });
+
+    // Traer la venta
+    const ventas = await sbGet('ventas_ml', `id=eq.${venta_id}&select=id,periodo,periodo_cobro,estado_conciliacion,aprobada&limit=1`);
+    if (!ventas?.length) return res.status(404).json({ error: 'Venta no encontrada' });
+
+    const venta = ventas[0];
+    if (!venta.aprobada) return res.status(400).json({ error: 'La venta no está aprobada' });
+    if (!['pendiente', 'parcial'].includes(venta.estado_conciliacion)) {
+      return res.status(400).json({ error: `La venta ya está ${venta.estado_conciliacion}` });
+    }
+
+    // Calcular mes siguiente desde periodo_cobro actual (o periodo si no tiene)
+    const base = venta.periodo_cobro || venta.periodo;
+    if (!base || !/^\d{4}-\d{2}$/.test(base)) {
+      return res.status(400).json({ error: 'periodo_cobro inválido: ' + base });
+    }
+    const [y, m] = base.split('-').map(Number);
+    const nextMonth = m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, '0')}`;
+
+    await sbPatch('ventas_ml', `id=eq.${venta_id}`, { periodo_cobro: nextMonth });
+
+    res.json({ ok: true, periodo_cobro_anterior: base, periodo_cobro_nuevo: nextMonth });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── EXTRACTO BANCARIO (Supervielle / Galicia) ────────────────────────
 app.post('/banco/extracto', upload.single('file'), async (req, res) => {
   try {
