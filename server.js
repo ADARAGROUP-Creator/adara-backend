@@ -583,13 +583,14 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
           }
 
           // por_cobrar = bruto menos cargos reales que ML descuenta de la liquidación
-          // costo_financiero (financing/interest real) NO se incluye en por_cobrar.
-          // add_on informativo tampoco: ML reporta el charge pero no lo descuenta del pago real.
+          // financing/interest (cuotas con interés): ML SÍ lo descuenta → incluir en por_cobrar
+          // add_on (cuotas sin interés): ML NO lo descuenta, es ruido informativo → NO incluir
           if (od._comision > 0 || od._impuestos > 0 || od._financiero > 0 || od._envio > 0) {
             od.row.por_cobrar = od.row.importe_bruto
               + od.row.cargo_venta
               + od.row.cargo_envio
-              + od.row.impuestos;
+              + od.row.impuestos
+              + (od._financiero > 0 ? -od._financiero : 0);
           }
 
           // Después de resolver shipment + payment:
@@ -603,12 +604,12 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             const impBonificacion = Math.round(od.flexBonificacion * 0.006 * 100) / 100;
             od.row.impuestos = (od.row.impuestos || 0) - impBonificacion;
 
-            // Recalcular por_cobrar incluyendo bonificación e impuesto
-            // costo_financiero NO se incluye (ver comentario arriba)
+            // Recalcular por_cobrar incluyendo bonificación, impuesto y financiero real
             od.row.por_cobrar = od.row.importe_bruto
               + od.row.cargo_venta
               + od.row.cargo_envio
-              + od.row.impuestos;
+              + od.row.impuestos
+              + (od._financiero > 0 ? -od._financiero : 0);
           }
 
           // Calcular fecha de despacho Flex según reglas MEF
@@ -1680,6 +1681,89 @@ async function autoConciliarMP() {
 app.post('/mp/conciliar', async (_, res) => {
   try { res.json({ ok: true, conciliados: await autoConciliarMP() }); }
   catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
+// ── Recalcular balance de todas las ventas conciliadas ───────────────
+// Útil cuando por_cobrar cambia (ej: re-sync corrige add_on) sin re-subir el AS.
+// Recorre TODAS las ventas con movimientos vinculados y recalcula balance vs por_cobrar actual.
+app.post('/mp/recalcular-balance', async (_, res) => {
+  try {
+    console.log('Recalculando balance de ventas con movimientos vinculados...');
+
+    // 1. Traer todas las ventas que tienen al menos 1 movimiento vinculado
+    const ventaIds = new Set();
+    let offset = 0;
+    while (true) {
+      const page = await sbGet('movimientos_mp',
+        `venta_ml_id=not.is.null&select=venta_ml_id&limit=1000&offset=${offset}&order=id`
+      );
+      if (!page?.length) break;
+      for (const m of page) ventaIds.add(m.venta_ml_id);
+      if (page.length < 1000) break;
+      offset += 1000;
+    }
+    const ids = [...ventaIds];
+    console.log(`  → ${ids.length} ventas con movimientos vinculados`);
+
+    // 2. Para cada venta: sumar movimientos y comparar con por_cobrar fresco
+    let nConciliadas = 0, nParciales = 0, nSinCambio = 0;
+    const concTasks = [], parcTasks = [];
+
+    for (let i = 0; i < ids.length; i += 200) {
+      const chunk = ids.slice(i, i + 200);
+      const chunkStr = chunk.join(',');
+
+      // Sumar movimientos por venta
+      const movs = await sbGet('movimientos_mp',
+        `venta_ml_id=in.(${chunkStr})&select=venta_ml_id,monto_neto&limit=1000`
+      );
+      const sumByVenta = {};
+      for (const m of (movs || [])) {
+        sumByVenta[m.venta_ml_id] = (sumByVenta[m.venta_ml_id] || 0) + (m.monto_neto || 0);
+      }
+
+      // Traer por_cobrar y estado actual
+      const ventas = await sbGet('ventas_ml',
+        `id=in.(${chunkStr})&select=id,por_cobrar,estado_conciliacion&limit=1000`
+      );
+      for (const v of (ventas || [])) {
+        const sumMovs = Math.round((sumByVenta[v.id] || 0) * 100) / 100;
+        const esperado = v.por_cobrar || 0;
+        const balance = Math.round((sumMovs - esperado) * 100) / 100;
+        const nuevoEstado = Math.abs(balance) < 0.02 ? 'conciliado' : 'parcial';
+
+        if (nuevoEstado === v.estado_conciliacion) { nSinCambio++; continue; }
+
+        if (nuevoEstado === 'conciliado') {
+          concTasks.push(() => sbPatch('ventas_ml', `id=eq.${v.id}`, {
+            balance_conciliacion: 0, estado_conciliacion: 'conciliado', conciliado: true
+          }).catch(e => console.warn('recalc conc:', e.message)));
+          nConciliadas++;
+        } else {
+          parcTasks.push(() => sbPatch('ventas_ml', `id=eq.${v.id}`, {
+            balance_conciliacion: balance, estado_conciliacion: 'parcial', conciliado: false
+          }).catch(e => console.warn('recalc parcial:', e.message)));
+          nParciales++;
+        }
+      }
+    }
+
+    // 3. Aplicar updates en paralelo
+    const parallel = async (tasks, concurrency = 15) => {
+      for (let i = 0; i < tasks.length; i += concurrency) {
+        await Promise.allSettled(tasks.slice(i, i + concurrency).map(fn => fn()));
+      }
+    };
+    await parallel(concTasks);
+    await parallel(parcTasks);
+
+    console.log(`✓ Recalcular balance: ${nConciliadas} nuevas conciliadas, ${nParciales} parciales, ${nSinCambio} sin cambio`);
+    res.json({ ok: true, conciliadas: nConciliadas, parciales: nParciales, sin_cambio: nSinCambio });
+  } catch (e) {
+    console.error('recalcular-balance:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── Movimientos vinculados a una venta ────────────────────────────────
