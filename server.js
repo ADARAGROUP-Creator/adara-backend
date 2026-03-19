@@ -507,7 +507,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
           // 2. MP Payment details — iterar TODOS los payments aprobados (split payment)
           //    Los cargos se distribuyen entre payments, hay que sumarlos todos
           if (od.paymentIds.length && od.row.ml_status !== 'cancelled') {
-            od._comision = 0; od._impuestos = 0; od._financiero = 0; od._envio = 0;
+            od._comision = 0; od._impuestos = 0; od._financiero = 0; od._financiero_info = 0; od._envio = 0;
             od._shippingBuyerContrib = 0; // contribución del comprador al envío
 
             for (const pid of od.paymentIds) {
@@ -533,8 +533,13 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
                     if (type === 'tax') {
                       od._impuestos += amt;
                     } else if (type === 'fee') {
-                      if (name.includes('financing') || name.includes('interest') || name.includes('add_on')) {
+                      if (name.includes('financing') || name.includes('interest')) {
+                        // Financiero REAL: cuotas con interés. ML sí lo descuenta del pago.
                         od._financiero += amt;
+                      } else if (name.includes('add_on')) {
+                        // add_on: informativo. ML lo reporta pero NO lo descuenta del pago real.
+                        // Se guarda en costo_financiero para visibilidad pero NO afecta por_cobrar.
+                        od._financiero_info += amt;
                       } else {
                         od._comision += amt;
                       }
@@ -565,7 +570,11 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
           // Aplicar totales acumulados de TODOS los payments (split payment support)
           if (od._comision > 0) od.row.cargo_venta = -od._comision;
           if (od._impuestos > 0) od.row.impuestos = -od._impuestos;
+          // financing/interest = cargo REAL de cuotas (ML lo descuenta del pago)
+          // add_on = informativo (ML lo reporta en charges pero NO lo descuenta del Account Statement)
+          // Se guarda en costo_financiero para visibilidad. add_on NO va en por_cobrar.
           if (od._financiero > 0) od.row.costo_financiero = -od._financiero;
+          else if (od._financiero_info > 0) od.row.costo_financiero = -od._financiero_info;
           // Envío neto = cargo de envío - contribución del comprador
           // Ej: cargo $10,729.58 - buyer $5,346.59 = neto $5,382.99
           if (od._envio > 0) {
@@ -574,8 +583,9 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
           }
 
           // por_cobrar = bruto menos cargos reales que ML descuenta de la liquidación
-          // costo_financiero NO se incluye: ML lo informa en charges_details pero no lo descuenta
-          if (od._comision > 0 || od._impuestos > 0 || od._financiero > 0 || od._envio > 0) {
+          // costo_financiero (financing/interest real) NO se incluye en por_cobrar.
+          // add_on informativo tampoco: ML reporta el charge pero no lo descuenta del pago real.
+          if (od._comision > 0 || od._impuestos > 0 || od._financiero > 0 || od._financiero_info > 0 || od._envio > 0) {
             od.row.por_cobrar = od.row.importe_bruto
               + od.row.cargo_venta
               + od.row.cargo_envio
@@ -966,6 +976,17 @@ app.post('/mp/settlement-sync', async (req, res) => {
       const isSplit = ventas[0].pagos_cantidad > 1;
       const existing = ventas[0];
 
+      // por_cobrar correcto = lo que ML realmente paga en el Account Statement
+      // SETTLEMENT_NET_AMOUNT ya descuenta el financing (incluye add_on informativo),
+      // pero el Account Statement paga sin ese descuento.
+      // Fix: revertir el descuento del financing para obtener el neto real pagado.
+      // Aplica tanto a add_on informativo (no cobrado) como a financing real (cuotas):
+      // - add_on informativo: financing en Settlement > 0, pero AS paga sin descontarlo → revertir ✅
+      // - financing real (cuotas): el sync normal ya lo excluye de por_cobrar → consistente ✅
+      const porCobrarReal = netAmount > 0
+        ? Math.round((netAmount + Math.abs(financing)) * 100) / 100
+        : 0;
+
       let updateData;
       if (isSplit && existing.mp_payment_id !== sourceId) {
         // Es el segundo (o N-ésimo) pago del split → acumular sobre lo existente
@@ -982,8 +1003,8 @@ app.post('/mp/settlement-sync', async (req, res) => {
           impuestos: taxes
             ? (existing.impuestos || 0) + (-Math.abs(taxes))
             : existing.impuestos,
-          por_cobrar: netAmount
-            ? (existing.por_cobrar || 0) + netAmount
+          por_cobrar: porCobrarReal
+            ? (existing.por_cobrar || 0) + porCobrarReal
             : existing.por_cobrar,
         };
       } else {
@@ -993,7 +1014,7 @@ app.post('/mp/settlement-sync', async (req, res) => {
           cargo_envio: shipping ? -Math.abs(shipping) : existing.cargo_envio,
           costo_financiero: financing ? -Math.abs(financing) : existing.costo_financiero,
           impuestos: taxes ? -Math.abs(taxes) : existing.impuestos,
-          por_cobrar: netAmount || existing.por_cobrar,
+          por_cobrar: porCobrarReal || existing.por_cobrar,
         };
       }
 
