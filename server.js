@@ -1269,6 +1269,7 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
       const t = (tipo || '').toLowerCase();
       if (t.includes('liquidación de dinero') && !t.includes('cancelada'))  return 'venta_ml';
       if (t.includes('liquidación') && t.includes('cancelada'))             return 'venta_cancelada';
+      if (t.includes('bonificación') && t.includes('cancelada'))            return 'bonificacion_cancelada';
       if (t.includes('bonificación'))                                       return 'bonificacion_envio';
       // Cargo envío devolución ANTES del check genérico de devolución
       if (t.includes('cargo') && t.includes('devolución'))                  return 'cargo_envio_devolucion';
