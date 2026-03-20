@@ -891,6 +891,66 @@ app.get('/ml/devoluciones', async (req, res) => {
   }
 });
 
+
+// ── Recepción de producto devuelto / cancelado ───────────────────────
+// Registra condición del producto al llegar al depósito.
+// condicion = 'ok'           → +1 stock en catalogo_skus + aprobada = true
+// condicion = 'no_disponible' → sin stock, nota obligatoria, aprobada = true
+// En ambos casos: inserta en stock_devoluciones + actualiza ventas_ml
+app.post('/ml/recepcion', async (req, res) => {
+  try {
+    const { venta_id, condicion, nota } = req.body;
+    if (!venta_id) return res.status(400).json({ error: 'Falta venta_id' });
+    if (!['ok', 'no_disponible'].includes(condicion)) return res.status(400).json({ error: 'condicion debe ser ok o no_disponible' });
+    if (condicion === 'no_disponible' && !nota?.trim()) return res.status(400).json({ error: 'Nota obligatoria para producto no disponible' });
+
+    // Traer venta
+    const ventas = await sbGet('ventas_ml', `id=eq.${venta_id}&select=id,sku,titulo,periodo,claim_status,recepcion_condicion&limit=1`);
+    if (!ventas?.length) return res.status(404).json({ error: 'Venta no encontrada' });
+    const venta = ventas[0];
+
+    const hoy = new Date().toISOString().split('T')[0];
+    const nuevoClaimStatus = condicion === 'ok' ? 'reingresado' : 'perdida';
+
+    // 1. Actualizar ventas_ml
+    await sbPatch('ventas_ml', `id=eq.${venta_id}`, {
+      recepcion_condicion: condicion,
+      recepcion_fecha: hoy,
+      recepcion_nota: nota?.trim() || null,
+      claim_status: nuevoClaimStatus,
+      aprobada: true,
+    });
+
+    // 2. Insertar en stock_devoluciones
+    await sb('POST', 'stock_devoluciones', [{
+      venta_ml_id: venta_id,
+      sku: venta.sku || null,
+      titulo: venta.titulo || null,
+      condicion,
+      nota: nota?.trim() || null,
+      fecha_recepcion: hoy,
+      periodo: venta.periodo || null,
+    }]);
+
+    // 3. Si ok → sumar +1 stock en catalogo_skus
+    let stockActualizado = false;
+    if (condicion === 'ok' && venta.sku) {
+      try {
+        const skus = await sbGet('catalogo_skus', `sku=eq.${encodeURIComponent(venta.sku)}&select=id,stock&limit=1`);
+        if (skus?.length) {
+          const nuevoStock = (skus[0].stock || 0) + 1;
+          await sbPatch('catalogo_skus', `id=eq.${skus[0].id}`, { stock: nuevoStock });
+          stockActualizado = true;
+        }
+      } catch (e) {
+        console.warn('Stock update error:', e.message);
+      }
+    }
+
+    res.json({ ok: true, claim_status: nuevoClaimStatus, stock_actualizado: stockActualizado });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── DEBUG: Return reasons ──────────────────────────────────────────────
 app.get('/debug-return-reasons', async (req, res) => {
   try {
