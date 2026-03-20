@@ -605,6 +605,8 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
                     // Skip buyer-side charges (coupons, discounts)
                     if (type === 'coupon' || type === 'discount') continue;
                     if (name.includes('coupon') || name.includes('rebate')) continue;
+                    // tax_withholding_payer-* = retencion del COMPRADOR, no del vendedor → ignorar
+                    if (type === 'tax' && name.includes('_payer')) continue;
 
                     if (type === 'tax') {
                       od._impuestos += amt;
