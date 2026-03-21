@@ -1586,29 +1586,37 @@ async function autoConciliarMP() {
   // Paso B: fallback por monto neto para las que no matchearon por posición
   let nBonifPos = 0, nBonifMonto = 0;
   try {
-    // 1. Bonificaciones sin vincular (paginado)
-    let bonifSinVinc = [];
-    let bOffset = 0;
-    while (true) {
-      const page = await sbGet('movimientos_mp', 
-        `conciliado=eq.false&venta_ml_id=is.null&categoria=eq.bonificacion_envio&select=id,monto_neto,posicion&limit=1000&offset=${bOffset}&order=id`
-      );
-      if (!page?.length) break;
-      bonifSinVinc.push(...page);
-      if (page.length < 1000) break;
-      bOffset += 1000;
-    }
+    // 1. Bonificaciones sin vincular: filtrar desde movs (batch actual) para evitar
+    //    procesar bonificaciones de meses anteriores que quedaron sin matchear en la tabla.
+    //    movs ya tiene todos los campos necesarios (id, monto_neto, posicion, categoria).
+    let bonifSinVinc = movs.filter(m => m.categoria === 'bonificacion_envio');
     
     if (bonifSinVinc.length) {
-      // 2. Todos los movimientos YA vinculados: posicion → venta_ml_id (paginado)
+      // IMPORTANTE: bonifSinVinc se construye desde movs (el batch actual), NO con query independiente.
+      // Esto evita procesar bonificaciones viejas de meses anteriores que quedaron sin matchear
+      // en la tabla (conciliado=false) y que podrían asignarse a ventas del mes incorrecto.
+      // 2. Movimientos vinculados del batch actual: posicion → venta_ml_id
+      //    Solo usamos movimientos del primer pase (movToVenta) para construir el índice de posiciones.
+      //    Esto evita colisiones entre posiciones de distintos meses (ambos empiezan en 1).
       const posByVenta = {}; // posicion → venta_ml_id
+      // Primero indexar los del primer pase (ya vinculados en esta corrida)
+      for (const link of movToVenta) {
+        // Buscar la posicion de este mov en movs
+        const mov = movs.find(m => m.id === link.mov_id);
+        if (mov?.posicion != null) posByVenta[mov.posicion] = link.venta_id;
+      }
+      // También incluir los ya vinculados previamente (conciliaciones manuales del mismo AS)
+      // usando solo los IDs del batch actual como referencia de posiciones
+      const movIdsActual = new Set(movs.map(m => m.id));
       let lpOffset = 0;
       while (true) {
         const page = await sbGet('movimientos_mp', 
-          `venta_ml_id=not.is.null&posicion=not.is.null&select=posicion,venta_ml_id&limit=1000&offset=${lpOffset}&order=id`
+          `venta_ml_id=not.is.null&posicion=not.is.null&select=id,posicion,venta_ml_id&limit=1000&offset=${lpOffset}&order=id`
         );
         if (!page?.length) break;
-        for (const m of page) posByVenta[m.posicion] = m.venta_ml_id;
+        for (const m of page) {
+          if (movIdsActual.has(m.id)) posByVenta[m.posicion] = m.venta_ml_id;
+        }
         if (page.length < 1000) break;
         lpOffset += 1000;
       }
