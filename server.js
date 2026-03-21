@@ -678,23 +678,26 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
           }
 
           // Después de resolver shipment + payment:
-          // Si es Flex, cargo_envio = bonificación Flex + lo que pagó el comprador por envío
-          //   - flexBonificacion: ML te paga por usar logística propia (siempre presente en Flex)
-          //   - _shippingBuyerContrib: lo que pagó el comprador; ML te lo transfiere en la liquidación
-          //     Si es 0 (envío sin costo al comprador), cargo_envio = solo la bonificación (sin cambio)
+          // Si es Flex, cargo_envio = solo la bonificación Flex (para que el matching de bonificaciones funcione)
+          //   - flexBonificacion: ML te paga por usar logística propia
+          //   - _shippingBuyerContrib: lo que pagó el comprador; ML también te lo transfiere en la liquidación
+          //     Se suma DIRECTO en por_cobrar, NO en cargo_envio (no afecta el matching de bonificaciones)
+          //   - Si _shippingBuyerContrib = 0, por_cobrar es idéntico al caso sin shipping (sin cambio)
           // Si es colecta/full, cargo_envio ya viene de charges_details (negativo, es un costo)
           if (od.flexBonificacion && od.flexBonificacion > 0) {
-            od.row.cargo_envio = Math.round((od.flexBonificacion + (od._shippingBuyerContrib || 0)) * 100) / 100;
+            od.row.cargo_envio = od.flexBonificacion;
 
             // Imp. Créd. y Déb. solo sobre la bonificación Flex (0.6%)
             // El shipping del comprador no genera este impuesto adicional
             const impBonificacion = Math.round(od.flexBonificacion * 0.006 * 100) / 100;
             od.row.impuestos = (od.row.impuestos || 0) - impBonificacion;
 
-            // Recalcular por_cobrar con cargo_envio corregido, impuesto Flex y financing_add_on_fee
+            // por_cobrar = bruto + comisión + bonif_flex + shipping_comprador + impuestos - financiero
+            // shipping_comprador se suma directo (ML te lo transfiere en la liquidación)
             od.row.por_cobrar = od.row.importe_bruto
               + od.row.cargo_venta
               + od.row.cargo_envio
+              + (od._shippingBuyerContrib || 0)
               + od.row.impuestos
               + (od._financiero > 0 ? -od._financiero : 0);
           }
