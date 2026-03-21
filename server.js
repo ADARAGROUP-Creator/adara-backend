@@ -649,10 +649,15 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
           // Aplicar totales acumulados de TODOS los payments (split payment support)
           if (od._comision > 0) od.row.cargo_venta = -od._comision;
           if (od._impuestos > 0) od.row.impuestos = -od._impuestos;
-          // financing/interest = cargo REAL de cuotas con interés (ML sí lo descuenta del pago).
-          // add_on = ruido informativo de ML. No es un costo del vendedor. ML absorbe ese costo.
-          //          No se guarda en ningún campo. No afecta por_cobrar.
+
+          // financing_add_on_fee: el VENDEDOR ofrece cuotas sin interés. ML descuenta este costo
+          //   de la liquidación → afecta por_cobrar. Se guarda en costo_financiero.
+          // financing_fee: ML ofrece cuotas (MSI plataforma). ML lo absorbe internamente.
+          //   ML NO lo descuenta de la liquidación del vendedor → NO afecta por_cobrar.
+          //   Se acumula en _financiero_info solo con fines informativos.
+          // Validado con datos reales (19 marzo 2026). Ver ADARA-DECISIONES.md.
           if (od._financiero > 0) od.row.costo_financiero = -od._financiero;
+
           // Envío neto = cargo de envío - contribución del comprador
           // Ej: cargo $10,729.58 - buyer $5,346.59 = neto $5,382.99
           if (od._envio > 0) {
@@ -660,9 +665,10 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             od.row.cargo_envio = -Math.round(envioNeto * 100) / 100;
           }
 
-          // por_cobrar = bruto menos cargos reales que ML descuenta de la liquidación
-          // financing/interest (cuotas con interés): ML SÍ lo descuenta → incluir en por_cobrar
-          // add_on (cuotas sin interés): ML NO lo descuenta, es ruido informativo → NO incluir
+          // por_cobrar = lo que ML efectivamente liquida al vendedor
+          // Fórmula: importe_bruto + cargo_venta + cargo_envio + impuestos - financing_add_on_fee
+          // financing_add_on_fee (_financiero) SÍ se descuenta: ML lo retiene de la liquidación.
+          // financing_fee (_financiero_info) NO se descuenta: ML lo absorbe. No entra en la fórmula.
           if (od._comision > 0 || od._impuestos > 0 || od._financiero > 0 || od._envio > 0) {
             od.row.por_cobrar = od.row.importe_bruto
               + od.row.cargo_venta
@@ -672,17 +678,20 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
           }
 
           // Después de resolver shipment + payment:
-          // Si es Flex, cargo_envio = bonificación (positivo, es ingreso)
-          // Si es colecta/full, cargo_envio ya viene de charges_details (negativo)
+          // Si es Flex, cargo_envio = bonificación Flex + lo que pagó el comprador por envío
+          //   - flexBonificacion: ML te paga por usar logística propia (siempre presente en Flex)
+          //   - _shippingBuyerContrib: lo que pagó el comprador; ML te lo transfiere en la liquidación
+          //     Si es 0 (envío sin costo al comprador), cargo_envio = solo la bonificación (sin cambio)
+          // Si es colecta/full, cargo_envio ya viene de charges_details (negativo, es un costo)
           if (od.flexBonificacion && od.flexBonificacion > 0) {
-            od.row.cargo_envio = od.flexBonificacion;
+            od.row.cargo_envio = Math.round((od.flexBonificacion + (od._shippingBuyerContrib || 0)) * 100) / 100;
 
-            // Imp. Créd. y Déb. sobre bonificación de envío (0.6% de la bonificación)
-            // Este impuesto no viene en charges_details de MP, hay que calcularlo
+            // Imp. Créd. y Déb. solo sobre la bonificación Flex (0.6%)
+            // El shipping del comprador no genera este impuesto adicional
             const impBonificacion = Math.round(od.flexBonificacion * 0.006 * 100) / 100;
             od.row.impuestos = (od.row.impuestos || 0) - impBonificacion;
 
-            // Recalcular por_cobrar incluyendo bonificación, impuesto y financiero real
+            // Recalcular por_cobrar con cargo_envio corregido, impuesto Flex y financing_add_on_fee
             od.row.por_cobrar = od.row.importe_bruto
               + od.row.cargo_venta
               + od.row.cargo_envio
