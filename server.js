@@ -720,7 +720,8 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
         // Remover campos que no deben pisarse en re-sync
         allKeys.delete('conciliado');
         allKeys.delete('estado_cancelacion');
-        allKeys.delete('periodo_cobro'); // No pisar: puede haber sido movido con → Pasar
+        // periodo_cobro SE INCLUYE en el upsert (se setea = periodo en línea ~486)
+        // Si se hizo → Pasar, un re-sync lo resetea — es aceptable y preferible a dejarlo null
         const keyList = [...allKeys];
         const normalized = dbRows.map(r => {
           const obj = {};
