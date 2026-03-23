@@ -2036,6 +2036,17 @@ app.post('/mp/pasar-mes', async (req, res) => {
     const [y, m] = base.split('-').map(Number);
     const nextMonth = m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, '0')}`;
 
+    // Validar que el salto no supere 3 meses desde el periodo original de la venta
+    // Más de 3 meses sin cobrar requiere revisión manual, no seguir pasando automáticamente
+    const [yOrig, mOrig] = venta.periodo.split('-').map(Number);
+    const [yNew, mNew] = nextMonth.split('-').map(Number);
+    const mesesDiferencia = (yNew - yOrig) * 12 + (mNew - mOrig);
+    if (mesesDiferencia > 3) {
+      return res.status(400).json({ 
+        error: `No se puede pasar más de 3 meses desde la fecha original de la venta (${venta.periodo}). Revisá manualmente.`
+      });
+    }
+
     await sbPatch('ventas_ml', `id=eq.${venta_id}`, { periodo_cobro: nextMonth });
 
     res.json({ ok: true, periodo_cobro_anterior: base, periodo_cobro_nuevo: nextMonth });
