@@ -483,6 +483,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
           row: {
             ml_order_id:      String(o.id),
             periodo:          fechaVenta ? fechaVenta.substring(0, 7) : null,
+            periodo_cobro:    fechaVenta ? fechaVenta.substring(0, 7) : null,
             fecha:            fechaVenta,
             titulo:           item.item?.title || '',
             sku:              sellerSku,
@@ -719,6 +720,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
         // Remover campos que no deben pisarse en re-sync
         allKeys.delete('conciliado');
         allKeys.delete('estado_cancelacion');
+        allKeys.delete('periodo_cobro'); // No pisar: puede haber sido movido con → Pasar
         const keyList = [...allKeys];
         const normalized = dbRows.map(r => {
           const obj = {};
@@ -1436,24 +1438,30 @@ app.post('/mp/extracto', upload.single('file'), async (req, res) => {
   }
 });
 
-async function autoConciliarMP() {
+async function autoConciliarMP(fechaDesde = null, fechaHasta = null) {
   // ─── V2: vincular TODO movimiento que matchee por referencia con un payment_id ──
   // Ya no filtramos por categoría — si la referencia coincide con un payment_id, se vincula.
   // Esto captura: liquidaciones, devoluciones, débitos por reclamo, reintegros, cargo envío, etc.
   // Solo quedan afuera: bonificaciones (otra referencia → segundo pase por monto) y movimientos sin referencia.
   
-  // Solo movimientos sin venta vinculada (no pisar links manuales)
+  // Solo movimientos sin venta vinculada del rango del AS actual (no pisar links manuales)
+  // Filtrar por rango de fechas evita procesar movimientos huérfanos de meses anteriores
+  // que podrían asignarse incorrectamente a ventas del mes nuevo.
   // Paginado para evitar límite de 1000 rows de Supabase
   let movs = [];
   let movOffset = 0;
+  let baseFilter = `conciliado=eq.false&venta_ml_id=is.null`;
+  if (fechaDesde && fechaHasta) {
+    baseFilter += `&fecha=gte.${fechaDesde}&fecha=lte.${fechaHasta}`;
+  }
   while (true) {
-    const page = await sbGet('movimientos_mp', `conciliado=eq.false&venta_ml_id=is.null&limit=1000&offset=${movOffset}&order=id`);
+    const page = await sbGet('movimientos_mp', `${baseFilter}&limit=1000&offset=${movOffset}&order=id`);
     if (!page?.length) break;
     movs.push(...page);
     if (page.length < 1000) break;
     movOffset += 1000;
   }
-  console.log(`  → ${movs.length} movimientos sin conciliar cargados`);
+  console.log(`  → ${movs.length} movimientos sin conciliar cargados${fechaDesde ? ` (${fechaDesde} → ${fechaHasta})` : ' (todos los meses)'}`);
   
   // Traer TODAS las ventas (para matchear devoluciones de ventas ya conciliadas)
   // Supabase puede limitar a 1000 por default → paginamos si es necesario
@@ -1837,8 +1845,12 @@ async function autoConciliarMP() {
   return result;
 }
 
-app.post('/mp/conciliar', async (_, res) => {
-  try { res.json({ ok: true, conciliados: await autoConciliarMP() }); }
+app.post('/mp/conciliar', async (req, res) => {
+  try {
+    // fechaDesde y fechaHasta opcionales — si vienen, filtran movimientos al rango del AS
+    const { fechaDesde, fechaHasta } = req.body || {};
+    res.json({ ok: true, conciliados: await autoConciliarMP(fechaDesde || null, fechaHasta || null) });
+  }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
