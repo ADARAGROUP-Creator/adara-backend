@@ -1861,15 +1861,21 @@ async function autoConciliarMP(fechaDesde = null, fechaHasta = null) {
 
   if (allTocadas.length) {
     // 1. Traer movimientos vinculados agrupados por venta (paginado)
-    const ventaMontosMap = {}; // venta_id → suma de montos
+    // Incluye categoria para calcular esperado dinámicamente (devoluciones reducen el esperado)
+    const ventaMontosMap = {}; // venta_id → suma total de montos
+    const ventaDevMap = {};    // venta_id → suma de movs devolucion/cancelada/cargo_envio (negativos)
+    const DEV_CATS = ['devolucion', 'venta_cancelada', 'cargo_envio_devolucion'];
     for (let i = 0; i < allTocadas.length; i += 100) {
       const chunk = allTocadas.slice(i, i + 100).join(',');
       let mOffset = 0;
       while (true) {
-        const movsChunk = await sbGet('movimientos_mp', `venta_ml_id=in.(${chunk})&select=venta_ml_id,monto_neto&limit=1000&offset=${mOffset}&order=id`);
+        const movsChunk = await sbGet('movimientos_mp', `venta_ml_id=in.(${chunk})&select=venta_ml_id,monto_neto,categoria&limit=1000&offset=${mOffset}&order=id`);
         if (!movsChunk?.length) break;
         for (const m of movsChunk) {
           ventaMontosMap[m.venta_ml_id] = (ventaMontosMap[m.venta_ml_id] || 0) + (m.monto_neto || 0);
+          if (DEV_CATS.includes(m.categoria)) {
+            ventaDevMap[m.venta_ml_id] = (ventaDevMap[m.venta_ml_id] || 0) + (m.monto_neto || 0);
+          }
         }
         if (movsChunk.length < 1000) break;
         mOffset += 1000;
@@ -1882,11 +1888,10 @@ async function autoConciliarMP(fechaDesde = null, fechaHasta = null) {
       const chunk = allTocadas.slice(i, i + 200).join(',');
       let pcOffset = 0;
       while (true) {
-        const ventasChunk = await sbGet('ventas_ml', `id=in.(${chunk})&select=id,por_cobrar,devuelta,monto_reembolso,cargo_envio_devolucion&limit=1000&offset=${pcOffset}&order=id`);
+        const ventasChunk = await sbGet('ventas_ml', `id=in.(${chunk})&select=id,por_cobrar&limit=1000&offset=${pcOffset}&order=id`);
         if (!ventasChunk?.length) break;
         for (const v of ventasChunk) {
-          // Fórmula unificada: para normales monto_reembolso=0, para devueltas resta el reembolso
-          ventaPorCobrar[v.id] = (v.por_cobrar || 0) - (v.monto_reembolso || 0) + (v.cargo_envio_devolucion || 0);
+          ventaPorCobrar[v.id] = v.por_cobrar || 0;
         }
         if (ventasChunk.length < 1000) break;
         pcOffset += 1000;
@@ -1894,14 +1899,16 @@ async function autoConciliarMP(fechaDesde = null, fechaHasta = null) {
     }
     
     // 3. Calcular balance y agrupar
-    // por_cobrar ya incluye bonificación Flex (cargo_envio = bonificacion en sync)
-    // por lo tanto: esperado = por_cobrar directamente
+    // esperado = por_cobrar + sumDev (sumDev es negativo para devoluciones → reduce esperado)
+    // Para normales: sumDev=0 → esperado = por_cobrar
+    // Para devol total: sumDev ≈ -por_cobrar → esperado ≈ 0
     const conciliadoIds = [];
     const parcialUpdates = []; // {id, balance}
     
     for (const ventaId of allTocadas) {
       const sumMovs = ventaMontosMap[ventaId] || 0;
-      const esperado = ventaPorCobrar[ventaId] || 0;
+      const sumDev = ventaDevMap[ventaId] || 0; // negativo para devoluciones
+      const esperado = (ventaPorCobrar[ventaId] || 0) + sumDev;
       const balance = Math.round((sumMovs - esperado) * 100) / 100;
       
       if (Math.abs(balance) < 0.02) {
@@ -1978,30 +1985,44 @@ app.post('/mp/recalcular-balance', async (_, res) => {
     console.log(`  → ${ids.length} ventas con movimientos vinculados`);
 
     // 2. Para cada venta: sumar movimientos y comparar con por_cobrar fresco
-    let nConciliadas = 0, nParciales = 0, nSinCambio = 0;
+    let nConciliadas = 0, nParciales = 0, nSinCambio = 0, nDescartadas = 0;
     const concTasks = [], parcTasks = [];
+    const DEV_CATS = ['devolucion', 'venta_cancelada', 'cargo_envio_devolucion'];
 
     for (let i = 0; i < ids.length; i += 200) {
       const chunk = ids.slice(i, i + 200);
       const chunkStr = chunk.join(',');
 
-      // Sumar movimientos por venta
-      const movs = await sbGet('movimientos_mp',
-        `venta_ml_id=in.(${chunkStr})&select=venta_ml_id,monto_neto&limit=1000`
-      );
+      // Sumar movimientos por venta (total + devolucion categories) — paginado
       const sumByVenta = {};
-      for (const m of (movs || [])) {
-        sumByVenta[m.venta_ml_id] = (sumByVenta[m.venta_ml_id] || 0) + (m.monto_neto || 0);
+      const devByVenta = {};
+      let mOffset = 0;
+      while (true) {
+        const movs = await sbGet('movimientos_mp',
+          `venta_ml_id=in.(${chunkStr})&select=venta_ml_id,monto_neto,categoria&limit=1000&offset=${mOffset}`
+        );
+        if (!movs?.length) break;
+        for (const m of movs) {
+          sumByVenta[m.venta_ml_id] = (sumByVenta[m.venta_ml_id] || 0) + (m.monto_neto || 0);
+          if (DEV_CATS.includes(m.categoria)) {
+            devByVenta[m.venta_ml_id] = (devByVenta[m.venta_ml_id] || 0) + (m.monto_neto || 0);
+          }
+        }
+        if (movs.length < 1000) break;
+        mOffset += 1000;
       }
 
       // Traer por_cobrar y estado actual
       const ventas = await sbGet('ventas_ml',
-        `id=in.(${chunkStr})&select=id,por_cobrar,estado_conciliacion,devuelta,monto_reembolso,cargo_envio_devolucion&limit=1000`
+        `id=in.(${chunkStr})&select=id,por_cobrar,estado_conciliacion&limit=1000`
       );
       for (const v of (ventas || [])) {
+        // NUNCA tocar descartadas — son cancelaciones sin entrega ya procesadas
+        if (v.estado_conciliacion === 'descartada') { nDescartadas++; continue; }
+
         const sumMovs = Math.round((sumByVenta[v.id] || 0) * 100) / 100;
-        // Fórmula unificada: para normales monto_reembolso=0, para devueltas resta el reembolso
-        const esperado = (v.por_cobrar || 0) - (v.monto_reembolso || 0) + (v.cargo_envio_devolucion || 0);
+        const sumDev = devByVenta[v.id] || 0; // negativo para devoluciones
+        const esperado = (v.por_cobrar || 0) + sumDev;
         const balance = Math.round((sumMovs - esperado) * 100) / 100;
         const nuevoEstado = Math.abs(balance) < 0.02 ? 'conciliado' : 'parcial';
 
@@ -2030,8 +2051,8 @@ app.post('/mp/recalcular-balance', async (_, res) => {
     await parallel(concTasks);
     await parallel(parcTasks);
 
-    console.log(`✓ Recalcular balance: ${nConciliadas} nuevas conciliadas, ${nParciales} parciales, ${nSinCambio} sin cambio`);
-    res.json({ ok: true, conciliadas: nConciliadas, parciales: nParciales, sin_cambio: nSinCambio });
+    console.log(`✓ Recalcular balance: ${nConciliadas} nuevas conciliadas, ${nParciales} parciales, ${nSinCambio} sin cambio, ${nDescartadas} descartadas ignoradas`);
+    res.json({ ok: true, conciliadas: nConciliadas, parciales: nParciales, sin_cambio: nSinCambio, descartadas_ignoradas: nDescartadas });
   } catch (e) {
     console.error('recalcular-balance:', e);
     res.status(500).json({ error: e.message });
@@ -2059,13 +2080,14 @@ app.post('/mp/vincular', async (req, res) => {
     });
 
     // Recalcular balance de la venta
-    const movsVenta = await sbGet('movimientos_mp', `venta_ml_id=eq.${venta_id}&select=monto_neto`);
+    const DEV_CATS = ['devolucion', 'venta_cancelada', 'cargo_envio_devolucion'];
+    const movsVenta = await sbGet('movimientos_mp', `venta_ml_id=eq.${venta_id}&select=monto_neto,categoria`);
     const sumMovs = (movsVenta || []).reduce((s, m) => s + (m.monto_neto || 0), 0);
-    const venta = await sbGet('ventas_ml', `id=eq.${venta_id}&select=por_cobrar,conciliado,devuelta,monto_reembolso,cargo_envio_devolucion`);
+    const sumDev = (movsVenta || []).filter(m => DEV_CATS.includes(m.categoria)).reduce((s, m) => s + (m.monto_neto || 0), 0);
+    const venta = await sbGet('ventas_ml', `id=eq.${venta_id}&select=por_cobrar,conciliado`);
     
     if (venta?.length) {
-      // Fórmula unificada: para normales monto_reembolso=0, para devueltas resta el reembolso
-      const esperado = (venta[0].por_cobrar || 0) - (venta[0].monto_reembolso || 0) + (venta[0].cargo_envio_devolucion || 0);
+      const esperado = (venta[0].por_cobrar || 0) + sumDev;
       const balance = Math.round((sumMovs - esperado) * 100) / 100;
       const estado = Math.abs(balance) < 0.02 ? 'conciliado' : 'parcial';
       await sbPatch('ventas_ml', `id=eq.${venta_id}`, {
@@ -2092,12 +2114,13 @@ app.post('/mp/desvincular', async (req, res) => {
 
     // Recalcular balance si se pasó venta_id
     if (venta_id) {
-      const movsVenta = await sbGet('movimientos_mp', `venta_ml_id=eq.${venta_id}&select=monto_neto`);
+      const DEV_CATS = ['devolucion', 'venta_cancelada', 'cargo_envio_devolucion'];
+      const movsVenta = await sbGet('movimientos_mp', `venta_ml_id=eq.${venta_id}&select=monto_neto,categoria`);
       const sumMovs = (movsVenta || []).reduce((s, m) => s + (m.monto_neto || 0), 0);
-      const venta = await sbGet('ventas_ml', `id=eq.${venta_id}&select=por_cobrar,devuelta,monto_reembolso,cargo_envio_devolucion`);
+      const sumDev = (movsVenta || []).filter(m => DEV_CATS.includes(m.categoria)).reduce((s, m) => s + (m.monto_neto || 0), 0);
+      const venta = await sbGet('ventas_ml', `id=eq.${venta_id}&select=por_cobrar`);
       if (venta?.length) {
-        // Fórmula unificada: para normales monto_reembolso=0, para devueltas resta el reembolso
-        const esperado = (venta[0].por_cobrar || 0) - (venta[0].monto_reembolso || 0) + (venta[0].cargo_envio_devolucion || 0);
+        const esperado = (venta[0].por_cobrar || 0) + sumDev;
         const balance = Math.round((sumMovs - esperado) * 100) / 100;
         const hasMov = (movsVenta || []).length > 0;
         const estado = !hasMov ? 'pendiente' : (Math.abs(balance) < 0.02 ? 'conciliado' : 'parcial');
