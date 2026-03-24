@@ -259,6 +259,44 @@ app.get('/debug/order/:orderId', async (req, res) => {
   }
 });
 
+// Debug: testear Claims search por resource_id
+app.get('/debug/claim/:orderId', async (req, res) => {
+  try {
+    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
+    const h = { 'Authorization': 'Bearer ' + ML.access };
+    const orderId = req.params.orderId;
+    
+    // Intentar varias búsquedas
+    const results = {};
+    
+    // 1. Search by resource_id
+    const r1 = await fetch(`https://api.mercadolibre.com/post-purchase/v1/claims/search?resource_id=${orderId}&limit=5`, { headers: h });
+    results.by_resource_id = await r1.json();
+    
+    // 2. Search by resource_id con status=closed
+    const r2 = await fetch(`https://api.mercadolibre.com/post-purchase/v1/claims/search?resource_id=${orderId}&status=closed&limit=5`, { headers: h });
+    results.by_resource_id_closed = await r2.json();
+    
+    // 3. Shipment info
+    const order = await mlGet(`/orders/${orderId}`);
+    if (order.shipping?.id) {
+      const ship = await mlGet(`/shipments/${order.shipping.id}`);
+      results.shipment = {
+        id: ship.id,
+        status: ship.status,
+        substatus: ship.substatus,
+        status_detail: ship.status_detail,
+        logistic_type: ship.logistic_type,
+        status_history: ship.status_history,
+      };
+    }
+    
+    res.json({ order_id: orderId, order_status: order.status, ...results });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── MERCADO LIBRE — OAuth ────────────────────────────────────────────
 app.get('/ml/auth', (_, res) => {
   const url = `https://auth.mercadolibre.com.ar/authorization?response_type=code&client_id=${ML_CLIENT_ID}&redirect_uri=${encodeURIComponent(ML_REDIRECT_URI)}`;
