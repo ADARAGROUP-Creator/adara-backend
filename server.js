@@ -795,67 +795,80 @@ app.get('/debug-order/:orderId', async (req, res) => {
 app.get('/ml/devoluciones', async (req, res) => {
   try {
     if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
-    
-    // 1. Buscar claims abiertos + cerrados
     const headers = { 'Authorization': 'Bearer ' + ML.access };
-    const [r1, r2] = await Promise.all([
-      fetch(`https://api.mercadolibre.com/post-purchase/v1/claims/search?status=opened&sort=date_created:desc&limit=50`, { headers }),
-      fetch(`https://api.mercadolibre.com/post-purchase/v1/claims/search?status=closed&sort=date_created:desc&limit=100`, { headers }),
-    ]);
+    
+    // ── PASO 1: Claims abiertos (devoluciones activas) ──
+    const r1 = await fetch(`https://api.mercadolibre.com/post-purchase/v1/claims/search?status=opened&sort=date_created:desc&limit=50`, { headers });
     const openedData = await r1.json();
-    const closedData = await r2.json();
     const openedClaims = openedData.data || [];
-    const closedClaims = closedData.data || [];
-    // Deduplicar por claim.id (un claim podría aparecer en ambas listas si cambió de estado)
+    console.log(`Claims abiertos: ${openedClaims.length}`);
+    
+    // ── PASO 2: Cancelled+entregado SIN claim_id (devoluciones no detectadas) ──
+    let huerfanas = [];
+    let hOffset = 0;
+    while (true) {
+      const page = await sbGet('ventas_ml', `ml_status=eq.cancelled&claim_id=is.null&estado_envio=in.(despachado,entregado)&aprobada=neq.true&select=ml_order_id&limit=200&offset=${hOffset}`);
+      if (!page?.length) break;
+      huerfanas.push(...page);
+      if (page.length < 200) break;
+      hOffset += 200;
+    }
+    console.log(`Canceladas sin claim (huérfanas): ${huerfanas.length}`);
+    
+    // Para cada huérfana, buscar claim por resource_id (order_id)
+    const huerfanaClaims = [];
+    for (let i = 0; i < huerfanas.length; i += 5) {
+      const batch = huerfanas.slice(i, i + 5);
+      await Promise.all(batch.map(async (h) => {
+        try {
+          const rS = await fetch(`https://api.mercadolibre.com/post-purchase/v1/claims/search?resource_id=${h.ml_order_id}&limit=1`, { headers });
+          const sData = await rS.json();
+          if (sData.data?.length) huerfanaClaims.push(sData.data[0]);
+        } catch (e) {
+          console.warn(`Claim search order ${h.ml_order_id}:`, e.message);
+        }
+      }));
+    }
+    console.log(`Claims encontrados para huérfanas: ${huerfanaClaims.length}`);
+    
+    // ── PASO 3: Unificar (deduplicar por claim.id) ──
     const seenIds = new Set();
-    const claims = [];
-    for (const c of [...openedClaims, ...closedClaims]) {
-      if (!seenIds.has(c.id)) { seenIds.add(c.id); claims.push(c); }
-    }
-    console.log(`Claims API: ${openedClaims.length} abiertos + ${closedClaims.length} cerrados = ${claims.length} únicos`);
-    
-    if (!claims.length) {
-      return res.json({ ok: true, total: 0, devoluciones: [] });
+    const allClaims = [];
+    for (const c of [...openedClaims, ...huerfanaClaims]) {
+      if (!seenIds.has(c.id)) { seenIds.add(c.id); allClaims.push(c); }
     }
     
-    // 2. Para cada claim, traer detalle de return (en paralelo, batches de 5)
+    if (!allClaims.length) {
+      return res.json({ ok: true, total: 0, updated: 0, openedClaims: openedClaims.length, huerfanas: huerfanas.length, huerfanasConClaim: 0, devoluciones: [] });
+    }
+    
+    // ── PASO 4: Detalle de cada claim + return ──
     const results = [];
-    for (let i = 0; i < claims.length; i += 5) {
-      const batch = claims.slice(i, i + 5);
+    for (let i = 0; i < allClaims.length; i += 5) {
+      const batch = allClaims.slice(i, i + 5);
       await Promise.all(batch.map(async (claim) => {
         try {
-          // Detalle del claim
-          const rClaim = await fetch(`https://api.mercadolibre.com/post-purchase/v1/claims/${claim.id}`, {
-            headers: { 'Authorization': 'Bearer ' + ML.access }
-          });
+          const rClaim = await fetch(`https://api.mercadolibre.com/post-purchase/v1/claims/${claim.id}`, { headers });
           const claimDetail = await rClaim.json();
           
-          // Detalle del return
           let returnDetail = null;
           if (claimDetail.related_entities?.includes('return')) {
-            const rRet = await fetch(`https://api.mercadolibre.com/post-purchase/v2/claims/${claim.id}/returns`, {
-              headers: { 'Authorization': 'Bearer ' + ML.access }
-            });
+            const rRet = await fetch(`https://api.mercadolibre.com/post-purchase/v2/claims/${claim.id}/returns`, { headers });
             returnDetail = await rRet.json();
           }
           
-          const orderId = String(claim.resource_id);
-          const returnStatus = returnDetail?.status || null;
-          const returnShipStatus = returnDetail?.shipments?.[0]?.status || null;
-          const moneyStatus = returnDetail?.status_money || null;
-          
           results.push({
             claim_id: claim.id,
-            order_id: orderId,
+            order_id: String(claim.resource_id),
             type: claim.type,
             stage: claimDetail.stage || claim.stage,
             reason_id: claim.reason_id,
             date_created: claim.date_created,
             fulfilled: claimDetail.fulfilled,
             quantity_type: claimDetail.quantity_type,
-            return_status: returnStatus,
-            return_ship_status: returnShipStatus,
-            money_status: moneyStatus,
+            return_status: returnDetail?.status || null,
+            return_ship_status: returnDetail?.shipments?.[0]?.status || null,
+            money_status: returnDetail?.status_money || null,
             seller_actions: (claimDetail.players || [])
               .find(p => p.type === 'seller')?.available_actions?.map(a => a.action) || [],
           });
@@ -865,10 +878,9 @@ app.get('/ml/devoluciones', async (req, res) => {
       }));
     }
     
-    // 3. Actualizar ventas_ml con datos de claims
+    // ── PASO 5: Actualizar ventas_ml ──
     let updated = 0;
     for (const dev of results) {
-      // Determinar claim_status basado en estado del claim y del retorno
       let claimStatus;
       if (dev.stage === 'closed' || dev.stage === 'resolved') {
         claimStatus = 'cerrado';
@@ -883,16 +895,10 @@ app.get('/ml/devoluciones', async (req, res) => {
       }
       
       try {
-        // Solo actualizar si la venta no tiene claim_id o es el mismo claim
-        // Evita pisar claims manuales o de otro origen
         const existing = await sbGet('ventas_ml', `ml_order_id=eq.${dev.order_id}&select=claim_id,claim_status&limit=1`);
         const venta = existing?.[0];
-        if (!venta) continue; // Venta no existe en DB (otro período no sincronizado)
-        
-        // Si ya tiene claim_id diferente, no pisar
+        if (!venta) continue;
         if (venta.claim_id && venta.claim_id !== String(dev.claim_id)) continue;
-        
-        // Si ya fue gestionado manualmente (reingresado/perdida), no pisar con 'cerrado'
         if (['reingresado', 'perdida'].includes(venta.claim_status)) continue;
         
         await sbPatch('ventas_ml', `ml_order_id=eq.${dev.order_id}`, {
@@ -907,17 +913,14 @@ app.get('/ml/devoluciones', async (req, res) => {
       }
     }
     
-    // 4. Enriquecer con datos de ventas_ml
+    // ── PASO 6: Enriquecer respuesta ──
     const orderIds = results.map(r => r.order_id);
     let ventasMap = {};
     if (orderIds.length) {
-      // Fetch in chunks of 20
       for (let i = 0; i < orderIds.length; i += 20) {
         const chunk = orderIds.slice(i, i + 20);
         const ventas = await sbGet('ventas_ml', `ml_order_id=in.(${chunk.join(',')})&select=ml_order_id,titulo,sku,importe_bruto,tipo_envio,fecha,linea_negocio_id`);
-        for (const v of (ventas || [])) {
-          ventasMap[v.ml_order_id] = v;
-        }
+        for (const v of (ventas || [])) ventasMap[v.ml_order_id] = v;
       }
     }
     
@@ -930,8 +933,8 @@ app.get('/ml/devoluciones', async (req, res) => {
       fecha_venta: ventasMap[r.order_id]?.fecha || null,
     }));
     
-    console.log(`✓ Devoluciones ML: ${results.length} claims, ${updated} ventas actualizadas`);
-    res.json({ ok: true, total: results.length, updated, devoluciones });
+    console.log(`✓ Devoluciones: ${openedClaims.length} abiertos + ${huerfanaClaims.length} huérfanas = ${results.length} total, ${updated} actualizadas`);
+    res.json({ ok: true, total: results.length, updated, openedClaims: openedClaims.length, huerfanas: huerfanas.length, huerfanasConClaim: huerfanaClaims.length, devoluciones });
     
   } catch (e) {
     console.error('Devoluciones ML:', e);
