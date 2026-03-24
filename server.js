@@ -568,6 +568,30 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
                   : ss === 'ready_to_ship' ? 'preparado'
                   : 'no_preparado';
 
+                // Para cancelled + despachado/entregado: capturar substatus como motivo
+                if (od.row.ml_status === 'cancelled' && ['despachado','entregado'].includes(od.row.estado_envio)) {
+                  const sub = ship.substatus || ship.status_detail?.substatus || '';
+                  const SUBSTATUS_MAP = {
+                    'returning_to_sender': 'Devuelto al vendedor',
+                    'returned_to_sender': 'Devuelto al vendedor',
+                    'receiver_absent': 'Destinatario ausente',
+                    'receiver_rejected': 'Destinatario rechazó',
+                    'damaged': 'Paquete dañado',
+                    'lost': 'Paquete extraviado',
+                    'stolen': 'Paquete robado',
+                    'not_delivered': 'No entregado',
+                    'cancelled': 'Cancelado en tránsito',
+                    'out_of_zone': 'Fuera de zona',
+                    'wrong_address': 'Dirección incorrecta',
+                    'buyer_absent': 'Comprador ausente',
+                  };
+                  const motivoShip = SUBSTATUS_MAP[sub] || sub || 'Entrega fallida';
+                  // Solo setear si no tiene ya un motivo mejor del cancel_detail
+                  if (!od.row.motivo_cancelacion || od.row.motivo_cancelacion === 'cancelled') {
+                    od.row.motivo_cancelacion = motivoShip;
+                  }
+                }
+
                 // Bonificación Flex: ML devuelve base_cost - list_cost como bonificación
                 // Es un ingreso (positivo) porque el vendedor pone logística propia
                 if (ship.logistic_type === 'self_service') {
