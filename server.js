@@ -1882,10 +1882,11 @@ async function autoConciliarMP(fechaDesde = null, fechaHasta = null) {
       const chunk = allTocadas.slice(i, i + 200).join(',');
       let pcOffset = 0;
       while (true) {
-        const ventasChunk = await sbGet('ventas_ml', `id=in.(${chunk})&select=id,por_cobrar&limit=1000&offset=${pcOffset}&order=id`);
+        const ventasChunk = await sbGet('ventas_ml', `id=in.(${chunk})&select=id,por_cobrar,devuelta,monto_reembolso,cargo_envio_devolucion&limit=1000&offset=${pcOffset}&order=id`);
         if (!ventasChunk?.length) break;
         for (const v of ventasChunk) {
-          ventaPorCobrar[v.id] = v.por_cobrar || 0;
+          // Fórmula unificada: para normales monto_reembolso=0, para devueltas resta el reembolso
+          ventaPorCobrar[v.id] = (v.por_cobrar || 0) - (v.monto_reembolso || 0) + (v.cargo_envio_devolucion || 0);
         }
         if (ventasChunk.length < 1000) break;
         pcOffset += 1000;
@@ -1995,11 +1996,12 @@ app.post('/mp/recalcular-balance', async (_, res) => {
 
       // Traer por_cobrar y estado actual
       const ventas = await sbGet('ventas_ml',
-        `id=in.(${chunkStr})&select=id,por_cobrar,estado_conciliacion&limit=1000`
+        `id=in.(${chunkStr})&select=id,por_cobrar,estado_conciliacion,devuelta,monto_reembolso,cargo_envio_devolucion&limit=1000`
       );
       for (const v of (ventas || [])) {
         const sumMovs = Math.round((sumByVenta[v.id] || 0) * 100) / 100;
-        const esperado = v.por_cobrar || 0;
+        // Fórmula unificada: para normales monto_reembolso=0, para devueltas resta el reembolso
+        const esperado = (v.por_cobrar || 0) - (v.monto_reembolso || 0) + (v.cargo_envio_devolucion || 0);
         const balance = Math.round((sumMovs - esperado) * 100) / 100;
         const nuevoEstado = Math.abs(balance) < 0.02 ? 'conciliado' : 'parcial';
 
@@ -2059,12 +2061,13 @@ app.post('/mp/vincular', async (req, res) => {
     // Recalcular balance de la venta
     const movsVenta = await sbGet('movimientos_mp', `venta_ml_id=eq.${venta_id}&select=monto_neto`);
     const sumMovs = (movsVenta || []).reduce((s, m) => s + (m.monto_neto || 0), 0);
-    const venta = await sbGet('ventas_ml', `id=eq.${venta_id}&select=por_cobrar,conciliado`);
+    const venta = await sbGet('ventas_ml', `id=eq.${venta_id}&select=por_cobrar,conciliado,devuelta,monto_reembolso,cargo_envio_devolucion`);
     
     if (venta?.length) {
-      const esperado = venta[0].por_cobrar || 0;
+      // Fórmula unificada: para normales monto_reembolso=0, para devueltas resta el reembolso
+      const esperado = (venta[0].por_cobrar || 0) - (venta[0].monto_reembolso || 0) + (venta[0].cargo_envio_devolucion || 0);
       const balance = Math.round((sumMovs - esperado) * 100) / 100;
-      const estado = balance === 0 ? 'conciliado' : 'parcial';
+      const estado = Math.abs(balance) < 0.02 ? 'conciliado' : 'parcial';
       await sbPatch('ventas_ml', `id=eq.${venta_id}`, {
         balance_conciliacion: balance,
         estado_conciliacion: estado,
@@ -2091,12 +2094,13 @@ app.post('/mp/desvincular', async (req, res) => {
     if (venta_id) {
       const movsVenta = await sbGet('movimientos_mp', `venta_ml_id=eq.${venta_id}&select=monto_neto`);
       const sumMovs = (movsVenta || []).reduce((s, m) => s + (m.monto_neto || 0), 0);
-      const venta = await sbGet('ventas_ml', `id=eq.${venta_id}&select=por_cobrar`);
+      const venta = await sbGet('ventas_ml', `id=eq.${venta_id}&select=por_cobrar,devuelta,monto_reembolso,cargo_envio_devolucion`);
       if (venta?.length) {
-        const esperado = venta[0].por_cobrar || 0;
+        // Fórmula unificada: para normales monto_reembolso=0, para devueltas resta el reembolso
+        const esperado = (venta[0].por_cobrar || 0) - (venta[0].monto_reembolso || 0) + (venta[0].cargo_envio_devolucion || 0);
         const balance = Math.round((sumMovs - esperado) * 100) / 100;
         const hasMov = (movsVenta || []).length > 0;
-        const estado = !hasMov ? 'pendiente' : (balance === 0 ? 'conciliado' : 'parcial');
+        const estado = !hasMov ? 'pendiente' : (Math.abs(balance) < 0.02 ? 'conciliado' : 'parcial');
         await sbPatch('ventas_ml', `id=eq.${venta_id}`, {
           balance_conciliacion: balance,
           estado_conciliacion: estado,
