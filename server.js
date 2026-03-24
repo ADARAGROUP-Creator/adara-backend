@@ -796,11 +796,23 @@ app.get('/ml/devoluciones', async (req, res) => {
   try {
     if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
     
-    // 1. Buscar claims abiertos (limit 50)
-    const searchUrl = `https://api.mercadolibre.com/post-purchase/v1/claims/search?status=opened&sort=date_created:desc&limit=50`;
-    const r1 = await fetch(searchUrl, { headers: { 'Authorization': 'Bearer ' + ML.access } });
-    const searchData = await r1.json();
-    const claims = searchData.data || [];
+    // 1. Buscar claims abiertos + cerrados
+    const headers = { 'Authorization': 'Bearer ' + ML.access };
+    const [r1, r2] = await Promise.all([
+      fetch(`https://api.mercadolibre.com/post-purchase/v1/claims/search?status=opened&sort=date_created:desc&limit=50`, { headers }),
+      fetch(`https://api.mercadolibre.com/post-purchase/v1/claims/search?status=closed&sort=date_created:desc&limit=100`, { headers }),
+    ]);
+    const openedData = await r1.json();
+    const closedData = await r2.json();
+    const openedClaims = openedData.data || [];
+    const closedClaims = closedData.data || [];
+    // Deduplicar por claim.id (un claim podría aparecer en ambas listas si cambió de estado)
+    const seenIds = new Set();
+    const claims = [];
+    for (const c of [...openedClaims, ...closedClaims]) {
+      if (!seenIds.has(c.id)) { seenIds.add(c.id); claims.push(c); }
+    }
+    console.log(`Claims API: ${openedClaims.length} abiertos + ${closedClaims.length} cerrados = ${claims.length} únicos`);
     
     if (!claims.length) {
       return res.json({ ok: true, total: 0, devoluciones: [] });
@@ -856,12 +868,33 @@ app.get('/ml/devoluciones', async (req, res) => {
     // 3. Actualizar ventas_ml con datos de claims
     let updated = 0;
     for (const dev of results) {
-      const claimStatus = dev.return_ship_status === 'delivered' ? 'producto_recibido'
-        : dev.return_ship_status === 'shipped' ? 'en_transito'
-        : dev.return_status === 'label_generated' ? 'etiqueta_generada'
-        : 'abierto';
+      // Determinar claim_status basado en estado del claim y del retorno
+      let claimStatus;
+      if (dev.stage === 'closed' || dev.stage === 'resolved') {
+        claimStatus = 'cerrado';
+      } else if (dev.return_ship_status === 'delivered') {
+        claimStatus = 'producto_recibido';
+      } else if (dev.return_ship_status === 'shipped') {
+        claimStatus = 'en_transito';
+      } else if (dev.return_status === 'label_generated') {
+        claimStatus = 'etiqueta_generada';
+      } else {
+        claimStatus = 'abierto';
+      }
       
       try {
+        // Solo actualizar si la venta no tiene claim_id o es el mismo claim
+        // Evita pisar claims manuales o de otro origen
+        const existing = await sbGet('ventas_ml', `ml_order_id=eq.${dev.order_id}&select=claim_id,claim_status&limit=1`);
+        const venta = existing?.[0];
+        if (!venta) continue; // Venta no existe en DB (otro período no sincronizado)
+        
+        // Si ya tiene claim_id diferente, no pisar
+        if (venta.claim_id && venta.claim_id !== String(dev.claim_id)) continue;
+        
+        // Si ya fue gestionado manualmente (reingresado/perdida), no pisar con 'cerrado'
+        if (['reingresado', 'perdida'].includes(venta.claim_status)) continue;
+        
         await sbPatch('ventas_ml', `ml_order_id=eq.${dev.order_id}`, {
           claim_id: String(dev.claim_id),
           claim_status: claimStatus,
