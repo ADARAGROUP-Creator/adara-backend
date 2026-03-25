@@ -816,6 +816,17 @@ app.post('/ml/sync', async (req, res) => {
       desde || null,
       hasta || null
     );
+
+    // Auto-descartar cancelaciones sin entrega (no_preparado/preparado)
+    // Nunca salieron del depósito → no generan movimientos financieros → no son conciliables
+    const descartadas = await sbPatch('ventas_ml',
+      `ml_status=eq.cancelled&estado_envio=in.(no_preparado,preparado)&estado_conciliacion=neq.descartada`,
+      { estado_conciliacion: 'descartada', conciliado: false, balance_conciliacion: 0 }
+    ).catch(() => null);
+    if (descartadas) {
+      console.log(`  → Auto-descartadas: cancelaciones sin entrega`);
+    }
+
     res.json({ ok: true, ...result });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
