@@ -1918,7 +1918,7 @@ async function autoConciliarMP(fechaDesde = null, fechaHasta = null) {
     
     for (const ventaId of allTocadas) {
       const sumMovs = ventaMontosMap[ventaId] || 0;
-      const sumDev = ventaDevMap[ventaId] || 0; // negativo para devoluciones
+      const sumDev = Math.min(0, ventaDevMap[ventaId] || 0); // negativo para devoluciones, cap a 0 si positivo (reclamo ganado)
       const esperado = (ventaPorCobrar[ventaId] || 0) + sumDev;
       const balance = Math.round((sumMovs - esperado) * 100) / 100;
       
@@ -2032,7 +2032,7 @@ app.post('/mp/recalcular-balance', async (_, res) => {
         if (v.estado_conciliacion === 'descartada') { nDescartadas++; continue; }
 
         const sumMovs = Math.round((sumByVenta[v.id] || 0) * 100) / 100;
-        const sumDev = devByVenta[v.id] || 0; // negativo para devoluciones
+        const sumDev = Math.min(0, devByVenta[v.id] || 0); // negativo para devoluciones, cap a 0 si positivo (reclamo ganado)
         const esperado = (v.por_cobrar || 0) + sumDev;
         const balance = Math.round((sumMovs - esperado) * 100) / 100;
         const nuevoEstado = Math.abs(balance) < 0.02 ? 'conciliado' : 'parcial';
@@ -2094,7 +2094,7 @@ app.post('/mp/vincular', async (req, res) => {
     const DEV_CATS = ['devolucion', 'venta_cancelada', 'cargo_envio_devolucion'];
     const movsVenta = await sbGet('movimientos_mp', `venta_ml_id=eq.${venta_id}&select=monto_neto,categoria`);
     const sumMovs = (movsVenta || []).reduce((s, m) => s + (m.monto_neto || 0), 0);
-    const sumDev = (movsVenta || []).filter(m => DEV_CATS.includes(m.categoria)).reduce((s, m) => s + (m.monto_neto || 0), 0);
+    const sumDev = Math.min(0, (movsVenta || []).filter(m => DEV_CATS.includes(m.categoria)).reduce((s, m) => s + (m.monto_neto || 0), 0));
     const venta = await sbGet('ventas_ml', `id=eq.${venta_id}&select=por_cobrar,conciliado`);
     
     if (venta?.length) {
@@ -2128,7 +2128,7 @@ app.post('/mp/desvincular', async (req, res) => {
       const DEV_CATS = ['devolucion', 'venta_cancelada', 'cargo_envio_devolucion'];
       const movsVenta = await sbGet('movimientos_mp', `venta_ml_id=eq.${venta_id}&select=monto_neto,categoria`);
       const sumMovs = (movsVenta || []).reduce((s, m) => s + (m.monto_neto || 0), 0);
-      const sumDev = (movsVenta || []).filter(m => DEV_CATS.includes(m.categoria)).reduce((s, m) => s + (m.monto_neto || 0), 0);
+      const sumDev = Math.min(0, (movsVenta || []).filter(m => DEV_CATS.includes(m.categoria)).reduce((s, m) => s + (m.monto_neto || 0), 0));
       const venta = await sbGet('ventas_ml', `id=eq.${venta_id}&select=por_cobrar`);
       if (venta?.length) {
         const esperado = (venta[0].por_cobrar || 0) + sumDev;
