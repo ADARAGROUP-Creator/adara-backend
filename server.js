@@ -1908,14 +1908,16 @@ async function autoConciliarMP(fechaDesde = null, fechaHasta = null) {
     
     // 2. Traer por_cobrar de las ventas tocadas (fresh from DB, paginado)
     const ventaPorCobrar = {};
+    const ventaStatus = {};
     for (let i = 0; i < allTocadas.length; i += 200) {
       const chunk = allTocadas.slice(i, i + 200).join(',');
       let pcOffset = 0;
       while (true) {
-        const ventasChunk = await sbGet('ventas_ml', `id=in.(${chunk})&select=id,por_cobrar&limit=1000&offset=${pcOffset}&order=id`);
+        const ventasChunk = await sbGet('ventas_ml', `id=in.(${chunk})&select=id,por_cobrar,ml_status&limit=1000&offset=${pcOffset}&order=id`);
         if (!ventasChunk?.length) break;
         for (const v of ventasChunk) {
           ventaPorCobrar[v.id] = v.por_cobrar || 0;
+          ventaStatus[v.id] = v.ml_status;
         }
         if (ventasChunk.length < 1000) break;
         pcOffset += 1000;
@@ -1923,16 +1925,15 @@ async function autoConciliarMP(fechaDesde = null, fechaHasta = null) {
     }
     
     // 3. Calcular balance y agrupar
-    // esperado = por_cobrar + sumDev (sumDev es negativo para devoluciones → reduce esperado)
-    // Para normales: sumDev=0 → esperado = por_cobrar
-    // Para devol total: sumDev ≈ -por_cobrar → esperado ≈ 0
+    // Para cancelled: esperado = 0 (ciclo financiero neta a 0, residual queda como balance)
+    // Para normales: esperado = por_cobrar + sumDev
     const conciliadoIds = [];
     const parcialUpdates = []; // {id, balance}
     
     for (const ventaId of allTocadas) {
       const sumMovs = ventaMontosMap[ventaId] || 0;
-      const sumDev = Math.min(0, ventaDevMap[ventaId] || 0); // negativo para devoluciones, cap a 0 si positivo (reclamo ganado)
-      const esperado = (ventaPorCobrar[ventaId] || 0) + sumDev;
+      const sumDev = Math.min(0, ventaDevMap[ventaId] || 0);
+      const esperado = ventaStatus[ventaId] === 'cancelled' ? 0 : (ventaPorCobrar[ventaId] || 0) + sumDev;
       const balance = Math.round((sumMovs - esperado) * 100) / 100;
       
       if (Math.abs(balance) < 0.02) {
@@ -2038,15 +2039,15 @@ app.post('/mp/recalcular-balance', async (_, res) => {
 
       // Traer por_cobrar y estado actual
       const ventas = await sbGet('ventas_ml',
-        `id=in.(${chunkStr})&select=id,por_cobrar,estado_conciliacion&limit=1000`
+        `id=in.(${chunkStr})&select=id,por_cobrar,estado_conciliacion,ml_status&limit=1000`
       );
       for (const v of (ventas || [])) {
         // NUNCA tocar descartadas — son cancelaciones sin entrega ya procesadas
         if (v.estado_conciliacion === 'descartada') { nDescartadas++; continue; }
 
         const sumMovs = Math.round((sumByVenta[v.id] || 0) * 100) / 100;
-        const sumDev = Math.min(0, devByVenta[v.id] || 0); // negativo para devoluciones, cap a 0 si positivo (reclamo ganado)
-        const esperado = (v.por_cobrar || 0) + sumDev;
+        const sumDev = Math.min(0, devByVenta[v.id] || 0);
+        const esperado = v.ml_status === 'cancelled' ? 0 : (v.por_cobrar || 0) + sumDev;
         const balance = Math.round((sumMovs - esperado) * 100) / 100;
         const nuevoEstado = Math.abs(balance) < 0.02 ? 'conciliado' : 'parcial';
 
@@ -2108,10 +2109,10 @@ app.post('/mp/vincular', async (req, res) => {
     const movsVenta = await sbGet('movimientos_mp', `venta_ml_id=eq.${venta_id}&select=monto_neto,categoria`);
     const sumMovs = (movsVenta || []).reduce((s, m) => s + (m.monto_neto || 0), 0);
     const sumDev = Math.min(0, (movsVenta || []).filter(m => DEV_CATS.includes(m.categoria)).reduce((s, m) => s + (m.monto_neto || 0), 0));
-    const venta = await sbGet('ventas_ml', `id=eq.${venta_id}&select=por_cobrar,conciliado`);
+    const venta = await sbGet('ventas_ml', `id=eq.${venta_id}&select=por_cobrar,conciliado,ml_status`);
     
     if (venta?.length) {
-      const esperado = (venta[0].por_cobrar || 0) + sumDev;
+      const esperado = venta[0].ml_status === 'cancelled' ? 0 : (venta[0].por_cobrar || 0) + sumDev;
       const balance = Math.round((sumMovs - esperado) * 100) / 100;
       const estado = Math.abs(balance) < 0.02 ? 'conciliado' : 'parcial';
       await sbPatch('ventas_ml', `id=eq.${venta_id}`, {
@@ -2142,9 +2143,9 @@ app.post('/mp/desvincular', async (req, res) => {
       const movsVenta = await sbGet('movimientos_mp', `venta_ml_id=eq.${venta_id}&select=monto_neto,categoria`);
       const sumMovs = (movsVenta || []).reduce((s, m) => s + (m.monto_neto || 0), 0);
       const sumDev = Math.min(0, (movsVenta || []).filter(m => DEV_CATS.includes(m.categoria)).reduce((s, m) => s + (m.monto_neto || 0), 0));
-      const venta = await sbGet('ventas_ml', `id=eq.${venta_id}&select=por_cobrar`);
+      const venta = await sbGet('ventas_ml', `id=eq.${venta_id}&select=por_cobrar,ml_status`);
       if (venta?.length) {
-        const esperado = (venta[0].por_cobrar || 0) + sumDev;
+        const esperado = venta[0].ml_status === 'cancelled' ? 0 : (venta[0].por_cobrar || 0) + sumDev;
         const balance = Math.round((sumMovs - esperado) * 100) / 100;
         const hasMov = (movsVenta || []).length > 0;
         const estado = !hasMov ? 'pendiente' : (Math.abs(balance) < 0.02 ? 'conciliado' : 'parcial');
