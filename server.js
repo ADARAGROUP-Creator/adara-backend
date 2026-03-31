@@ -1076,6 +1076,19 @@ app.post('/ml/recepcion', async (req, res) => {
 });
 
 // ── DEBUG: Return reasons ──────────────────────────────────────────────
+// ── ML RAW API PROXY (debug/exploración) ─────────────────────────────
+app.get('/ml/raw', async (req, res) => {
+  try {
+    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
+    const path = req.query.path;
+    if (!path) return res.status(400).json({ error: 'Falta ?path=/v1/...' });
+    const url = path.startsWith('http') ? path : `https://api.mercadolibre.com${path}`;
+    const r = await fetch(url, { headers: { 'Authorization': 'Bearer ' + ML.access } });
+    const data = await r.json();
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/debug-return-reasons', async (req, res) => {
   try {
     if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
