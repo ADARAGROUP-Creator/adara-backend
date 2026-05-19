@@ -2385,3 +2385,78 @@ app.listen(PORT, async () => {
   await loadMLToken();
   await loadFeriados(new Date().getFullYear());
 });
+
+// ════════════════════════════════════════════════════════════════
+// ENDPOINT DE PRUEBA TANGO FACTURA (borrar después de validar)
+// ════════════════════════════════════════════════════════════════
+app.get('/test/tango', async (req, res) => {
+  const {
+    TANGO_USERNAME,
+    TANGO_PASSWORD,
+    TANGO_APP_PUBLIC_KEY,
+    TANGO_USER_IDENTIFIER,
+  } = process.env;
+
+  const faltantes = [];
+  if (!TANGO_USERNAME) faltantes.push('TANGO_USERNAME');
+  if (!TANGO_PASSWORD) faltantes.push('TANGO_PASSWORD');
+  if (!TANGO_APP_PUBLIC_KEY) faltantes.push('TANGO_APP_PUBLIC_KEY');
+  if (!TANGO_USER_IDENTIFIER) faltantes.push('TANGO_USER_IDENTIFIER');
+  if (faltantes.length) {
+    return res.status(500).json({ error: 'Faltan variables', faltantes });
+  }
+
+  const BASE = 'https://www.tangofactura.com';
+  const out = { paso1_auth: null, paso2_listar: null };
+
+  try {
+    // PASO 1: auth
+    const r1 = await fetch(`${BASE}/Provisioning/GetAuthToken`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        UserName: TANGO_USERNAME,
+        Password: TANGO_PASSWORD,
+        UserSecret: TANGO_USER_IDENTIFIER,
+      }),
+    });
+    const auth = await r1.json();
+    const token = typeof auth.Data === 'string' ? auth.Data : null;
+    out.paso1_auth = {
+      http: r1.status,
+      token_obtenido: !!token,
+      codigo_error: auth.CodigoError,
+      error: auth.Error,
+    };
+    if (!token) return res.json(out);
+
+    // PASO 2: listar movimientos abril 2026
+    const r2 = await fetch(`${BASE}/Services/Facturacion/ListarMovimientos`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        Desde: '2026-04-01T00:00:00',
+        Hasta: '2026-04-30T23:59:59',
+        Tope: 5,
+        UserIdentifier: TANGO_USER_IDENTIFIER,
+        ApplicationPublicKey: TANGO_APP_PUBLIC_KEY,
+        Token: token,
+      }),
+    });
+    const movs = await r2.json();
+    out.paso2_listar = {
+      http: r2.status,
+      codigo_error: movs.CodigoError,
+      error: movs.Error,
+      data: movs.Data,
+      cantidad: Array.isArray(movs.Data) ? movs.Data.length : null,
+      campos_primer_movimiento: Array.isArray(movs.Data) && movs.Data[0]
+        ? Object.keys(movs.Data[0])
+        : null,
+    };
+
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: err.message, partial: out });
+  }
+});
