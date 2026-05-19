@@ -2387,7 +2387,8 @@ app.listen(PORT, async () => {
 });
 
 // ════════════════════════════════════════════════════════════════
-// ENDPOINT DE PRUEBA TANGO FACTURA (borrar después de validar)
+// ENDPOINT DE PRUEBA TANGO FACTURA — versión con debug
+// (borrar después de validar)
 // ════════════════════════════════════════════════════════════════
 app.get('/test/tango', async (req, res) => {
   const {
@@ -2397,66 +2398,70 @@ app.get('/test/tango', async (req, res) => {
     TANGO_USER_IDENTIFIER,
   } = process.env;
 
-  const faltantes = [];
-  if (!TANGO_USERNAME) faltantes.push('TANGO_USERNAME');
-  if (!TANGO_PASSWORD) faltantes.push('TANGO_PASSWORD');
-  if (!TANGO_APP_PUBLIC_KEY) faltantes.push('TANGO_APP_PUBLIC_KEY');
-  if (!TANGO_USER_IDENTIFIER) faltantes.push('TANGO_USER_IDENTIFIER');
-  if (faltantes.length) {
-    return res.status(500).json({ error: 'Faltan variables', faltantes });
-  }
+  // Diagnóstico: longitudes de las variables (detecta espacios extra, vacíos, etc.)
+  const checkVar = (v) => {
+    if (!v) return 'FALTA';
+    return {
+      length: v.length,
+      starts: v.substring(0, 3),
+      ends: v.substring(v.length - 3),
+      hasSpaces: /^\s|\s$/.test(v),
+      hasNewlines: /\n|\r/.test(v),
+    };
+  };
+
+  const vars = {
+    TANGO_USERNAME: checkVar(TANGO_USERNAME),
+    TANGO_PASSWORD: checkVar(TANGO_PASSWORD),
+    TANGO_APP_PUBLIC_KEY: checkVar(TANGO_APP_PUBLIC_KEY),
+    TANGO_USER_IDENTIFIER: checkVar(TANGO_USER_IDENTIFIER),
+  };
 
   const BASE = 'https://www.tangofactura.com';
-  const out = { paso1_auth: null, paso2_listar: null };
+  const body = {
+    UserName: TANGO_USERNAME,
+    Password: TANGO_PASSWORD,
+    UserSecret: TANGO_USER_IDENTIFIER,
+  };
 
   try {
-    // PASO 1: auth
     const r1 = await fetch(`${BASE}/Provisioning/GetAuthToken`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        UserName: TANGO_USERNAME,
-        Password: TANGO_PASSWORD,
-        UserSecret: TANGO_USER_IDENTIFIER,
-      }),
+      body: JSON.stringify(body),
     });
-    const auth = await r1.json();
-    const token = typeof auth.Data === 'string' ? auth.Data : null;
-    out.paso1_auth = {
-      http: r1.status,
-      token_obtenido: !!token,
-      codigo_error: auth.CodigoError,
-      error: auth.Error,
-    };
-    if (!token) return res.json(out);
 
-    // PASO 2: listar movimientos abril 2026
-    const r2 = await fetch(`${BASE}/Services/Facturacion/ListarMovimientos`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        Desde: '2026-04-01T00:00:00',
-        Hasta: '2026-04-30T23:59:59',
-        Tope: 5,
-        UserIdentifier: TANGO_USER_IDENTIFIER,
-        ApplicationPublicKey: TANGO_APP_PUBLIC_KEY,
-        Token: token,
-      }),
+    const rawText = await r1.text();
+    let parsed = null;
+    let parseError = null;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch (e) {
+      parseError = e.message;
+    }
+
+    const headers = {};
+    r1.headers.forEach((v, k) => (headers[k] = v));
+
+    res.json({
+      vars,
+      bodyEnviado: {
+        ...body,
+        Password: body.Password ? `${body.Password.length} chars` : 'vacio',
+        UserSecret: body.UserSecret ? `${body.UserSecret.length} chars` : 'vacio',
+      },
+      authResponse: {
+        status: r1.status,
+        statusText: r1.statusText,
+        headers,
+        rawText: rawText.length > 2000 ? rawText.substring(0, 2000) + '...[truncado]' : rawText,
+        rawLength: rawText.length,
+        parsed,
+        parseError,
+        parsedKeys: parsed && typeof parsed === 'object' ? Object.keys(parsed) : null,
+      },
     });
-    const movs = await r2.json();
-    out.paso2_listar = {
-      http: r2.status,
-      codigo_error: movs.CodigoError,
-      error: movs.Error,
-      data: movs.Data,
-      cantidad: Array.isArray(movs.Data) ? movs.Data.length : null,
-      campos_primer_movimiento: Array.isArray(movs.Data) && movs.Data[0]
-        ? Object.keys(movs.Data[0])
-        : null,
-    };
-
-    res.json(out);
   } catch (err) {
-    res.status(500).json({ error: err.message, partial: out });
+    res.status(500).json({ vars, error: err.message, stack: err.stack });
   }
 });
