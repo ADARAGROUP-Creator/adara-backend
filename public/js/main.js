@@ -1,10 +1,12 @@
 import { initSB } from './core/sb.js';
 import { loadHome } from './screens/home.js';
 import { loadSkus } from './screens/skus.js';
+import { loadMovimientos } from './screens/movimientos.js';
 
 const screens = {
   home: { fn: loadHome, title: 'Home', sub: 'Resumen del estado actual' },
-  skus: { fn: loadSkus, title: 'SKUs', sub: 'Catálogo de productos' }
+  skus: { fn: loadSkus, title: 'SKUs', sub: 'Catálogo de productos' },
+  movimientos: { fn: loadMovimientos, title: 'Movimientos', sub: 'Extracto unificado de cuentas' }
 };
 
 async function route() {
