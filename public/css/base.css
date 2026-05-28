@@ -152,8 +152,9 @@ table.t tbody tr.inactive .col-desc{text-decoration:line-through}
   font-size:14px;font-weight:500;box-shadow:0 4px 12px rgba(0,0,0,0.15);
   animation:slideIn 0.2s ease-out;
 }
-.toast.error{background:var(--red)}
-.toast.ok{background:var(--green)}
+/* Rojo oscuro fijo para que el texto blanco siempre se lea (el --red de la paleta es muy claro). */
+.toast.error{background:var(--red-strong,#B42318);color:#FFF}
+.toast.ok{background:var(--green);color:#FFF}
 @keyframes slideIn{from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1}}
 
 /* Estados */
