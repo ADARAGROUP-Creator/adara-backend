@@ -20,11 +20,13 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 app.use(cors());
 app.use(express.json({ limit: '20mb' }));
+app.use(express.static('public'));   // sirve el frontend desde /public
 
 // ─── Variables de entorno (se cargan desde Railway) ─────────────────
 const {
   SUPABASE_URL,
   SUPABASE_KEY,
+  SUPABASE_ANON_KEY,
   ML_CLIENT_ID,
   ML_CLIENT_SECRET,
   ML_REDIRECT_URI,
@@ -137,7 +139,12 @@ async function tfPost(endpoint, body) {
 // ════════════════════════════════════════════════════════════════════
 
 // ── Salud del servidor ───────────────────────────────────────────────
-app.get('/', (_, res) => res.json({ ok: true, servicio: 'ADARA Backend', ts: new Date().toISOString() }));
+// Config para el frontend: le pasa al index.html las credenciales públicas
+// de Supabase (anon key) leyéndolas de las env vars de Railway.
+app.get('/config', (_, res) => res.json({
+  supabase_url: SUPABASE_URL,
+  supabase_anon_key: SUPABASE_ANON_KEY || SUPABASE_KEY
+}));
 
 app.get('/health', async (_, res) => {
   const c = { supabase: false, ml_token: false, tango: false };
@@ -2384,90 +2391,4 @@ app.listen(PORT, async () => {
   console.log(`   Tango    : ${TF_APP_KEY    ? '✓' : '✗ FALTA variable TF_APP_KEY (opcional)'}`);
   await loadMLToken();
   await loadFeriados(new Date().getFullYear());
-});
-
-// ════════════════════════════════════════════════════════════════
-// ENDPOINT DE PRUEBA TANGO — incluye paso 3: detalle con aplicaciones
-// (borrar después de validar)
-// ════════════════════════════════════════════════════════════════
-app.get('/test/tango', async (req, res) => {
-  const {
-    TANGO_USERNAME,
-    TANGO_PASSWORD,
-    TANGO_APP_PUBLIC_KEY,
-    TANGO_USER_IDENTIFIER,
-  } = process.env;
-
-  const BASE = 'https://www.tangofactura.com';
-  const out = { paso1_auth: null, paso2_listar: null, paso3_detalle: null };
-
-  try {
-    // PASO 1: auth
-    const r1 = await fetch(`${BASE}/Provisioning/GetAuthToken`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        UserName: TANGO_USERNAME,
-        Password: TANGO_PASSWORD,
-        UserSecret: TANGO_USER_IDENTIFIER,
-      }),
-    });
-    const auth = await r1.json();
-    let token = null;
-    if (typeof auth === 'string' && auth.length > 50) {
-      token = decodeURIComponent(auth);
-    } else if (auth && typeof auth.Data === 'string') {
-      token = decodeURIComponent(auth.Data);
-    }
-    out.paso1_auth = { http: r1.status, token_obtenido: !!token };
-    if (!token) return res.json(out);
-
-    // PASO 2: listar 5 movimientos de abril
-    const r2 = await fetch(`${BASE}/Services/Facturacion/ListarMovimientos`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        Desde: '2026-04-01T00:00:00',
-        Hasta: '2026-04-30T23:59:59',
-        Tope: 5,
-        UserIdentifier: TANGO_USER_IDENTIFIER,
-        ApplicationPublicKey: TANGO_APP_PUBLIC_KEY,
-        Token: token,
-      }),
-    });
-    const movs = await r2.json();
-    out.paso2_listar = {
-      http: r2.status,
-      cantidad: Array.isArray(movs.Data) ? movs.Data.length : null,
-    };
-    const primerId = movs.Data && movs.Data[0] && movs.Data[0].MovimientoId;
-    if (!primerId) return res.json(out);
-
-    // PASO 3: detalle del primer movimiento, CON aplicaciones vinculadas
-    const r3 = await fetch(`${BASE}/Services/Facturacion/ObtenerInfoMovimiento`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        MovimientoId: primerId,
-        ObtenerInfoAplicaciones: true,
-        UserIdentifier: TANGO_USER_IDENTIFIER,
-        ApplicationPublicKey: TANGO_APP_PUBLIC_KEY,
-        Token: token,
-      }),
-    });
-    const detalle = await r3.json();
-    out.paso3_detalle = {
-      http: r3.status,
-      codigo_error: detalle.CodigoError,
-      error: detalle.Error,
-      data_completa: detalle.Data,
-      campos_top_level: detalle.Data && typeof detalle.Data === 'object'
-        ? Object.keys(detalle.Data)
-        : null,
-    };
-
-    res.json(out);
-  } catch (err) {
-    res.status(500).json({ error: err.message, partial: out });
-  }
 });
