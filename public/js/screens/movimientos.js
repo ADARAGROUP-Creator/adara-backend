@@ -8,9 +8,13 @@ import { sbGet, sbPost } from '../core/sb.js';
 // - `monto` es signed: + entrada, − salida. Una sola columna, sin `tipo`.
 // - En cuentas USD (caja_usd) el monto se guarda en USD nativo; la valuación
 //   a pesos es dinámica (TI5). Acá NO se convierte.
-// - Carga manual: NO se deduplica por contenido (dos movimientos iguales pueden
-//   ser reales). origen='manual', referencia_externa queda NULL. El seguro contra
-//   el doble-cargado por error es un AVISO al guardar, no un bloqueo.
+// - `referencia_externa` es NOT NULL + UNIQUE(origen, referencia_externa).
+//   En carga manual NO se deduplica por contenido (dos movimientos iguales pueden
+//   ser reales): cada fila lleva una referencia ÚNICA propia (surrogate). El seguro
+//   contra el doble-cargado por error es un AVISO al guardar (mira cuenta+fecha+monto),
+//   no un bloqueo por constraint.
+// - La línea de negocio NO vive en el movimiento (opción A / CB6): se hereda de la
+//   operación vinculada al conciliar. Por eso no hay campo de línea acá.
 // - `estado` en v1 se deriva de conciliado_auto (auto | pendiente). Cuando exista
 //   Conciliación, cambiar la lectura a la vista v_movimientos_estado para traer
 //   parcial/conciliado en vivo.
@@ -44,6 +48,15 @@ const CATEGORIAS = [
 ];
 
 const hoyISO = () => new Date().toISOString().slice(0, 10);
+
+// Referencia única para cargas manuales (cumple NOT NULL + UNIQUE sin deduplicar
+// por contenido: dos movimientos iguales son válidos, cada uno con su referencia).
+function nuevaRef() {
+  const rnd = (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : Date.now() + '-' + Math.random().toString(36).slice(2);
+  return 'manual-' + rnd;
+}
 
 function cuentaLabel(id) {
   const c = CUENTA_BY_ID[id];
@@ -304,6 +317,7 @@ function openModalNuevo() {
       const [nuevo] = await sbPost('movimientos', {
         cuenta_id, fecha, monto, categoria, descripcion,
         origen: 'manual',
+        referencia_externa: nuevaRef(),  // NOT NULL + UNIQUE: referencia única por carga manual
         conciliado_auto: false,
       });
       DATA.unshift(nuevo);
