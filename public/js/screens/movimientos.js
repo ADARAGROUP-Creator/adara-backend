@@ -34,7 +34,6 @@ const LABEL_CUENTA = {
 
 // Categorías operativas convencionales (ADARA-SCHEMA.md, capa 4)
 const CATEGORIAS = [
-  ['', 'Sin clasificar'],
   ['cobro_venta', 'Cobro de venta'],
   ['pago_proveedor', 'Pago a proveedor'],
   ['gasto', 'Gasto'],
@@ -181,7 +180,7 @@ function filaHTML(m) {
   const neg = Number(m.monto) < 0;
   const est = estadoDe(m);
   const catLabel = (CATEGORIAS.find(c => c[0] === (m.categoria || ''))?.[1]) || m.categoria;
-  const catSinClasif = !m.categoria;
+  const catSinClasif = !m.categoria || m.categoria === 'sin_clasificar';
   return `<tr>
     <td>${(m.fecha || '').slice(8, 10)}/${(m.fecha || '').slice(5, 7)}</td>
     <td>${cuentaLabel(m.cuenta_id)}</td>
@@ -197,8 +196,8 @@ function openModalNuevo() {
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
 
-  const opcionesCuenta = CUENTAS.map(c => `<option value="${c.id}">${cuentaLabel(c.id)}</option>`).join('');
-  const opcionesCat = CATEGORIAS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
+  const opcionesCuenta = '<option value="">Elegí cuenta…</option>' + CUENTAS.map(c => `<option value="${c.id}">${cuentaLabel(c.id)}</option>`).join('');
+  const opcionesCat = '<option value="">Elegí categoría…</option>' + CATEGORIAS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
 
   overlay.innerHTML = `
     <div class="modal">
@@ -223,7 +222,7 @@ function openModalNuevo() {
         <input class="input" id="m-monto" type="number" min="0" step="0.01" placeholder="0,00">
       </div>
 
-      <div class="field"><label>Categoría <span class="mov-muted">(opcional)</span></label>
+      <div class="field"><label>Categoría</label>
         <select class="select" id="m-cat">${opcionesCat}</select>
       </div>
 
@@ -292,12 +291,14 @@ function openModalNuevo() {
     const cuenta_id = +cuentaSel.value;
     const fecha = fechaSel.value;
     const montoAbs = parseFloat(overlay.querySelector('#m-monto').value);
-    const categoria = overlay.querySelector('#m-cat').value || null;
-    const descripcion = overlay.querySelector('#m-desc').value.trim() || null;
+    const categoria = overlay.querySelector('#m-cat').value;
+    const descripcion = overlay.querySelector('#m-desc').value.trim();
 
     if (!cuenta_id) { window.toast('Elegí una cuenta', 'error'); return; }
     if (!fecha) { window.toast('Falta la fecha', 'error'); return; }
     if (!(montoAbs > 0)) { window.toast('El monto tiene que ser mayor a 0', 'error'); return; }
+    if (!categoria) { window.toast('Elegí una categoría', 'error'); return; }
+    if (!descripcion) { window.toast('Poné una descripción', 'error'); return; }
 
     const monto = +(signo * montoAbs).toFixed(2);
 
