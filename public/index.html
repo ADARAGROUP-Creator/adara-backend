@@ -19,7 +19,8 @@
   </div>
   <nav>
     <div class="nav-sec">Operación</div>
-    <a class="nav-item active" href="#home">Home</a>
+    <a class="nav-item" href="#home">Home</a>
+    <a class="nav-item" href="#skus">SKUs</a>
   </nav>
 </aside>
 
@@ -36,8 +37,9 @@
   </section>
 </main>
 
+<div id="toast-host"></div>
+
 <script>
-  // Fecha en topbar
   document.getElementById('topbar-date').textContent =
     new Date().toLocaleDateString('es-AR', { day:'numeric', month:'long', year:'numeric' });
 </script>
