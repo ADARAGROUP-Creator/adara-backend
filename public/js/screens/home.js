@@ -16,42 +16,51 @@ export async function loadHome() {
 
     const skusListos = skusTotal - skusSinFamilia;
     const pctListos = skusTotal > 0 ? Math.round((skusListos / skusTotal) * 100) : 0;
+    const skusEstado = skusSinFamilia === 0
+      ? { txt: `${pctListos}% clasificados`, cls: 'ok' }
+      : { txt: `${skusSinFamilia} sin clasificar`, cls: '' };
 
     root.innerHTML = `
       <div class="kpi-grid">
+
         <div class="kpi">
           <div class="kpi-label">SKUs cargados</div>
           <div class="kpi-value">${skusTotal}</div>
-          <div class="kpi-sub">${skusSinFamilia} sin clasificar · ${pctListos}% listos</div>
+          <div class="kpi-sub ${skusEstado.cls}">${skusEstado.txt}</div>
         </div>
-        <div class="kpi" style="--kpi-color:var(--green)">
+
+        <div class="kpi">
           <div class="kpi-label">Ventas</div>
           <div class="kpi-value">${ventasTotal}</div>
-          <div class="kpi-sub">registradas en DB</div>
+          <div class="kpi-sub">registradas en base</div>
         </div>
-        <div class="kpi" style="--kpi-color:var(--blue)">
+
+        <div class="kpi">
           <div class="kpi-label">Compras</div>
           <div class="kpi-value">${comprasTotal}</div>
-          <div class="kpi-sub">registradas en DB</div>
+          <div class="kpi-sub">registradas en base</div>
         </div>
-        <div class="kpi" style="--kpi-color:var(--red)">
+
+        <div class="kpi">
           <div class="kpi-label">Gastos</div>
           <div class="kpi-value">${gastosTotal}</div>
-          <div class="kpi-sub">registrados en DB</div>
+          <div class="kpi-sub">registrados en base</div>
         </div>
-        <div class="kpi" style="--kpi-color:var(--muted)">
+
+        <div class="kpi">
           <div class="kpi-label">Movimientos</div>
           <div class="kpi-value">${movsTotal}</div>
-          <div class="kpi-sub">extracto / MP / caja</div>
+          <div class="kpi-sub">extracto · MP · caja</div>
         </div>
+
       </div>
 
       <div class="card">
         <div class="card-title">Próximos pasos</div>
-        <div style="font-size:.7rem;color:var(--muted);line-height:1.8">
-          • Clasificar los ${skusSinFamilia} SKUs sin familia (próxima pantalla: Maestros — SKUs)<br>
-          • Cargar saldos iniciales al 31/12/2025 (próxima pantalla: Maestros — Saldos)<br>
-          • Recién después: conciliación, ventas, gastos
+        <div class="steps">
+          <div class="step"><span class="step-dot"></span>Cargar saldos iniciales al 31/12/2025</div>
+          <div class="step"><span class="step-dot dim"></span>Registrar primeras ventas y compras</div>
+          <div class="step"><span class="step-dot dim"></span>Conciliar movimientos del extracto bancario</div>
         </div>
       </div>
     `;

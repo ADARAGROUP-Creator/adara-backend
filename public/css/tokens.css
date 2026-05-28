@@ -1,19 +1,35 @@
 :root{
-  --bg:#09090b;
-  --surface:#111113;
-  --surface2:#18181b;
-  --border:#27272a;
-  --text:#fafafa;
-  --muted:#71717a;
-  --muted2:#52525b;
-  --acc:#f59e0b;
-  --acc2:#d97706;
-  --acc-bg:rgba(245,158,11,0.08);
-  --green:#22c55e;
-  --green-bg:rgba(34,197,94,0.08);
-  --red:#ef4444;
-  --red-bg:rgba(239,68,68,0.08);
-  --blue:#3b82f6;
-  --blue-bg:rgba(59,130,246,0.08);
-  --r:4px;
+  /* Fondos */
+  --bg: #FAFAF9;
+  --surface: #FFFFFF;
+  --surface-alt: #F5F5F4;
+
+  /* Bordes */
+  --border: #E7E5E4;
+  --border-strong: #D6D3D1;
+
+  /* Texto */
+  --text: #1C1917;
+  --text-muted: #78716C;
+  --text-soft: #A8A29E;
+
+  /* Acento (ámbar ADARA, suavizado) */
+  --acc: #D97706;
+  --acc-dark: #9A3412;
+  --acc-bg: #FEF3E2;
+
+  /* Semánticos */
+  --green: #15803D;
+  --green-bg: #DCFCE7;
+  --blue: #1D4ED8;
+  --blue-bg: #DBEAFE;
+  --red: #B91C1C;
+  --red-bg: #FEE2E2;
+
+  /* Radius */
+  --r: 10px;
+  --r-sm: 6px;
+
+  /* Sombras (muy sutiles) */
+  --shadow: 0 1px 2px rgba(0,0,0,0.04);
 }

@@ -4,7 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ADARA</title>
-<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@300;400;500;700&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/css/tokens.css">
 <link rel="stylesheet" href="/css/base.css">
 </head>
@@ -13,23 +15,32 @@
 <aside class="sidebar">
   <div class="brand">
     <div class="brand-name">ADARA</div>
-    <div class="brand-sub">v22 · build</div>
+    <div class="brand-sub">v22</div>
   </div>
   <nav>
     <div class="nav-sec">Operación</div>
-    <a class="nav-item active" href="#home">📊 Home</a>
+    <a class="nav-item active" href="#home">Home</a>
   </nav>
 </aside>
 
 <main class="main">
   <header class="topbar">
-    <div class="topbar-title" id="topbar-title">Home</div>
+    <div>
+      <div class="topbar-title" id="topbar-title">Home</div>
+      <div class="topbar-sub" id="topbar-sub">Resumen del estado actual</div>
+    </div>
+    <div class="topbar-date" id="topbar-date"></div>
   </header>
   <section id="app-screens" class="content">
     <div class="loading">Inicializando…</div>
   </section>
 </main>
 
+<script>
+  // Fecha en topbar
+  document.getElementById('topbar-date').textContent =
+    new Date().toLocaleDateString('es-AR', { day:'numeric', month:'long', year:'numeric' });
+</script>
 <script type="module" src="/js/main.js"></script>
 </body>
 </html>
