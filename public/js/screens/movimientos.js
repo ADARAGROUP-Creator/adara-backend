@@ -140,9 +140,8 @@ function render() {
     <div class="toolbar">
       <select class="select" id="f-cuenta" style="width:auto">${opcionesCuenta}</select>
       <input class="input grow" id="f-q" type="text" placeholder="Buscar descripción…" value="${FILTRO.q.replace(/"/g, '&quot;')}">
-      <button class="btn btn-ghost" id="btn-importar">Importar Supervielle</button>
+      <button class="btn btn-ghost" id="btn-importar">Importar</button>
       <button class="btn btn-primary" id="btn-nuevo">+ Movimiento de caja</button>
-      <input type="file" id="file-import" accept=".xlsx,.xls,.csv" style="display:none">
     </div>
 
     <div class="kpi-grid" style="margin:14px 0">
@@ -173,11 +172,7 @@ function render() {
   document.getElementById('f-cuenta').addEventListener('change', e => { FILTRO.cuenta = e.target.value; render(); });
   document.getElementById('f-q').addEventListener('input', e => { FILTRO.q = e.target.value; render(); });
   document.getElementById('btn-nuevo').addEventListener('click', openModalNuevo);
-  document.getElementById('btn-importar').addEventListener('click', () => document.getElementById('file-import').click());
-  document.getElementById('file-import').addEventListener('change', e => {
-    if (e.target.files[0]) importarSupervielle(e.target.files[0]);
-    e.target.value = '';
-  });
+  document.getElementById('btn-importar').addEventListener('click', openModalImportar);
   document.querySelectorAll('.pill').forEach(p => {
     p.addEventListener('click', () => { FILTRO.estado = p.dataset.estado; render(); });
   });
@@ -359,24 +354,74 @@ async function borrarMovimiento(id) {
   }
 }
 
-// ── Importar extracto Supervielle ──────────────────────────────────────
-async function importarSupervielle(file) {
-  window.toast('Importando extracto…');
+// ── Importar extracto (Supervielle / Mercado Pago) ─────────────────────
+function openModalImportar() {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal">
+      <div class="card-title">Importar extracto</div>
+      <p class="imp-sub">Elegí la fuente y subí el archivo descargado del homebanking.</p>
+
+      <div class="imp-src">
+        <div class="imp-src-h">Supervielle <span class="imp-tag">banco</span></div>
+        <div class="imp-src-fmt">Export de <b>Movimientos</b> (.xlsx o .csv). Columnas: Fecha · Hora · Concepto · Detalle · Débito · Crédito · Saldo.</div>
+        <button class="btn btn-ghost imp-pick" data-src="supervielle">Elegir archivo…</button>
+      </div>
+
+      <div class="imp-src">
+        <div class="imp-src-h">Mercado Pago <span class="imp-tag">mp</span></div>
+        <div class="imp-src-fmt">Resumen de cuenta (.xlsx). Columnas: RELEASE_DATE · TRANSACTION_TYPE · REFERENCE_ID · TRANSACTION_NET_AMOUNT · PARTIAL_BALANCE.</div>
+        <div class="imp-note">Las liquidaciones de ventas entran <b>sin conciliar</b> hasta el sync de ML.</div>
+        <button class="btn btn-ghost imp-pick" data-src="mp">Elegir archivo…</button>
+      </div>
+
+      <input type="file" id="imp-file" accept=".xlsx,.xls,.csv" style="display:none">
+
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="imp-cancel">Cerrar</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const close = () => overlay.remove();
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  overlay.querySelector('#imp-cancel').addEventListener('click', close);
+
+  const fileInput = overlay.querySelector('#imp-file');
+  let src = 'supervielle';
+  overlay.querySelectorAll('.imp-pick').forEach(b => {
+    b.addEventListener('click', () => { src = b.dataset.src; fileInput.click(); });
+  });
+  fileInput.addEventListener('change', e => {
+    const f = e.target.files[0];
+    e.target.value = '';
+    if (!f) return;
+    close();
+    importarExtracto(f, src);
+  });
+}
+
+async function importarExtracto(file, source) {
+  const cfg = source === 'mp'
+    ? { url: '/mp/import', label: 'Mercado Pago' }
+    : { url: '/supervielle/import', label: 'Supervielle' };
+  window.toast(`Importando ${cfg.label}…`);
   try {
     const fd = new FormData();
     fd.append('file', file);
-    const r = await fetch('/supervielle/import', { method: 'POST', body: fd });
+    const r = await fetch(cfg.url, { method: 'POST', body: fd });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
 
     if (data.saldo_check && !data.saldo_check.ok) {
       alert(
-        `⚠ El saldo no encadena (${data.saldo_check.total_breaks} salto/s). ` +
+        `⚠ El saldo no encadena (${data.saldo_check.total_breaks} salto/s) en ${cfg.label}. ` +
         `Puede que falten movimientos en el archivo.\n\n` +
         `Se importaron igual ${data.importados}, pero conviene revisar/rebajar el extracto completo.`
       );
     }
-    window.toast(`Importados ${data.importados} · pendientes ${data.pendientes} · auto ${data.auto}`);
+    window.toast(`${cfg.label}: importados ${data.importados} · pendientes ${data.pendientes} · auto ${data.auto}`);
 
     DATA = await sbGet('movimientos', 'order=fecha.desc,id.desc');
     render();
@@ -415,6 +460,13 @@ function inyectarEstilo() {
     .mov-yahoy-r{display:flex;justify-content:space-between;gap:10px;font-size:13px;padding:2px 0}
     .mov-del{border:0;background:transparent;color:#A8A29E;cursor:pointer;font-size:15px;padding:2px 7px;border-radius:6px;line-height:1}
     .mov-del:hover{background:#FEE2E2;color:#B91C1C}
+    .imp-sub{font-size:13px;color:#78716C;margin:-4px 0 14px}
+    .imp-src{border:1px solid #E7E5E4;border-radius:10px;padding:12px 14px;margin-bottom:12px}
+    .imp-src-h{font-weight:600;font-size:14px;margin-bottom:4px}
+    .imp-tag{font-size:11px;color:#78716C;background:#F5F5F4;padding:1px 7px;border-radius:6px;font-weight:400;margin-left:4px}
+    .imp-src-fmt{font-size:12px;color:#57534E;line-height:1.5;margin-bottom:8px}
+    .imp-note{font-size:12px;color:#854F0B;background:#FAEEDA;border-radius:6px;padding:6px 8px;margin-bottom:8px}
+    .imp-pick{font-size:13px}
   `;
   const style = document.createElement('style');
   style.id = 'mov-style';
