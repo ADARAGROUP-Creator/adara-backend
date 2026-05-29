@@ -2728,15 +2728,18 @@ app.post('/mp/import', upload.single('file'), async (req, res) => {
     const iF = col(/RELEASE_DATE|FECHA/), iT = col(/TRANSACTION_TYPE/), iR = col(/REFERENCE_ID/),
           iM = col(/NET_AMOUNT|AMOUNT/), iS = col(/PARTIAL_BALANCE|BALANCE/);
 
-    // Clasificador MP. Solo rendimientos/impuestos son auto; el resto va sin conciliar.
+    // Clasificador MP. Auto (no atado a venta) = solo rendimientos e impuestos
+    // que MP cobra directo (ej. impuesto por extracción). Todo lo demás —incluidas
+    // las devoluciones/reintegros de impuestos y comisiones— se ata a una venta/
+    // compra/gasto y entra SIN conciliar.
     const clasificar = tipo => {
       const s = tipo.toLowerCase();
       if (/rendimiento/.test(s)) return { categoria: 'interes', auto: true };
-      if (/impuesto/.test(s)) return { categoria: 'impuesto', auto: true };
+      if (/^impuesto/.test(s)) return { categoria: 'impuesto', auto: true }; // ej. "Impuesto por extracción"
+      if (/devoluci.n|reintegro|dinero retenido/.test(s)) return { categoria: 'devolucion', auto: false };
       if (/liquidaci.n de dinero/.test(s)) return { categoria: 'cobro_venta', auto: false };
       if (/bonificaci.n por env/.test(s)) return { categoria: 'cobro_venta', auto: false };
-      if (/d.bito por deuda|dinero retenido/.test(s)) return { categoria: 'devolucion', auto: false };
-      if (/devoluci.n de dinero/.test(s)) return { categoria: 'devolucion', auto: false };
+      if (/d.bito por deuda/.test(s)) return { categoria: 'devolucion', auto: false };
       if (/transferencia enviada/.test(s)) return { categoria: 'pago_proveedor', auto: false };
       if (/transferencia recibida|dinero recibido/.test(s)) return { categoria: 'cobro_venta', auto: false };
       if (/pago de suscripci|^pago |compra mercado/.test(s)) return { categoria: 'gasto', auto: false };
