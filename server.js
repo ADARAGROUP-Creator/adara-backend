@@ -2842,6 +2842,42 @@ app.delete('/vincular/:id', async (req, res) => {
   }
 });
 
+// ── Conciliación: transferencia interna entre cuentas propias (CB8) ──────
+// Empareja dos movimientos (salida en una cuenta, entrada en otra) con vínculos
+// cruzados op_tipo='transferencia' (op_id = el OTRO movimiento). Cada lado
+// concilia contra el otro y NO impacta P&L ni AR/AP. Si no hay contrapartida en
+// el sistema, se marca "interna sin par" (vínculo a sí mismo).
+app.post('/transferencia-interna', async (req, res) => {
+  try {
+    const { movimiento_a, movimiento_b } = req.body || {};
+    if (!movimiento_a) return res.status(400).json({ error: 'Falta movimiento_a' });
+
+    const ids = [movimiento_a, movimiento_b].filter(Boolean).join(',');
+    const movs = await sbGet('movimientos', `id=in.(${ids})&select=id,monto`);
+    const ma = movs.find(m => String(m.id) === String(movimiento_a));
+    if (!ma) return res.status(404).json({ error: 'No existe movimiento_a' });
+    const mag = x => Math.round(Math.abs(Number(x)) * 100) / 100;
+
+    if (movimiento_b) {
+      const mb = movs.find(m => String(m.id) === String(movimiento_b));
+      if (!mb) return res.status(404).json({ error: 'No existe movimiento_b' });
+      await sbUpsert('vinculos', [
+        { movimiento_id: movimiento_a, op_tipo: 'transferencia', op_id: movimiento_b, monto: mag(ma.monto) },
+        { movimiento_id: movimiento_b, op_tipo: 'transferencia', op_id: movimiento_a, monto: mag(mb.monto) },
+      ], 'movimiento_id,op_tipo,op_id');
+    } else {
+      // Interna sin contrapartida en el sistema → vínculo a sí mismo
+      await sbUpsert('vinculos', {
+        movimiento_id: movimiento_a, op_tipo: 'transferencia', op_id: movimiento_a, monto: mag(ma.monto)
+      }, 'movimiento_id,op_tipo,op_id');
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('transferencia interna:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── START ────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
   console.log(`\n🚀 ADARA Backend corriendo — puerto ${PORT}`);
