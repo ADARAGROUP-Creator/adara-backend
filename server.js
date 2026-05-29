@@ -2657,6 +2657,27 @@ app.post('/supervielle/import', upload.single('file'), async (req, res) => {
   }
 });
 
+// ── Borrar movimiento (solo los cargados a mano) ─────────────────────────
+// Guarda: nunca borra importados (banco/MP) — esos se restauran al re-importar.
+app.delete('/movimientos/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const rows = await sbGet('movimientos', `id=eq.${id}&select=id,origen`);
+    const mov = rows && rows[0];
+    if (!mov) return res.status(404).json({ error: 'No existe el movimiento' });
+    if (mov.origen !== 'manual') {
+      return res.status(403).json({ error: 'Solo se borran movimientos cargados a mano. Los importados se restauran al re-importar.' });
+    }
+    await sb('DELETE', 'vinculos', null, `movimiento_id=eq.${id}`); // limpia vínculos por las dudas
+    await sb('DELETE', 'movimientos', null, `id=eq.${id}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE movimiento:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
 // ── START ────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
   console.log(`\n🚀 ADARA Backend corriendo — puerto ${PORT}`);
