@@ -140,7 +140,9 @@ function render() {
     <div class="toolbar">
       <select class="select" id="f-cuenta" style="width:auto">${opcionesCuenta}</select>
       <input class="input grow" id="f-q" type="text" placeholder="Buscar descripción…" value="${FILTRO.q.replace(/"/g, '&quot;')}">
-      <button class="btn btn-primary" id="btn-nuevo">+ Cargar movimiento</button>
+      <button class="btn btn-ghost" id="btn-importar">Importar Supervielle</button>
+      <button class="btn btn-primary" id="btn-nuevo">+ Movimiento de caja</button>
+      <input type="file" id="file-import" accept=".xlsx,.xls,.csv" style="display:none">
     </div>
 
     <div class="kpi-grid" style="margin:14px 0">
@@ -170,6 +172,11 @@ function render() {
   document.getElementById('f-cuenta').addEventListener('change', e => { FILTRO.cuenta = e.target.value; render(); });
   document.getElementById('f-q').addEventListener('input', e => { FILTRO.q = e.target.value; render(); });
   document.getElementById('btn-nuevo').addEventListener('click', openModalNuevo);
+  document.getElementById('btn-importar').addEventListener('click', () => document.getElementById('file-import').click());
+  document.getElementById('file-import').addEventListener('change', e => {
+    if (e.target.files[0]) importarSupervielle(e.target.files[0]);
+    e.target.value = '';
+  });
   document.querySelectorAll('.pill').forEach(p => {
     p.addEventListener('click', () => { FILTRO.estado = p.dataset.estado; render(); });
   });
@@ -196,12 +203,13 @@ function openModalNuevo() {
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
 
-  const opcionesCuenta = '<option value="">Elegí cuenta…</option>' + CUENTAS.map(c => `<option value="${c.id}">${cuentaLabel(c.id)}</option>`).join('');
+  const cajas = CUENTAS.filter(c => c.tipo === 'caja');
+  const opcionesCuenta = '<option value="">Elegí caja…</option>' + cajas.map(c => `<option value="${c.id}">${cuentaLabel(c.id)}</option>`).join('');
   const opcionesCat = '<option value="">Elegí categoría…</option>' + CATEGORIAS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
 
   overlay.innerHTML = `
     <div class="modal">
-      <div class="card-title">Cargar movimiento</div>
+      <div class="card-title">Movimiento de caja</div>
 
       <div class="field"><label>Cuenta</label>
         <select class="select" id="m-cuenta">${opcionesCuenta}</select>
@@ -329,6 +337,32 @@ function openModalNuevo() {
       window.toast('Error al guardar: ' + e.message, 'error');
     }
   });
+}
+
+// ── Importar extracto Supervielle ──────────────────────────────────────
+async function importarSupervielle(file) {
+  window.toast('Importando extracto…');
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const r = await fetch('/supervielle/import', { method: 'POST', body: fd });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+
+    if (data.saldo_check && !data.saldo_check.ok) {
+      alert(
+        `⚠ El saldo no encadena (${data.saldo_check.total_breaks} salto/s). ` +
+        `Puede que falten movimientos en el archivo.\n\n` +
+        `Se importaron igual ${data.importados}, pero conviene revisar/rebajar el extracto completo.`
+      );
+    }
+    window.toast(`Importados ${data.importados} · pendientes ${data.pendientes} · auto ${data.auto}`);
+
+    DATA = await sbGet('movimientos', 'order=fecha.desc,id.desc');
+    render();
+  } catch (e) {
+    window.toast('Error al importar: ' + e.message, 'error');
+  }
 }
 
 // ── Utilidades ─────────────────────────────────────────────────────────
