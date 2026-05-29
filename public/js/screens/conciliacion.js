@@ -170,10 +170,19 @@ function filaHTML(m) {
   </tr>`;
 }
 
+function chipLabel(v, m) {
+  if (v.op_tipo === 'transferencia') {
+    return String(v.op_id) === String(m.id) ? 'Transf. interna (sin par)' : `↔ Transf. mov #${v.op_id}`;
+  }
+  return `${CAT_LABEL[v.op_tipo] || v.op_tipo} #${v.op_id}`;
+}
+
 function accionHTML(m) {
   const vinc = VINC_BY_MOV[m.id] || [];
-  const chips = vinc.map(v => `<span class="con-chip">${esc(CAT_LABEL[v.op_tipo] || v.op_tipo)} #${v.op_id} · ${money(v.monto)}
+  const chips = vinc.map(v => `<span class="con-chip">${esc(chipLabel(v, m))} · ${money(v.monto)}
       <button class="con-x" data-accion="desvincular" data-id="${v.id}" title="Desvincular">✕</button></span>`).join('');
+
+  const transfBtn = `<button class="btn btn-ghost con-mini" data-accion="transf" data-mov="${m.id}">Transf. interna</button>`;
 
   if (esAccionable(m)) {
     const saldo = Math.abs(Number(m.saldo_pendiente) || 0);
@@ -181,10 +190,10 @@ function accionHTML(m) {
     const spark = sug
       ? `<button class="con-spark-btn" data-accion="aceptar" data-mov="${m.id}" data-tipo="${sug.tipo}" data-op="${sug.id}" data-monto="${sug.monto}" title="Aceptar: ${esc(sug.label)} · ${money(sug.monto)}">✨</button>`
       : '';
-    return `${chips}<div class="con-acts">${spark}<button class="btn btn-ghost con-mini" data-accion="pick" data-mov="${m.id}">Vincular</button></div>`;
+    return `${chips}<div class="con-acts">${spark}<button class="btn btn-ghost con-mini" data-accion="pick" data-mov="${m.id}">Vincular</button>${transfBtn}</div>`;
   }
   if ((m.estado === 'pendiente' || m.estado === 'parcial') && esEspera(m)) {
-    return `${chips}<span class="con-wait">espera venta</span>`;
+    return `${chips}<div class="con-acts"><span class="con-wait">espera venta</span>${transfBtn}</div>`;
   }
   if (m.estado === 'conciliado') return chips || '<span class="con-ok">✓</span>';
   return chips || '<span class="con-dash">—</span>';
@@ -196,6 +205,7 @@ function onTablaClick(e) {
   const a = btn.dataset.accion;
   if (a === 'aceptar') vincular(btn.dataset.mov, btn.dataset.tipo, btn.dataset.op, Number(btn.dataset.monto));
   else if (a === 'pick') openPicker(btn.dataset.mov);
+  else if (a === 'transf') openTransferencia(btn.dataset.mov);
   else if (a === 'desvincular') desvincular(btn.dataset.id);
 }
 
@@ -235,6 +245,73 @@ function openPicker(movId) {
   overlay.querySelector('#c-cancel').addEventListener('click', close);
   overlay.querySelectorAll('.con-pick-row button').forEach(b =>
     b.addEventListener('click', () => { close(); vincular(movId, b.dataset.tipo, b.dataset.op, Number(b.dataset.monto)); }));
+}
+
+function openTransferencia(movId) {
+  const m = MOVS.find(x => String(x.id) === String(movId));
+  if (!m) return;
+  const mag = Math.abs(Number(m.monto) || 0);
+  const signo = Math.sign(Number(m.monto) || 0);
+
+  // Contrapartes: otra cuenta, signo opuesto, aún sin conciliar. Más cercanas primero.
+  const cands = MOVS
+    .filter(x => String(x.id) !== String(m.id)
+      && String(x.cuenta_id) !== String(m.cuenta_id)
+      && Math.sign(Number(x.monto) || 0) === -signo
+      && (x.estado === 'pendiente' || x.estado === 'parcial'))
+    .map(x => ({ x, diff: Math.abs(Math.abs(Number(x.monto) || 0) - mag) }))
+    .sort((a, b) => a.diff - b.diff)
+    .slice(0, 50)
+    .map(o => o.x);
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal">
+      <div class="card-title">Transferencia interna</div>
+      <p class="con-sub"><b>${esc(m.descripcion || '')}</b> · ${cuentaLabel(m.cuenta_id)} · ${fmtMonto(m.monto, monedaDe(m.cuenta_id))}<br>
+        Elegí el movimiento contrario (la otra pata de la transferencia). Ambos quedan conciliados y no impactan el P&amp;L.</p>
+      ${cands.length === 0
+        ? `<div class="empty">No hay movimientos de otra cuenta con signo opuesto sin conciliar.</div>`
+        : `<div class="con-pick">${cands.map(o => {
+            const exacto = Math.abs(Math.abs(Number(o.monto) || 0) - mag) < 0.02;
+            return `<div class="con-pick-row ${exacto ? 'exacto' : ''}">
+              <div><div class="con-pick-lbl">${esc(o.descripcion || ('#' + o.id))} ${exacto ? '<span class="con-tag">coincide</span>' : ''}</div>
+                <div class="con-pick-sub">${cuentaLabel(o.cuenta_id)} · ${ddmm(o.fecha)} · ${fmtMonto(o.monto, monedaDe(o.cuenta_id))}</div></div>
+              <button class="btn btn-primary con-mini" data-emp="${o.id}">Emparejar</button>
+            </div>`;
+          }).join('')}</div>`}
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="t-sinpar">Marcar interna sin contrapartida</button>
+        <button class="btn btn-ghost" id="t-cancel">Cancelar</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  overlay.querySelector('#t-cancel').addEventListener('click', close);
+  overlay.querySelector('#t-sinpar').addEventListener('click', () => {
+    if (!confirm('¿Marcar como transferencia interna sin contrapartida en el sistema? Quedará conciliada sola.')) return;
+    close(); transfInterna(m.id, null);
+  });
+  overlay.querySelectorAll('.con-pick-row button').forEach(b =>
+    b.addEventListener('click', () => { close(); transfInterna(m.id, b.dataset.emp); }));
+}
+
+async function transfInterna(movimiento_a, movimiento_b) {
+  window.toast('Emparejando…');
+  try {
+    const r = await fetch('/transferencia-interna', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(movimiento_b ? { movimiento_a, movimiento_b } : { movimiento_a })
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+    window.toast('Transferencia interna conciliada');
+    await loadConciliacion();
+  } catch (e) {
+    window.toast('Error: ' + e.message, 'error');
+  }
 }
 
 async function vincular(movimiento_id, op_tipo, op_id, monto) {
