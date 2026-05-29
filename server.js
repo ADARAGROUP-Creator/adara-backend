@@ -2508,6 +2508,155 @@ app.post('/gastos', async (req, res) => {
   }
 });
 
+// ── Importador de extracto Supervielle (Excel/CSV → movimientos) ──────────
+// Parsea el export de movimientos de Supervielle (xlsx o csv), lo mapea a la
+// tabla nueva `movimientos` (capa 4), auto-clasifica el ruido (impuestos,
+// comisiones, intereses, FCI) y verifica la continuidad del saldo.
+//
+// Idempotencia: referencia_externa = fecha|hora|monto|saldo (el saldo corre y
+// es único por movimiento, así re-importar no duplica — UNIQUE(origen, ref)).
+// Clasificación: las líneas "ruido" quedan conciliado_auto=true (fuera de
+// pendientes); las reales quedan conciliado_auto=false (van a conciliar).
+app.post('/supervielle/import', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'Falta el archivo' });
+
+    // Resolver cuenta Supervielle (las 3 subcuentas se agregan en una sola, CB10)
+    const cuentas = await sbGet('cuentas', `codigo=eq.supervielle_ars&select=id`);
+    const cuentaId = cuentas?.[0]?.id;
+    if (!cuentaId) return res.status(400).json({ error: "No existe la cuenta 'supervielle_ars'" });
+
+    // Parseo: xlsx por buffer; csv decodificado latin1 → string (Supervielle exporta acentos como '?')
+    const fname = (req.file.originalname || '').toLowerCase();
+    const wb = fname.endsWith('.csv')
+      ? XLSX.read(req.file.buffer.toString('latin1'), { type: 'string', raw: true })
+      : XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
+    const ws  = wb.Sheets[wb.SheetNames[0]];
+    const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
+
+    // Buscar fila de cabecera
+    let hRow = -1;
+    for (let i = 0; i < Math.min(raw.length, 12); i++) {
+      const j = (raw[i] || []).join('|').toLowerCase();
+      if (j.includes('fecha') && (j.includes('saldo') || j.includes('concepto'))) { hRow = i; break; }
+    }
+    if (hRow < 0) return res.status(400).json({ error: 'No encontré la cabecera. ¿Es el export de movimientos de Supervielle?' });
+
+    const headers = (raw[hRow] || []).map(h => String(h || '').toLowerCase().trim());
+    const col = re => headers.findIndex(h => re.test(h));
+    const iF = col(/fecha/), iH = col(/hora/), iC = col(/concepto|descrip/),
+          iDet = col(/detalle|referenc/), iDeb = col(/d.?bito/),
+          iCr = col(/cr.?dito/), iSal = col(/saldo/);
+
+    const num = v => {
+      if (v == null || v === '') return 0;
+      if (typeof v === 'number') return Math.abs(v) < 1e-6 ? 0 : v;
+      let s = String(v).trim().replace(/\./g, '').replace(',', '.');
+      const n = parseFloat(s);
+      return isNaN(n) ? 0 : n;
+    };
+    const toISO = v => {
+      if (v instanceof Date) return v.toISOString().slice(0, 10);
+      if (typeof v === 'number' && v > 40000) return new Date(Math.round((v - 25569) * 86400000)).toISOString().slice(0, 10);
+      const m = String(v || '').trim().match(/^(\d{2})\/(\d{2})\/(\d{4})/);
+      return m ? `${m[3]}-${m[2]}-${m[1]}` : null;
+    };
+
+    // Clasificador: devuelve { categoria, auto }. El orden importa (lo fiscal antes que lo genérico).
+    const clasificar = (concepto, detalle, monto) => {
+      const t = (concepto + ' ' + detalle).toLowerCase();
+      const entra = monto > 0;
+      if (/impuesto d.?bitos y cr.?ditos/.test(t)) return { categoria: 'impuesto', auto: true };
+      if (/sellos/.test(t)) return { categoria: 'impuesto', auto: true };
+      if (/ganancias/.test(t)) return { categoria: 'impuesto', auto: true };
+      if (/iibb|ingresos brutos|sircreb/.test(t)) return { categoria: 'impuesto', auto: true };
+      if (/percep/.test(t)) return { categoria: 'impuesto', auto: true };
+      if (/\biva\b|i\.v\.a/.test(t)) return { categoria: 'impuesto', auto: true };
+      if (/remuneraci.?n de saldo/.test(t)) return { categoria: 'interes', auto: true };
+      if (/intereses de sobregiro|contras.*ints.*sobreg/.test(t)) return { categoria: 'interes', auto: true };
+      if (/comisi.?n|comis\.|com\.cheque/.test(t)) return { categoria: 'comision_bancaria', auto: true };
+      if (/rescate fci|suscripci.?n.*fci|\bfci\b/.test(t)) return { categoria: 'transferencia_interna', auto: true };
+      if (/comex/.test(t)) return { categoria: 'pago_proveedor', auto: false };
+      if (/resumenvisa|resumen visa/.test(t)) return { categoria: 'gasto', auto: false };
+      if (/pago de servicios|d.?bito autom.?tic/.test(t)) {
+        if (/afip|vep/.test(t)) return { categoria: 'impuesto', auto: false };
+        if (/axoft|tango/.test(t)) return { categoria: 'gasto', auto: false };
+        return { categoria: 'pago_proveedor', auto: false };
+      }
+      if (/cr.?dito por transferencia|debin|acreditaci.?n cheque|cheque de c.?mara|cred bca electronica/.test(t))
+        return { categoria: entra ? 'cobro_venta' : 'pago_proveedor', auto: false };
+      if (/transferencia|trf\.|porcbu|pago.prov/.test(t))
+        return { categoria: entra ? 'cobro_venta' : 'pago_proveedor', auto: false };
+      return { categoria: 'sin_clasificar', auto: false };
+    };
+
+    const filas = [];
+    for (let i = hRow + 1; i < raw.length; i++) {
+      const row = raw[i] || [];
+      const fecha = toISO(row[iF]);
+      if (!fecha || fecha < '2020-01-01') continue;
+      const concepto = String(row[iC] || '').trim();
+      const detalle  = iDet >= 0 ? String(row[iDet] || '').trim() : '';
+      const hora     = iH >= 0 ? String(row[iH] || '').trim() : '';
+      const deb = iDeb >= 0 ? num(row[iDeb]) : 0;
+      const cr  = iCr  >= 0 ? num(row[iCr])  : 0;
+      const saldo = iSal >= 0 ? num(row[iSal]) : 0;
+      if (!concepto && !deb && !cr) continue;
+      const monto = Math.round((cr - deb) * 100) / 100;
+      filas.push({ fecha, hora, concepto, detalle, deb, cr, saldo, monto });
+    }
+    if (!filas.length) return res.status(400).json({ error: 'No encontré movimientos en el archivo.' });
+
+    // Chequeo de continuidad de saldo (el export viene más-reciente-primero):
+    // saldo[i] == saldo[i+1] + monto[i]
+    const breaks = [];
+    for (let i = 0; i < filas.length - 1; i++) {
+      const esperado = Math.round((filas[i + 1].saldo + filas[i].monto) * 100) / 100;
+      if (Math.abs(esperado - filas[i].saldo) > 0.01) {
+        breaks.push({ fecha: filas[i].fecha, concepto: filas[i].concepto, saldo: filas[i].saldo, esperado });
+      }
+    }
+    const saldoOk = breaks.length === 0;
+
+    // Construir movimientos + clasificación
+    let auto = 0, pendientes = 0;
+    const movs = filas.map(f => {
+      const { categoria, auto: esAuto } = clasificar(f.concepto, f.detalle, f.monto);
+      if (esAuto) auto++; else pendientes++;
+      const desc = (f.concepto + (f.detalle ? ' — ' + f.detalle : '')).slice(0, 300);
+      return {
+        cuenta_id: cuentaId,
+        fecha: f.fecha,
+        monto: f.monto,
+        origen: 'supervielle',
+        referencia_externa: `${f.fecha}|${f.hora}|${f.monto.toFixed(2)}|${f.saldo.toFixed(2)}`,
+        categoria,
+        descripcion: desc,
+        conciliado_auto: esAuto
+      };
+    });
+
+    // Upsert idempotente (UNIQUE origen+referencia_externa → no duplica al re-importar)
+    let importados = 0;
+    for (let i = 0; i < movs.length; i += 50) {
+      const lote = movs.slice(i, i + 50);
+      await sbUpsert('movimientos', lote, 'origen,referencia_externa');
+      importados += lote.length;
+    }
+
+    const fechas = filas.map(f => f.fecha).sort();
+    res.json({
+      ok: true,
+      importados, auto, pendientes,
+      rango: { desde: fechas[0], hasta: fechas[fechas.length - 1] },
+      saldo_check: { ok: saldoOk, breaks: breaks.slice(0, 5), total_breaks: breaks.length }
+    });
+  } catch (e) {
+    console.error('Supervielle import:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── START ────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
   console.log(`\n🚀 ADARA Backend corriendo — puerto ${PORT}`);
