@@ -105,10 +105,9 @@ export async function loadMovimientos() {
 function render() {
   const root = document.getElementById('app-screens');
 
-  // Filtrado en cliente (data chica al inicio)
-  const filtrados = DATA.filter(m => {
+  // Base: respeta cuenta + búsqueda (NO el estado, que es la pill seleccionada)
+  const base = DATA.filter(m => {
     if (FILTRO.cuenta && String(m.cuenta_id) !== FILTRO.cuenta) return false;
-    if (FILTRO.estado && estadoDe(m) !== FILTRO.estado) return false;
     if (FILTRO.q) {
       const txt = `${m.descripcion || ''} ${m.categoria || ''}`.toLowerCase();
       if (!txt.includes(FILTRO.q.toLowerCase())) return false;
@@ -116,18 +115,21 @@ function render() {
     return true;
   });
 
-  // KPIs
-  const total = DATA.length;
-  const pendientes = DATA.filter(m => estadoDe(m) === 'pendiente').length;
-  const netoArs = DATA
+  // Lista: base + filtro de estado (la pill activa)
+  const filtrados = base.filter(m => !FILTRO.estado || estadoDe(m) === FILTRO.estado);
+
+  // KPIs (sobre la base filtrada por cuenta + búsqueda)
+  const total = base.length;
+  const pendientes = base.filter(m => estadoDe(m) === 'pendiente').length;
+  const netoArs = base
     .filter(m => monedaDe(m.cuenta_id) === 'ARS')
     .reduce((s, m) => s + (Number(m.monto) || 0), 0);
 
-  // Pills dinámicas por estado presente
-  const estadosPresentes = [...new Set(DATA.map(estadoDe))];
+  // Pills dinámicas por estado presente (sobre la base)
+  const estadosPresentes = [...new Set(base.map(estadoDe))];
   const pills = [`<button class="pill ${FILTRO.estado === '' ? 'active' : ''}" data-estado="">Todos <span class="num">${total}</span></button>`]
     .concat(estadosPresentes.map(es => {
-      const n = DATA.filter(m => estadoDe(m) === es).length;
+      const n = base.filter(m => estadoDe(m) === es).length;
       return `<button class="pill ${FILTRO.estado === es ? 'active' : ''}" data-estado="${es}">${LABEL_ESTADO[es] || es} <span class="num">${n}</span></button>`;
     }))
     .join('');
