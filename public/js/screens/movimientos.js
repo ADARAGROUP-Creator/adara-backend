@@ -163,6 +163,7 @@ function render() {
             <th style="width:150px">Categoría</th>
             <th style="width:150px;text-align:right">Monto</th>
             <th style="width:110px">Estado</th>
+            <th style="width:54px"></th>
           </tr></thead>
           <tbody>${filtrados.map(filaHTML).join('')}</tbody>
         </table></div>`}
@@ -180,6 +181,9 @@ function render() {
   document.querySelectorAll('.pill').forEach(p => {
     p.addEventListener('click', () => { FILTRO.estado = p.dataset.estado; render(); });
   });
+  document.querySelectorAll('.mov-del').forEach(b => {
+    b.addEventListener('click', () => borrarMovimiento(b.dataset.id));
+  });
 }
 
 function filaHTML(m) {
@@ -195,6 +199,7 @@ function filaHTML(m) {
     <td>${catSinClasif ? '<span class="mov-tag-empty">sin clasificar</span>' : `<span class="mov-tag">${esc(catLabel)}</span>`}</td>
     <td style="text-align:right" class="mov-mono ${neg ? 'mov-neg' : 'mov-pos'}">${fmtMonto(m.monto, moneda)}</td>
     <td><span class="mov-badge mov-badge-${est}">${LABEL_ESTADO[est] || est}</span></td>
+    <td style="text-align:center">${m.origen === 'manual' ? `<button class="mov-del" data-id="${m.id}" title="Borrar movimiento">✕</button>` : ''}</td>
   </tr>`;
 }
 
@@ -339,6 +344,21 @@ function openModalNuevo() {
   });
 }
 
+// ── Borrar movimiento manual ───────────────────────────────────────────
+async function borrarMovimiento(id) {
+  if (!confirm('¿Borrar este movimiento cargado a mano? No se puede deshacer.')) return;
+  try {
+    const r = await fetch('/movimientos/' + id, { method: 'DELETE' });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+    DATA = DATA.filter(m => String(m.id) !== String(id));
+    render();
+    window.toast('Movimiento borrado');
+  } catch (e) {
+    window.toast('Error al borrar: ' + e.message, 'error');
+  }
+}
+
 // ── Importar extracto Supervielle ──────────────────────────────────────
 async function importarSupervielle(file) {
   window.toast('Importando extracto…');
@@ -393,6 +413,8 @@ function inyectarEstilo() {
     .mov-yahoy{margin:10px 0;padding:10px 12px;background:#FAFAF9;border:1px solid #E7E5E4;border-radius:8px}
     .mov-yahoy-t{font-size:12px;color:#78716C;margin-bottom:6px}
     .mov-yahoy-r{display:flex;justify-content:space-between;gap:10px;font-size:13px;padding:2px 0}
+    .mov-del{border:0;background:transparent;color:#A8A29E;cursor:pointer;font-size:15px;padding:2px 7px;border-radius:6px;line-height:1}
+    .mov-del:hover{background:#FEE2E2;color:#B91C1C}
   `;
   const style = document.createElement('style');
   style.id = 'mov-style';
