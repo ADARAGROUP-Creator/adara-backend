@@ -2678,6 +2678,134 @@ app.delete('/movimientos/:id', async (req, res) => {
 });
 
 
+// ── Importador de extracto Mercado Pago (Resumen de cuenta .xlsx) ─────────
+// El archivo trae un bloque de resumen arriba (INITIAL/FINAL balance) y la tabla
+// real con cabecera RELEASE_DATE/TRANSACTION_TYPE/REFERENCE_ID/
+// TRANSACTION_NET_AMOUNT/PARTIAL_BALANCE (más-viejo-primero, fechas DD-MM-AAAA).
+// Liquidaciones/bonificaciones/devoluciones entran SIN conciliar: se atan a su
+// venta con el sync de ML. Solo rendimientos e impuestos se cierran solos.
+app.post('/mp/import', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'Falta el archivo' });
+
+    const cuentas = await sbGet('cuentas', `codigo=eq.mp_ars&select=id`);
+    const cuentaId = cuentas?.[0]?.id;
+    if (!cuentaId) return res.status(400).json({ error: "No existe la cuenta 'mp_ars'" });
+
+    const wb  = XLSX.read(req.file.buffer, { type: 'buffer', raw: true });
+    const ws  = wb.Sheets[wb.SheetNames[0]];
+    const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
+
+    const num = v => {
+      if (v == null || v === '') return 0;
+      if (typeof v === 'number') return v;
+      const s = String(v).trim().replace(/\./g, '').replace(',', '.');
+      const n = parseFloat(s);
+      return isNaN(n) ? 0 : n;
+    };
+    const toISO = v => {
+      const m = String(v || '').trim().match(/^(\d{2})[\/\-](\d{2})[\/\-](\d{4})/);
+      return m ? `${m[3]}-${m[2]}-${m[1]}` : null;
+    };
+
+    // Resumen (INITIAL/FINAL balance) para anclar el chequeo de saldo
+    let ini = null, fin = null;
+    for (let i = 0; i < Math.min(raw.length, 8); i++) {
+      const j = (raw[i] || []).join('|').toUpperCase();
+      if (j.includes('INITIAL_BALANCE')) { ini = num((raw[i + 1] || [])[0]); fin = num((raw[i + 1] || [])[3]); break; }
+    }
+
+    // Cabecera real de la tabla de movimientos
+    let hRow = -1;
+    for (let i = 0; i < Math.min(raw.length, 12); i++) {
+      const j = (raw[i] || []).join('|').toUpperCase();
+      if (j.includes('TRANSACTION_TYPE') && j.includes('RELEASE_DATE')) { hRow = i; break; }
+    }
+    if (hRow < 0) return res.status(400).json({ error: 'No encontré la cabecera. ¿Es el Resumen de cuenta de Mercado Pago?' });
+
+    const H = (raw[hRow] || []).map(h => String(h || '').toUpperCase().trim());
+    const col = re => H.findIndex(h => re.test(h));
+    const iF = col(/RELEASE_DATE|FECHA/), iT = col(/TRANSACTION_TYPE/), iR = col(/REFERENCE_ID/),
+          iM = col(/NET_AMOUNT|AMOUNT/), iS = col(/PARTIAL_BALANCE|BALANCE/);
+
+    // Clasificador MP. Solo rendimientos/impuestos son auto; el resto va sin conciliar.
+    const clasificar = tipo => {
+      const s = tipo.toLowerCase();
+      if (/rendimiento/.test(s)) return { categoria: 'interes', auto: true };
+      if (/impuesto/.test(s)) return { categoria: 'impuesto', auto: true };
+      if (/liquidaci.n de dinero/.test(s)) return { categoria: 'cobro_venta', auto: false };
+      if (/bonificaci.n por env/.test(s)) return { categoria: 'cobro_venta', auto: false };
+      if (/d.bito por deuda|dinero retenido/.test(s)) return { categoria: 'devolucion', auto: false };
+      if (/devoluci.n de dinero/.test(s)) return { categoria: 'devolucion', auto: false };
+      if (/transferencia enviada/.test(s)) return { categoria: 'pago_proveedor', auto: false };
+      if (/transferencia recibida|dinero recibido/.test(s)) return { categoria: 'cobro_venta', auto: false };
+      if (/pago de suscripci|^pago |compra mercado/.test(s)) return { categoria: 'gasto', auto: false };
+      return { categoria: 'sin_clasificar', auto: false };
+    };
+
+    const filas = [];
+    for (let i = hRow + 1; i < raw.length; i++) {
+      const r = raw[i] || [];
+      const fecha = toISO(r[iF]);
+      if (!fecha || fecha < '2020-01-01') continue;
+      const tipo = String(r[iT] || '').trim();
+      if (!tipo) continue;
+      const ref = String(r[iR] || '').trim();
+      const monto = Math.round(num(r[iM]) * 100) / 100;
+      const saldo = num(r[iS]);
+      filas.push({ fecha, tipo, ref, monto, saldo });
+    }
+    if (!filas.length) return res.status(400).json({ error: 'No encontré movimientos en el archivo.' });
+
+    // Continuidad de saldo (más-viejo-primero): saldo[i] == saldo[i-1] + monto[i]
+    const breaks = [];
+    let prev = ini != null ? ini : Math.round((filas[0].saldo - filas[0].monto) * 100) / 100;
+    for (let i = 0; i < filas.length; i++) {
+      const esperado = Math.round((prev + filas[i].monto) * 100) / 100;
+      if (Math.abs(esperado - filas[i].saldo) > 0.01) breaks.push({ fecha: filas[i].fecha, tipo: filas[i].tipo, saldo: filas[i].saldo, esperado });
+      prev = filas[i].saldo;
+    }
+    if (fin != null && Math.abs(filas[filas.length - 1].saldo - fin) > 0.01) {
+      breaks.push({ fecha: 'FINAL', tipo: 'saldo final', saldo: filas[filas.length - 1].saldo, esperado: fin });
+    }
+    const saldoOk = breaks.length === 0;
+
+    let auto = 0, pendientes = 0;
+    const movs = filas.map(f => {
+      const { categoria, auto: esAuto } = clasificar(f.tipo);
+      if (esAuto) auto++; else pendientes++;
+      return {
+        cuenta_id: cuentaId,
+        fecha: f.fecha,
+        monto: f.monto,
+        origen: 'mp_account_statement',
+        referencia_externa: `${f.fecha}|${f.ref}|${f.monto.toFixed(2)}|${f.saldo.toFixed(2)}`,
+        categoria,
+        descripcion: (f.tipo + (f.ref ? ' · ' + f.ref : '')).slice(0, 300),
+        conciliado_auto: esAuto
+      };
+    });
+
+    let importados = 0;
+    for (let i = 0; i < movs.length; i += 500) {
+      const lote = movs.slice(i, i + 500);
+      await sbUpsert('movimientos', lote, 'origen,referencia_externa');
+      importados += lote.length;
+    }
+
+    const fechas = filas.map(f => f.fecha).sort();
+    res.json({
+      ok: true,
+      importados, auto, pendientes,
+      rango: { desde: fechas[0], hasta: fechas[fechas.length - 1] },
+      saldo_check: { ok: saldoOk, breaks: breaks.slice(0, 5), total_breaks: breaks.length }
+    });
+  } catch (e) {
+    console.error('MP import:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── START ────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
   console.log(`\n🚀 ADARA Backend corriendo — puerto ${PORT}`);
