@@ -2383,6 +2383,131 @@ cron.schedule('0 */6 * * *', async () => {
   try { await refreshML(); } catch (e) { console.error('Cron refresh:', e.message); }
 });
 
+// ── Gastos: alta atómica (gasto + renglones fiscales + caja sin_factura) ──
+// Opción A (ver ADARA-GASTOS.md): el front SIEMPRE postea acá.
+//   1) Inserta el gasto.
+//   2) Inserta los renglones fiscales (retenciones/percepciones) en gasto_fiscal.
+//   3) Si es sin_factura + efectivo, dispara el movimiento de caja
+//      (origen='sin_factura_auto') + vínculo op_tipo='gasto', así queda pagado
+//      al instante y la caja refleja la salida.
+// PostgREST no da transacción nativa: si algo falla después de crear el gasto,
+// se hace rollback best-effort borrando lo creado (gasto recién nacido, sin
+// historia que preservar).
+app.post('/gastos', async (req, res) => {
+  const RET_TIPOS  = ['ret_ganancias', 'ret_iva', 'ret_iibb', 'ret_suss', 'otro_ret'];
+  const PERC_TIPOS = ['perc_iva', 'perc_iibb', 'otro_perc'];
+  const TIPOS_FISCALES = [...RET_TIPOS, ...PERC_TIPOS];
+  const round2 = n => Math.round((Number(n) || 0) * 100) / 100;
+
+  let gastoId = null;
+  let movAutoId = null;
+  try {
+    const { gasto, fiscal } = req.body || {};
+    if (!gasto) return res.status(400).json({ error: 'Falta el objeto gasto' });
+
+    const requeridos = ['fecha', 'linea_id', 'categoria_codigo', 'descripcion', 'tipo_comprobante', 'moneda', 'monto_neto'];
+    for (const f of requeridos) {
+      if (gasto[f] === undefined || gasto[f] === null || gasto[f] === '') {
+        return res.status(400).json({ error: `Falta ${f}` });
+      }
+    }
+    if (!(Number(gasto.monto_neto) > 0)) return res.status(400).json({ error: 'monto_neto debe ser mayor a 0' });
+
+    // Normalización coherente con los CHECK de la tabla
+    const esFacturaA = gasto.tipo_comprobante === 'factura_a';
+    const esUSD = gasto.moneda === 'USD';
+    const monto_iva = esFacturaA ? round2(gasto.monto_iva) : 0;                          // chk_iva_solo_factura_a
+    const tc = (esUSD && gasto.tc != null && gasto.tc !== '') ? Number(gasto.tc) : null;  // chk_tc_solo_usd / chk_tc_positivo
+
+    const lineasFiscales = (Array.isArray(fiscal) ? fiscal : [])
+      .filter(x => x && TIPOS_FISCALES.includes(x.tipo) && Number(x.monto) > 0)
+      .map(x => ({ tipo: x.tipo, monto: round2(x.monto) }));
+
+    // Efectivo sin factura en USD necesita TC (el pago ocurre ahora — B1)
+    if (gasto.tipo_comprobante === 'sin_factura' && gasto.forma_pago === 'efectivo' && esUSD && tc == null) {
+      return res.status(400).json({ error: 'Efectivo sin factura en USD: falta el TC' });
+    }
+
+    // 1) Gasto
+    const filaGasto = {
+      fecha: gasto.fecha,
+      linea_id: gasto.linea_id,
+      categoria_codigo: gasto.categoria_codigo,
+      proveedor_id: gasto.proveedor_id || null,
+      descripcion: gasto.descripcion,
+      tipo_comprobante: gasto.tipo_comprobante,
+      nro_comprobante: gasto.nro_comprobante || null,
+      moneda: gasto.moneda,
+      tc,
+      monto_neto: round2(gasto.monto_neto),
+      monto_iva,
+      cuenta_origen_intencion: gasto.cuenta_origen_intencion || null,
+      forma_pago: gasto.forma_pago || null,
+      estado: 'activo'
+    };
+    const insGasto = await sbUpsert('gastos', filaGasto);
+    const g = Array.isArray(insGasto) ? insGasto[0] : insGasto;
+    if (!g || !g.id) throw new Error('No se obtuvo el id del gasto');
+    gastoId = g.id;
+
+    // 2) Renglones fiscales
+    if (lineasFiscales.length) {
+      await sbUpsert('gasto_fiscal', lineasFiscales.map(x => ({ gasto_id: gastoId, tipo: x.tipo, monto: x.monto })));
+    }
+
+    // 3) Caja automática (sin_factura efectivo)
+    if (gasto.tipo_comprobante === 'sin_factura' && gasto.forma_pago === 'efectivo') {
+      const bruto   = round2(filaGasto.monto_neto + filaGasto.monto_iva);
+      const sumPerc = lineasFiscales.filter(x => PERC_TIPOS.includes(x.tipo)).reduce((s, x) => s + x.monto, 0);
+      const sumRet  = lineasFiscales.filter(x => RET_TIPOS.includes(x.tipo)).reduce((s, x) => s + x.monto, 0);
+      const aPagarOrigen = round2(bruto + sumPerc - sumRet);
+
+      const codigoCaja = gasto.cuenta_origen_intencion || (esUSD ? 'caja_usd' : 'caja_ars');
+      const cuentas = await sbGet('cuentas', `codigo=eq.${codigoCaja}&select=id,moneda`);
+      if (!cuentas || !cuentas.length) throw new Error(`No existe la cuenta de caja '${codigoCaja}'`);
+      const cuenta = cuentas[0];
+
+      // El movimiento se guarda en la moneda de la cuenta (USD nativo si caja_usd).
+      const movRows = await sbUpsert('movimientos', {
+        cuenta_id: cuenta.id,
+        fecha: gasto.fecha,
+        monto: -aPagarOrigen,
+        origen: 'sin_factura_auto',
+        referencia_externa: 'sin_factura_auto-' + gastoId,   // NOT NULL + UNIQUE(origen, ref)
+        categoria: 'gasto',
+        descripcion: gasto.descripcion,
+        conciliado_auto: false
+      });
+      const mov = Array.isArray(movRows) ? movRows[0] : movRows;
+      movAutoId = mov.id;
+
+      // El vínculo se expresa en ARS (v_gastos_ap concilia en ARS).
+      const montoVinculoArs = esUSD ? round2(aPagarOrigen * tc) : aPagarOrigen;
+      await sbUpsert('vinculos', {
+        movimiento_id: mov.id,
+        op_tipo: 'gasto',
+        op_id: gastoId,
+        monto: montoVinculoArs
+      });
+    }
+
+    return res.json({ ok: true, id: gastoId, movimiento_auto: movAutoId });
+  } catch (e) {
+    // Rollback best-effort
+    try {
+      if (movAutoId) {
+        await sb('DELETE', 'vinculos', null, `movimiento_id=eq.${movAutoId}&op_tipo=eq.gasto`);
+        await sb('DELETE', 'movimientos', null, `id=eq.${movAutoId}`);
+      }
+      if (gastoId) {
+        await sb('DELETE', 'gasto_fiscal', null, `gasto_id=eq.${gastoId}`);
+        await sb('DELETE', 'gastos', null, `id=eq.${gastoId}`);
+      }
+    } catch (e2) { console.error('Rollback /gastos falló:', e2.message); }
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 // ── START ────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
   console.log(`\n🚀 ADARA Backend corriendo — puerto ${PORT}`);
