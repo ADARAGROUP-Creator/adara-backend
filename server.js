@@ -2809,6 +2809,39 @@ app.post('/mp/import', upload.single('file'), async (req, res) => {
   }
 });
 
+// ── Conciliación: crear / borrar vínculo movimiento ↔ operación ──────────
+// vinculos.monto es la MAGNITUD POSITIVA imputada (convención del sistema:
+// v_gastos_ap / v_compras_ap / v_ventas_ar restan Σ vínculos, y
+// v_movimientos_estado usa abs(monto) − Σ vínculos). Ver ADARA-SCHEMA.md.
+app.post('/vincular', async (req, res) => {
+  try {
+    const { movimiento_id, op_tipo, op_id, monto } = req.body || {};
+    const tiposOk = ['venta', 'compra', 'gasto', 'reclamo', 'transferencia', 'ajuste'];
+    if (!movimiento_id || !op_tipo || !op_id) return res.status(400).json({ error: 'Faltan movimiento_id, op_tipo u op_id' });
+    if (!tiposOk.includes(op_tipo)) return res.status(400).json({ error: 'op_tipo inválido' });
+    const m = Math.round(Number(monto) * 100) / 100;
+    if (!(m > 0)) return res.status(400).json({ error: 'El monto del vínculo debe ser > 0' });
+
+    const row = await sbUpsert('vinculos', {
+      movimiento_id, op_tipo, op_id, monto: m
+    }, 'movimiento_id,op_tipo,op_id');
+    res.json({ ok: true, vinculo: Array.isArray(row) ? row[0] : row });
+  } catch (e) {
+    console.error('vincular:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/vincular/:id', async (req, res) => {
+  try {
+    await sb('DELETE', 'vinculos', null, `id=eq.${req.params.id}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('desvincular:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── START ────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
   console.log(`\n🚀 ADARA Backend corriendo — puerto ${PORT}`);
