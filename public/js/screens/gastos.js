@@ -262,7 +262,17 @@ function openModalNuevo() {
       <div class="field"><label>Descripción</label><input class="input" id="g-desc" type="text" placeholder="Ej: alquiler depósito mayo"></div>
 
       <div class="gas-grid2">
-        <div class="field"><label>Proveedor (opcional)</label><select class="select" id="g-prov">${optProv}</select></div>
+        <div class="field"><label>Proveedor (opcional)</label>
+          <div style="display:flex;gap:8px;align-items:center">
+            <select class="select" id="g-prov" style="flex:1">${optProv}</select>
+            <button class="btn btn-ghost" id="g-prov-add" type="button" style="padding:6px 12px;font-size:13px">+ Nuevo</button>
+          </div>
+          <div id="g-prov-new" style="display:none;gap:8px;margin-top:8px">
+            <input class="input" id="g-prov-nombre" placeholder="Nombre del proveedor" style="flex:1">
+            <input class="input" id="g-prov-cuit" placeholder="CUIT (opcional)" style="width:150px">
+            <button class="btn btn-primary" id="g-prov-crear" type="button" style="padding:6px 12px;font-size:13px">Crear</button>
+          </div>
+        </div>
         <div class="field"><label>N° comprobante (opcional)</label><input class="input" id="g-nro" type="text" placeholder="0001-00001234"></div>
       </div>
 
@@ -307,6 +317,31 @@ function openModalNuevo() {
   const close = () => overlay.remove();
   overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
   $('#g-cancel').addEventListener('click', close);
+
+  // Alta rápida de proveedor (mismo patrón que Compras)
+  $('#g-prov-add').addEventListener('click', () => {
+    const box = $('#g-prov-new');
+    box.style.display = box.style.display === 'none' ? 'flex' : 'none';
+  });
+  $('#g-prov-crear').addEventListener('click', async () => {
+    const nombre = $('#g-prov-nombre').value.trim();
+    if (!nombre) { window.toast('Poné el nombre del proveedor', 'error'); return; }
+    try {
+      const r = await fetch('/proveedores', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nombre, cuit: $('#g-prov-cuit').value.trim() || null })
+      });
+      const p = await r.json();
+      if (!r.ok) throw new Error(p.error || r.statusText);
+      PROVEEDORES.push(p);
+      PROVEEDORES.sort((a, b) => provLabel(a).localeCompare(provLabel(b)));
+      $('#g-prov').innerHTML = '<option value="">— Sin proveedor —</option>' +
+        PROVEEDORES.map(x => `<option value="${x.id}" ${x.id === p.id ? 'selected' : ''}>${esc(provLabel(x))}</option>`).join('');
+      $('#g-prov-new').style.display = 'none';
+      $('#g-prov-nombre').value = ''; $('#g-prov-cuit').value = '';
+      window.toast('Proveedor creado');
+    } catch (e) { window.toast('Error: ' + e.message, 'error'); }
+  });
 
   const compSel = $('#g-comp');
   const monedaSel = $('#g-moneda');
