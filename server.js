@@ -2878,6 +2878,104 @@ app.post('/transferencia-interna', async (req, res) => {
   }
 });
 
+// ── Proveedores: alta rápida (desde Compras o Gastos) ───────────────────
+app.post('/proveedores', async (req, res) => {
+  try {
+    const { nombre, cuit } = req.body || {};
+    if (!nombre || !String(nombre).trim()) return res.status(400).json({ error: 'Falta el nombre del proveedor' });
+    const ins = await sbUpsert('proveedores', {
+      nombre: String(nombre).trim(),
+      cuit: cuit ? String(cuit).trim() : null,
+      activo: true
+    });
+    const p = Array.isArray(ins) ? ins[0] : ins;
+    res.json(p);
+  } catch (e) {
+    console.error('POST /proveedores:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Compras LOCALES: alta atómica (cabecera + componentes + lotes) ──────
+// Solo tipo='local', moneda='ARS'. Las importaciones (USD, prorrateo de
+// nacionalización) son otro flujo, pendiente. Ver ADARA-COMPRAS-IMPORTACIONES.md.
+// El costo del lote = SOLO los productos (neto). IVA / IIBB / Ganancias son
+// componentes fiscales (crédito), entran en el total a pagar pero NO en el costo.
+app.post('/compras', async (req, res) => {
+  const round2 = n => Math.round((Number(n) || 0) * 100) / 100;
+  let compraId = null;
+  try {
+    const { compra, items, fiscales } = req.body || {};
+    if (!compra) return res.status(400).json({ error: 'Falta el objeto compra' });
+    for (const f of ['fecha', 'linea_id']) {
+      if (compra[f] === undefined || compra[f] === null || compra[f] === '') {
+        return res.status(400).json({ error: `Falta ${f}` });
+      }
+    }
+
+    const prods = (Array.isArray(items) ? items : [])
+      .filter(x => x && x.sku_id && Number(x.cantidad) > 0 && Number(x.costo_unitario) >= 0)
+      .map(x => ({ sku_id: +x.sku_id, cantidad: Number(x.cantidad), costo_unitario: round2(x.costo_unitario) }));
+    if (!prods.length) return res.status(400).json({ error: 'Cargá al menos un producto con cantidad y costo' });
+
+    const FISCAL_MAP = { iva: 'iva', iibb: 'iibb_percepcion', ganancias: 'ganancias_percepcion' };
+    const fisc = [];
+    for (const [k, tipo] of Object.entries(FISCAL_MAP)) {
+      const m = round2(fiscales && fiscales[k]);
+      if (m > 0) fisc.push({ tipo, monto: m });
+    }
+
+    // nº de factura → notas (compras no tiene columna dedicada de comprobante)
+    const notas = [
+      compra.nro_factura ? `Factura ${String(compra.nro_factura).trim()}` : null,
+      compra.notas ? String(compra.notas).trim() : null
+    ].filter(Boolean).join(' · ') || null;
+
+    // 1) Cabecera
+    const insCompra = await sbUpsert('compras', {
+      proveedor_id: compra.proveedor_id || null,
+      linea_id: compra.linea_id,
+      tipo: 'local',
+      moneda: 'ARS',
+      tc_blue: null,
+      fecha: compra.fecha,
+      estado: 'activa',
+      notas
+    });
+    const c = Array.isArray(insCompra) ? insCompra[0] : insCompra;
+    if (!c || !c.id) throw new Error('No se obtuvo el id de la compra');
+    compraId = c.id;
+
+    // 2) Componentes de producto + lotes (costo unitario neto en ARS)
+    await sbUpsert('compra_componentes', prods.map(p => ({
+      compra_id: compraId, tipo: 'producto', sku_id: p.sku_id,
+      cantidad: p.cantidad, moneda: 'ARS', monto: round2(p.costo_unitario * p.cantidad)
+    })));
+    await sbUpsert('lotes', prods.map(p => ({
+      sku_id: p.sku_id, compra_id: compraId,
+      cantidad_inicial: p.cantidad, cantidad_actual: p.cantidad,
+      costo_unitario: p.costo_unitario, fecha_alta: compra.fecha
+    })));
+
+    // 3) Componentes fiscales (crédito — no suman al costo del lote)
+    if (fisc.length) {
+      await sbUpsert('compra_componentes', fisc.map(x => ({
+        compra_id: compraId, tipo: x.tipo, moneda: 'ARS', monto: x.monto
+      })));
+    }
+
+    res.json({ ok: true, compra_id: compraId });
+  } catch (e) {
+    console.error('POST /compras:', e);
+    if (compraId) { // rollback best-effort
+      try { await sb('DELETE', 'lotes', null, `compra_id=eq.${compraId}`); } catch {}
+      try { await sb('DELETE', 'compra_componentes', null, `compra_id=eq.${compraId}`); } catch {}
+      try { await sb('DELETE', 'compras', null, `id=eq.${compraId}`); } catch {}
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── START ────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
   console.log(`\n🚀 ADARA Backend corriendo — puerto ${PORT}`);
