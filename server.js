@@ -3073,6 +3073,36 @@ async function arcaGetTA() {
   return ARCA_TA_MEM;
 }
 
+// Diagnóstico seguro de las variables ARCA (no expone el cuerpo de la clave)
+app.get('/padron-diag', (req, res) => {
+  const out = {};
+  for (const n of ['ARCA_CERT', 'ARCA_KEY']) {
+    const raw = process.env[n];
+    if (!raw) { out[n] = { presente: false }; continue; }
+    const s = String(raw);
+    const norm = arcaPem(n);
+    const m = String(norm).match(/-----BEGIN ([A-Z0-9 ]+)-----/);
+    let parse = 'no intentado';
+    try {
+      if (n === 'ARCA_KEY') forge.pki.privateKeyFromPem(norm);
+      else forge.pki.certificateFromPem(norm);
+      parse = 'OK';
+    } catch (e) { parse = 'ERROR: ' + e.message; }
+    out[n] = {
+      presente: true,
+      largo: s.length,
+      tieneBEGIN: /-----BEGIN/.test(s),
+      tieneEND: /-----END/.test(s),
+      saltos_reales: (s.match(/\n/g) || []).length,
+      barra_n_literales: (s.match(/\\n/g) || []).length,
+      tipo_detectado: m ? m[1] : null,
+      parseForge: parse
+    };
+  }
+  out.ARCA_CUIT = process.env.ARCA_CUIT || null;
+  res.json(out);
+});
+
 app.get('/padron/:cuit', async (req, res) => {
   try {
     const cuit = String(req.params.cuit).replace(/\D/g, '');
