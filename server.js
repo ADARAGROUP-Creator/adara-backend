@@ -2884,10 +2884,14 @@ app.post('/proveedores', async (req, res) => {
   try {
     const { nombre, cuit } = req.body || {};
     if (!nombre || !String(nombre).trim()) return res.status(400).json({ error: 'Falta el nombre del proveedor' });
-    if (!cuit || !String(cuit).trim()) return res.status(400).json({ error: 'El CUIT es obligatorio' });
+    const cuitNorm = String(cuit || '').replace(/\D/g, '');
+    if (cuitNorm.length !== 11) return res.status(400).json({ error: 'El CUIT es obligatorio (11 dígitos)' });
+    // No duplicar: si ya existe un proveedor con ese CUIT, lo devolvemos
+    const existentes = await sbGet('proveedores', `cuit=eq.${cuitNorm}`);
+    if (existentes && existentes[0]) return res.json(existentes[0]);
     const ins = await sbUpsert('proveedores', {
       nombre: String(nombre).trim(),
-      cuit: String(cuit).trim(),
+      cuit: cuitNorm,
       activo: true
     });
     const p = Array.isArray(ins) ? ins[0] : ins;
@@ -3139,6 +3143,36 @@ app.get('/padron/:cuit', async (req, res) => {
     res.status(502).json({ error: e.message });
   }
 });
+
+// ── Compras: anular (soft-delete con reversa de stock) ──────────────────
+// Marca la compra como 'anulada', borra sus lotes (revierte el stock) y sus
+// componentes. La cabecera queda como tombstone. Bloquea si ya se vendió stock
+// de esos lotes o si tiene pagos vinculados (hay que desvincular primero).
+app.post('/compras/:id/anular', async (req, res) => {
+  try {
+    const id = +req.params.id;
+    if (!id) return res.status(400).json({ error: 'Falta el id de la compra' });
+    const { motivo } = req.body || {};
+
+    const lotes = await sbGet('lotes', `compra_id=eq.${id}&select=id,cantidad_inicial,cantidad_actual`);
+    if ((lotes || []).some(l => Number(l.cantidad_actual) < Number(l.cantidad_inicial))) {
+      return res.status(409).json({ error: 'No se puede anular: ya se vendió/consumió stock de esta compra' });
+    }
+    const vinc = await sbGet('vinculos', `op_tipo=eq.compra&op_id=eq.${id}&select=id`);
+    if (vinc && vinc.length) {
+      return res.status(409).json({ error: 'No se puede anular: tiene pagos vinculados. Desvinculá primero desde Conciliación.' });
+    }
+
+    await sbPatch('compras', `id=eq.${id}`, { estado: 'anulada', motivo: motivo ? String(motivo).slice(0, 500) : 'anulada manualmente' });
+    await sb('DELETE', 'lotes', null, `compra_id=eq.${id}`);
+    await sb('DELETE', 'compra_componentes', null, `compra_id=eq.${id}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('POST /compras/:id/anular:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 
 // ── START ────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
