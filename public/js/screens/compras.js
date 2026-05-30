@@ -115,6 +115,7 @@ function renderFacturas() {
             <th style="width:140px;text-align:right">Pagado</th>
             <th style="width:140px;text-align:right">Saldo</th>
             <th style="width:96px">Pago</th>
+            <th style="width:64px"></th>
           </tr></thead>
           <tbody>${filtradas.map(filaCompra).join('')}</tbody>
         </table></div>`}
@@ -123,6 +124,7 @@ function renderFacturas() {
   document.getElementById('cf-periodo').addEventListener('change', e => { FILTRO.periodo = e.target.value; renderFacturas(); });
   document.getElementById('cf-q').addEventListener('input', e => { FILTRO.q = e.target.value; renderFacturas(); });
   document.getElementById('cf-nueva').addEventListener('click', openAlta);
+  document.querySelectorAll('.com-anular').forEach(b => b.addEventListener('click', () => anularCompra(+b.dataset.id)));
 }
 
 function filaCompra(c) {
@@ -135,7 +137,25 @@ function filaCompra(c) {
     <td style="text-align:right" class="com-mono com-muted">${money(c.pagado_ars)}</td>
     <td style="text-align:right" class="com-mono">${money(c.saldo_ap_ars)}</td>
     <td><span class="com-badge com-badge-${est}">${est}</span></td>
+    <td style="text-align:right"><button class="com-anular" data-id="${c.compra_id}" title="Anular compra" style="font-size:12px;color:#B91C1C;background:none;border:0;cursor:pointer;font:inherit;padding:2px 4px">Anular</button></td>
   </tr>`;
+}
+
+async function anularCompra(id) {
+  const motivo = prompt('Anular esta compra: se quita su stock (lotes) y deja de contar para cuentas por pagar.\n\nMotivo:');
+  if (motivo == null) return;
+  if (!motivo.trim()) { window.toast('Necesitás un motivo para anular', 'error'); return; }
+  try {
+    const r = await fetch('/compras/' + id + '/anular', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ motivo: motivo.trim() })
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || (r.status + ' ' + r.statusText));
+    window.toast('Compra anulada');
+    await recargar();
+    renderFacturas();
+  } catch (e) { window.toast('Error: ' + e.message, 'error'); }
 }
 
 // ── Pestaña Cuenta corriente ──────────────────────────────────────────────
@@ -280,26 +300,27 @@ function openAlta() {
   }
   $('#c-prov-cuit').addEventListener('blur', buscarPadronProv);
 
-  $('#c-prov-crear').addEventListener('click', async () => {
+  // Crea (o reutiliza por CUIT) el proveedor a partir del alta rápida. Devuelve el proveedor o null.
+  async function crearProveedorDesdeCuit() {
     const cuit = $('#c-prov-cuit').value.replace(/\D/g, '');
-    if (cuit.length !== 11) { window.toast('El CUIT es obligatorio (11 dígitos)', 'error'); return; }
+    if (cuit.length !== 11) { window.toast('El CUIT es obligatorio (11 dígitos)', 'error'); return null; }
     if (!$('#c-prov-nombre').value.trim()) await buscarPadronProv();
     const nombre = $('#c-prov-nombre').value.trim();
-    if (!nombre) { window.toast('No se pudo traer el nombre desde ARCA; revisá el CUIT o escribilo a mano', 'error'); return; }
+    if (!nombre) { window.toast('No se pudo traer el nombre desde ARCA; revisá el CUIT o escribilo a mano', 'error'); return null; }
     try {
-      const r = await fetch('/proveedores', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nombre, cuit })
-      });
+      const r = await fetch('/proveedores', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nombre, cuit }) });
       const p = await r.json();
       if (!r.ok) throw new Error(p.error || r.statusText);
-      PROVEEDORES.push(p); PROV_BY_ID[p.id] = p;
-      PROVEEDORES.sort((a, b) => provLabel(a).localeCompare(provLabel(b)));
+      if (!PROV_BY_ID[p.id]) { PROVEEDORES.push(p); PROV_BY_ID[p.id] = p; PROVEEDORES.sort((a, b) => provLabel(a).localeCompare(provLabel(b))); }
       $('#c-prov').innerHTML = optProv(p.id);
       $('#c-prov-new').style.display = 'none';
       $('#c-prov-nombre').value = ''; $('#c-prov-cuit').value = ''; $('#c-prov-status').textContent = '';
-      window.toast('Proveedor creado');
-    } catch (e) { window.toast('Error: ' + e.message, 'error'); }
+      return p;
+    } catch (e) { window.toast('Error: ' + e.message, 'error'); return null; }
+  }
+  $('#c-prov-crear').addEventListener('click', async () => {
+    const p = await crearProveedorDesdeCuit();
+    if (p) window.toast('Proveedor listo');
   });
 
   // Ítems
@@ -385,9 +406,16 @@ function openAlta() {
       .map(it => ({ sku_id: +it.sku_id, cantidad: num(it.cantidad), costo_unitario: num(it.costo) }));
     if (!items.length) { window.toast('Cargá al menos un producto con SKU, cantidad y costo', 'error'); return; }
 
+    // Si quedó un CUIT cargado en el alta rápida y no se creó el proveedor, lo creamos ahora
+    let provId = $('#c-prov').value ? +$('#c-prov').value : null;
+    if (!provId && $('#c-prov-cuit').value.replace(/\D/g, '').length === 11) {
+      const np = await crearProveedorDesdeCuit();
+      if (np) provId = np.id;
+    }
+
     const payload = {
       compra: {
-        proveedor_id: $('#c-prov').value ? +$('#c-prov').value : null,
+        proveedor_id: provId,
         linea_id: +linea_id,
         fecha,
         nro_factura: $('#c-factura').value.trim() || null
