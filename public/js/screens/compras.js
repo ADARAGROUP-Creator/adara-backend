@@ -9,7 +9,7 @@ import { sbGet } from '../core/sb.js';
 
 let LINEAS = [], LINEA_LABEL = {};
 let PROVEEDORES = [], PROV_BY_ID = {};
-let SKUS = [];
+let SKUS = [], SKU_BY_ID = {};
 let COMPRAS = [];     // v_compras_ap
 let GASTOS_AP = [];   // v_gastos_ap (para cuenta corriente)
 let TAB = 'facturas';
@@ -30,7 +30,8 @@ export async function loadCompras() {
   try {
     LINEAS = await sbGet('lineas_negocio', 'order=id.asc');
     LINEA_LABEL = Object.fromEntries(LINEAS.map(l => [l.id, lineaLabel(l)]));
-    SKUS = await sbGet('skus', 'activo=eq.true&order=codigo.asc&select=id,codigo,descripcion');
+    SKUS = await sbGet('skus', 'activo=eq.true&order=codigo.asc&select=id,codigo,descripcion,alicuota_iva');
+    SKU_BY_ID = Object.fromEntries(SKUS.map(s => [s.id, s]));
     await recargar();
   } catch (e) {
     root.innerHTML = `<div class="error">No se pudo cargar Compras: ${e.message}</div>`;
@@ -197,7 +198,7 @@ function filaCC(f) {
 let ITEMS = [];
 
 function openAlta() {
-  ITEMS = [{ sku_id: '', cantidad: '', costo: '' }];
+  ITEMS = [{ sku_id: '', cantidad: '', costo: '', iva: 0.21 }];
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.innerHTML = `
@@ -210,10 +211,15 @@ function openAlta() {
           <select class="select" id="c-prov" style="flex:1">${optProv()}</select>
           <button class="btn btn-ghost com-mini" id="c-prov-add" type="button">+ Nuevo</button>
         </div>
-        <div id="c-prov-new" style="display:none;gap:8px;margin-top:8px">
-          <input class="input" id="c-prov-nombre" placeholder="Nombre del proveedor" style="flex:1">
-          <input class="input" id="c-prov-cuit" placeholder="CUIT (opcional)" style="width:150px">
-          <button class="btn btn-primary com-mini" id="c-prov-crear" type="button">Crear</button>
+        <div id="c-prov-new" style="display:none;flex-direction:column;gap:8px;margin-top:8px">
+          <div style="display:flex;gap:8px;align-items:center">
+            <input class="input" id="c-prov-cuit" placeholder="CUIT (sin guiones)" style="width:200px">
+            <span id="c-prov-status" style="font-size:12px;color:#78716C"></span>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input class="input" id="c-prov-nombre" placeholder="Nombre (se completa con el CUIT)" style="flex:1">
+            <button class="btn btn-primary com-mini" id="c-prov-crear" type="button">Crear</button>
+          </div>
         </div>
       </div>
 
@@ -231,7 +237,7 @@ function openAlta() {
       <div class="com-block">
         <div class="com-block-h"><span>Impuestos de la factura (crédito fiscal — no son costo)</span></div>
         <div class="com-row3">
-          <div class="field"><label>IVA</label><input class="input com-fisc" id="c-iva" inputmode="decimal" placeholder="0,00"></div>
+          <div class="field"><label>IVA (automático)</label><input class="input" id="c-iva-disp" readonly value="$ 0,00"></div>
           <div class="field"><label>Percepción IIBB</label><input class="input com-fisc" id="c-iibb" inputmode="decimal" placeholder="0,00"></div>
           <div class="field"><label>Percepción Ganancias</label><input class="input com-fisc" id="c-gan" inputmode="decimal" placeholder="0,00"></div>
         </div>
@@ -255,13 +261,35 @@ function openAlta() {
     const box = $('#c-prov-new');
     box.style.display = box.style.display === 'none' ? 'flex' : 'none';
   });
+  async function buscarPadronProv() {
+    const cuit = $('#c-prov-cuit').value.replace(/\D/g, '');
+    const st = $('#c-prov-status');
+    if (cuit.length !== 11) { st.textContent = cuit.length ? '⚠ El CUIT debe tener 11 dígitos' : ''; return null; }
+    st.textContent = 'Buscando en ARCA…'; st.style.color = '#78716C';
+    try {
+      const r = await fetch('/padron/' + cuit);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || 'no encontrado');
+      if (d.nombre) $('#c-prov-nombre').value = d.nombre;
+      st.textContent = '✓ ' + d.nombre + (d.estado ? ' · ' + d.estado : ''); st.style.color = '#0F6E56';
+      return d.nombre;
+    } catch (e) {
+      st.textContent = '⚠ ' + e.message; st.style.color = '#B91C1C';
+      return null;
+    }
+  }
+  $('#c-prov-cuit').addEventListener('blur', buscarPadronProv);
+
   $('#c-prov-crear').addEventListener('click', async () => {
+    const cuit = $('#c-prov-cuit').value.replace(/\D/g, '');
+    if (cuit.length !== 11) { window.toast('El CUIT es obligatorio (11 dígitos)', 'error'); return; }
+    if (!$('#c-prov-nombre').value.trim()) await buscarPadronProv();
     const nombre = $('#c-prov-nombre').value.trim();
-    if (!nombre) { window.toast('Poné el nombre del proveedor', 'error'); return; }
+    if (!nombre) { window.toast('No se pudo traer el nombre desde ARCA; revisá el CUIT o escribilo a mano', 'error'); return; }
     try {
       const r = await fetch('/proveedores', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nombre, cuit: $('#c-prov-cuit').value.trim() || null })
+        body: JSON.stringify({ nombre, cuit })
       });
       const p = await r.json();
       if (!r.ok) throw new Error(p.error || r.statusText);
@@ -269,7 +297,7 @@ function openAlta() {
       PROVEEDORES.sort((a, b) => provLabel(a).localeCompare(provLabel(b)));
       $('#c-prov').innerHTML = optProv(p.id);
       $('#c-prov-new').style.display = 'none';
-      $('#c-prov-nombre').value = ''; $('#c-prov-cuit').value = '';
+      $('#c-prov-nombre').value = ''; $('#c-prov-cuit').value = ''; $('#c-prov-status').textContent = '';
       window.toast('Proveedor creado');
     } catch (e) { window.toast('Error: ' + e.message, 'error'); }
   });
@@ -282,6 +310,12 @@ function openAlta() {
         <select class="select com-it-sku"><option value="">SKU…</option>${SKUS.map(s => `<option value="${s.id}" ${String(it.sku_id) === String(s.id) ? 'selected' : ''}>${esc(skuLabel(s))}</option>`).join('')}</select>
         <input class="input com-it-cant" inputmode="decimal" placeholder="Cant." value="${esc(it.cantidad)}">
         <input class="input com-it-costo" inputmode="decimal" placeholder="Costo unit." value="${esc(it.costo)}">
+        <select class="select com-it-iva">
+          <option value="0.21" ${num(it.iva) === 0.21 ? 'selected' : ''}>IVA 21%</option>
+          <option value="0.105" ${num(it.iva) === 0.105 ? 'selected' : ''}>IVA 10,5%</option>
+          <option value="0.27" ${num(it.iva) === 0.27 ? 'selected' : ''}>IVA 27%</option>
+          <option value="0" ${num(it.iva) === 0 ? 'selected' : ''}>Exento</option>
+        </select>
         <span class="com-it-sub com-mono">${money(num(it.cantidad) * num(it.costo))}</span>
         <button class="com-it-del" type="button" title="Quitar" ${ITEMS.length === 1 ? 'style="visibility:hidden"' : ''}>✕</button>
       </div>`).join('');
@@ -293,6 +327,7 @@ function openAlta() {
       ITEMS[i].sku_id = row.querySelector('.com-it-sku').value;
       ITEMS[i].cantidad = row.querySelector('.com-it-cant').value;
       ITEMS[i].costo = row.querySelector('.com-it-costo').value;
+      ITEMS[i].iva = Number(row.querySelector('.com-it-iva').value);
     });
   };
   itemsBox.addEventListener('input', e => {
@@ -305,22 +340,34 @@ function openAlta() {
     }
   });
   itemsBox.addEventListener('change', e => {
+    const row = e.target.closest('.com-item'); if (!row) return;
+    const i = +row.dataset.i;
     if (e.target.matches('.com-it-sku')) {
-      const row = e.target.closest('.com-item'); ITEMS[+row.dataset.i].sku_id = e.target.value;
+      leerItems();
+      ITEMS[i].sku_id = e.target.value;
+      const s = SKU_BY_ID[e.target.value];
+      if (s && s.alicuota_iva != null) ITEMS[i].iva = Number(s.alicuota_iva);
+      pintarItems(); // refresca el % de IVA de la fila según el SKU
+    } else if (e.target.matches('.com-it-iva')) {
+      ITEMS[i].iva = Number(e.target.value);
+      pintarResumen();
     }
   });
   itemsBox.addEventListener('click', e => {
     if (e.target.matches('.com-it-del')) { leerItems(); ITEMS.splice(+e.target.closest('.com-item').dataset.i, 1); pintarItems(); }
   });
-  $('#c-add-item').addEventListener('click', () => { leerItems(); ITEMS.push({ sku_id: '', cantidad: '', costo: '' }); pintarItems(); });
+  $('#c-add-item').addEventListener('click', () => { leerItems(); ITEMS.push({ sku_id: '', cantidad: '', costo: '', iva: 0.21 }); pintarItems(); });
 
+  const ivaTotal = () => ITEMS.reduce((s, it) => s + num(it.cantidad) * num(it.costo) * num(it.iva), 0);
   const pintarResumen = () => {
     const neto = ITEMS.reduce((s, it) => s + num(it.cantidad) * num(it.costo), 0);
-    const iva = num($('#c-iva').value), iibb = num($('#c-iibb').value), gan = num($('#c-gan').value);
+    const iva = ivaTotal();
+    const iibb = num($('#c-iibb').value), gan = num($('#c-gan').value);
     const total = neto + iva + iibb + gan;
+    const disp = $('#c-iva-disp'); if (disp) disp.value = money(iva);
     $('#c-resumen').innerHTML = `
       <div class="com-res-r"><span>Productos (neto, va al costo)</span><span class="com-mono">${money(neto)}</span></div>
-      <div class="com-res-r com-muted"><span>+ IVA · IIBB · Ganancias (crédito)</span><span class="com-mono">${money(iva + iibb + gan)}</span></div>
+      <div class="com-res-r com-muted"><span>+ IVA (auto) · IIBB · Ganancias (crédito)</span><span class="com-mono">${money(iva + iibb + gan)}</span></div>
       <div class="com-res-r com-res-strong"><span>Total factura (lo que le debés)</span><span class="com-mono">${money(total)}</span></div>`;
   };
   overlay.querySelectorAll('.com-fisc').forEach(el => el.addEventListener('input', pintarResumen));
@@ -346,7 +393,7 @@ function openAlta() {
         nro_factura: $('#c-factura').value.trim() || null
       },
       items,
-      fiscales: { iva: num($('#c-iva').value), iibb: num($('#c-iibb').value), ganancias: num($('#c-gan').value) }
+      fiscales: { iva: ivaTotal(), iibb: num($('#c-iibb').value), ganancias: num($('#c-gan').value) }
     };
 
     const btn = $('#c-guardar'); btn.disabled = true;
@@ -389,7 +436,7 @@ function inyectarEstilo() {
     .com-row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
     .com-block{border:1px solid #E7E5E4;border-radius:10px;padding:12px;margin:12px 0}
     .com-block-h{display:flex;justify-content:space-between;align-items:center;font-size:13px;font-weight:600;color:#44403C;margin-bottom:8px}
-    .com-item{display:grid;grid-template-columns:1fr 90px 130px 120px 28px;gap:8px;align-items:center;margin-bottom:8px}
+    .com-item{display:grid;grid-template-columns:1fr 70px 108px 108px 96px 26px;gap:8px;align-items:center;margin-bottom:8px}
     .com-it-sub{text-align:right;font-size:13px;color:#57534E}
     .com-it-del{border:0;background:transparent;color:#A8A29E;cursor:pointer;font-size:14px}
     .com-it-del:hover{color:#B91C1C}
