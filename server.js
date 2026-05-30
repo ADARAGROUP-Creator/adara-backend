@@ -2997,10 +2997,16 @@ function cuitValido(cuit) {
 }
 
 function arcaPem(name) {
-  let v = process.env[name];
-  if (!v) return null;
-  // Por si Railway guardó los saltos como \n literales
-  return (v.includes('\\n') && !v.includes('\n')) ? v.replace(/\\n/g, '\n') : v;
+  const raw = process.env[name];
+  if (!raw) return null;
+  // Reconstruye un PEM válido aunque Railway haya aplastado los saltos de línea
+  // (los convierta en espacios, los elimine, o los deje como \n literales).
+  let s = String(raw).trim().replace(/\\r\\n|\\n|\\r/g, '\n').replace(/\r/g, '');
+  const m = s.match(/-----BEGIN ([A-Z0-9 ]+)-----([\s\S]*?)-----END \1-----/);
+  if (!m) return s; // no parece PEM: dejamos que forge tire el error claro
+  const body = (m[2].match(/[A-Za-z0-9+/=]+/g) || []).join('');
+  const wrapped = body.replace(/.{1,64}/g, '$&\n').trimEnd();
+  return `-----BEGIN ${m[1]}-----\n${wrapped}\n-----END ${m[1]}-----\n`;
 }
 
 function arcaBuildTRA(service) {
