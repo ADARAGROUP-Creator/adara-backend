@@ -14,6 +14,7 @@ const cron    = require('node-cron');
 const fetch   = require('node-fetch');
 const multer  = require('multer');
 const XLSX    = require('xlsx');
+const forge   = require('node-forge');
 
 const app    = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -2883,9 +2884,10 @@ app.post('/proveedores', async (req, res) => {
   try {
     const { nombre, cuit } = req.body || {};
     if (!nombre || !String(nombre).trim()) return res.status(400).json({ error: 'Falta el nombre del proveedor' });
+    if (!cuit || !String(cuit).trim()) return res.status(400).json({ error: 'El CUIT es obligatorio' });
     const ins = await sbUpsert('proveedores', {
       nombre: String(nombre).trim(),
-      cuit: cuit ? String(cuit).trim() : null,
+      cuit: String(cuit).trim(),
       activo: true
     });
     const p = Array.isArray(ins) ? ins[0] : ins;
@@ -2973,6 +2975,132 @@ app.post('/compras', async (req, res) => {
       try { await sb('DELETE', 'compras', null, `id=eq.${compraId}`); } catch {}
     }
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ── ARCA: consulta de padrón (constancia de inscripción) ────────────────
+// CUIT -> razón social, vía WSAA (LoginCms) + servicio ws_sr_constancia_inscripcion.
+// Variables de entorno necesarias: ARCA_CERT, ARCA_KEY, ARCA_CUIT.
+// El Ticket de Acceso (TA) se cachea en memoria y, si existe la tabla opcional
+// arca_ta, también en Supabase (sobrevive a reinicios y evita el error de ARCA
+// "el CEE ya posee un TA válido"). Si la tabla no existe, usa solo memoria.
+const ARCA_WSAA   = 'https://wsaa.afip.gov.ar/ws/services/LoginCms';
+const ARCA_PADRON = 'https://aws.afip.gov.ar/sr-padron/webservices/personaServiceA5';
+let ARCA_TA_MEM = null; // { token, sign, exp(ms) }
+
+function cuitValido(cuit) {
+  if (!/^\d{11}$/.test(cuit)) return false;
+  const m = [5, 4, 3, 2, 7, 6, 5, 4, 3, 2];
+  let s = 0; for (let i = 0; i < 10; i++) s += parseInt(cuit[i], 10) * m[i];
+  let v = 11 - (s % 11); if (v === 11) v = 0; if (v === 10) v = 9;
+  return v === parseInt(cuit[10], 10);
+}
+
+function arcaPem(name) {
+  let v = process.env[name];
+  if (!v) return null;
+  // Por si Railway guardó los saltos como \n literales
+  return (v.includes('\\n') && !v.includes('\n')) ? v.replace(/\\n/g, '\n') : v;
+}
+
+function arcaBuildTRA(service) {
+  const now = Date.now();
+  const fmt = d => new Date(d).toISOString().replace(/\.\d{3}Z$/, 'Z'); // UTC
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<loginTicketRequest version="1.0">
+<header><uniqueId>${Math.floor(now / 1000)}</uniqueId><generationTime>${fmt(now - 600000)}</generationTime><expirationTime>${fmt(now + 600000)}</expirationTime></header>
+<service>${service}</service>
+</loginTicketRequest>`;
+}
+
+function arcaSignTRA(tra) {
+  const certPem = arcaPem('ARCA_CERT'), keyPem = arcaPem('ARCA_KEY');
+  if (!certPem || !keyPem) throw new Error('Faltan ARCA_CERT / ARCA_KEY en las variables de entorno');
+  let cert, key;
+  try { cert = forge.pki.certificateFromPem(certPem); } catch { throw new Error('ARCA_CERT no es un certificado PEM válido (revisá que se hayan respetado los saltos de línea)'); }
+  try { key = forge.pki.privateKeyFromPem(keyPem); } catch { throw new Error('ARCA_KEY no es una clave PEM válida (revisá que se hayan respetado los saltos de línea)'); }
+  const p7 = forge.pkcs7.createSignedData();
+  p7.content = forge.util.createBuffer(tra, 'utf8');
+  p7.addCertificate(cert);
+  p7.addSigner({
+    key, certificate: cert, digestAlgorithm: forge.pki.oids.sha256,
+    authenticatedAttributes: [
+      { type: forge.pki.oids.contentType, value: forge.pki.oids.data },
+      { type: forge.pki.oids.messageDigest },
+      { type: forge.pki.oids.signingTime, value: new Date() }
+    ]
+  });
+  p7.sign();
+  return forge.util.encode64(forge.asn1.toDer(p7.toAsn1()).getBytes());
+}
+
+const arcaUnesc = s => String(s).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+
+async function arcaGetTA() {
+  // 1) memoria
+  if (ARCA_TA_MEM && ARCA_TA_MEM.exp > Date.now() + 60000) return ARCA_TA_MEM;
+  // 2) Supabase (si existe la tabla arca_ta)
+  try {
+    const rows = await sbGet('arca_ta', 'id=eq.1');
+    if (rows && rows[0] && rows[0].expiration && Date.parse(rows[0].expiration) > Date.now() + 60000) {
+      ARCA_TA_MEM = { token: rows[0].token, sign: rows[0].sign, exp: Date.parse(rows[0].expiration) };
+      return ARCA_TA_MEM;
+    }
+  } catch (_) { /* tabla inexistente: seguimos solo con memoria */ }
+
+  // 3) login nuevo
+  const cms = arcaSignTRA(arcaBuildTRA('ws_sr_constancia_inscripcion'));
+  const env = `<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:wsaa="http://wsaa.view.sua.dvadac.desein.afip.gov">
+<soapenv:Header/><soapenv:Body><wsaa:loginCms><wsaa:in0>${cms}</wsaa:in0></wsaa:loginCms></soapenv:Body></soapenv:Envelope>`;
+  const r = await fetch(ARCA_WSAA, { method: 'POST', headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': '' }, body: env });
+  const xml = await r.text();
+  const fault = xml.match(/<faultstring>([\s\S]*?)<\/faultstring>/i);
+  if (fault) throw new Error('WSAA rechazó el login: ' + arcaUnesc(fault[1]).trim());
+  const ta = arcaUnesc(xml);
+  const token = (ta.match(/<token>([^<]+)<\/token>/) || [])[1];
+  const sign = (ta.match(/<sign>([^<]+)<\/sign>/) || [])[1];
+  const exp = (ta.match(/<expirationTime>([^<]+)<\/expirationTime>/) || [])[1];
+  if (!token || !sign) throw new Error('WSAA no devolvió token/sign. Respuesta: ' + xml.slice(0, 300));
+  ARCA_TA_MEM = { token, sign, exp: exp ? Date.parse(exp) : Date.now() + 11 * 3600 * 1000 };
+  try { await sbUpsert('arca_ta', { id: 1, token, sign, expiration: new Date(ARCA_TA_MEM.exp).toISOString() }, 'id'); } catch (_) {}
+  return ARCA_TA_MEM;
+}
+
+app.get('/padron/:cuit', async (req, res) => {
+  try {
+    const cuit = String(req.params.cuit).replace(/\D/g, '');
+    if (!cuitValido(cuit)) return res.status(400).json({ error: 'CUIT inválido (no pasa el dígito verificador)', cuit });
+    const repres = (process.env.ARCA_CUIT || '').replace(/\D/g, '');
+    if (!repres) return res.status(500).json({ error: 'Falta ARCA_CUIT en las variables de entorno' });
+
+    const ta = await arcaGetTA();
+    const env = `<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:a5="http://a5.soap.ws.server.puc.sr/">
+<soapenv:Header/><soapenv:Body><a5:getPersona_v2>
+<token>${ta.token}</token><sign>${ta.sign}</sign>
+<cuitRepresentada>${repres}</cuitRepresentada><idPersona>${cuit}</idPersona>
+</a5:getPersona_v2></soapenv:Body></soapenv:Envelope>`;
+    const r = await fetch(ARCA_PADRON, { method: 'POST', headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': '' }, body: env });
+    const xml = await r.text();
+
+    const fault = xml.match(/<faultstring>([\s\S]*?)<\/faultstring>/i);
+    if (fault) {
+      const msg = arcaUnesc(fault[1]).trim();
+      if (/no existe persona/i.test(msg)) return res.status(404).json({ error: 'No se encontró ese CUIT en el padrón', cuit });
+      return res.status(502).json({ error: 'ARCA (padrón) devolvió: ' + msg });
+    }
+
+    const grab = t => { const m = xml.match(new RegExp(`<${t}>([^<]*)</${t}>`)); return m ? m[1].trim() : null; };
+    const razon = grab('razonSocial');
+    const nombre = grab('nombre'), apellido = grab('apellido');
+    const display = razon || [apellido, nombre].filter(Boolean).join(', ') || null;
+    if (!display) return res.status(404).json({ error: 'No se pudo leer la razón social del padrón', cuit, raw: xml.slice(0, 400) });
+
+    res.json({ cuit, nombre: display, tipoPersona: grab('tipoPersona'), estado: grab('estadoClave') });
+  } catch (e) {
+    console.error('GET /padron:', e);
+    res.status(502).json({ error: e.message });
   }
 });
 
