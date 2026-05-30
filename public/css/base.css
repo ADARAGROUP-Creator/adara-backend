@@ -133,6 +133,7 @@ table.t tbody tr.inactive .col-desc{text-decoration:line-through}
 .modal{
   background:var(--surface);border-radius:var(--r);border:1px solid var(--border);
   width:100%;max-width:480px;padding:24px 26px;
+  max-height:calc(100vh - 40px);overflow-y:auto;
   box-shadow:0 20px 50px rgba(0,0,0,0.15);
   animation:slideUp 0.2s ease-out;
 }
