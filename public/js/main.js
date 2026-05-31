@@ -2,6 +2,7 @@ import { initSB } from './core/sb.js';
 import { loadHome } from './screens/home.js';
 import { loadSkus } from './screens/skus.js';
 import { loadMovimientos } from './screens/movimientos.js';
+import { loadVentasML } from './screens/ventas-ml.js';
 import { loadGastos } from './screens/gastos.js';
 import { loadConciliacion } from './screens/conciliacion.js';
 import { loadCompras } from './screens/compras.js';
@@ -10,6 +11,7 @@ const screens = {
   home: { fn: loadHome, title: 'Home', sub: 'Resumen del estado actual' },
   skus: { fn: loadSkus, title: 'SKUs', sub: 'Catálogo de productos' },
   movimientos: { fn: loadMovimientos, title: 'Movimientos', sub: 'Extracto unificado de cuentas' },
+  ventas_ml: { fn: loadVentasML, title: 'Ventas ML', sub: 'Ventas de Mercado Libre y su cobro' },
   conciliacion: { fn: loadConciliacion, title: 'Conciliación', sub: 'Vincular movimientos con operaciones' },
   gastos: { fn: loadGastos, title: 'Gastos', sub: 'Gastos operativos' },
   compras: { fn: loadCompras, title: 'Compras', sub: 'Facturas de mercadería y cuenta corriente' }
