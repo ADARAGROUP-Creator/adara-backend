@@ -132,9 +132,9 @@ function render() {
       ${pills}
       ${visibles.length === 0
         ? `<div class="empty" style="margin-top:14px">No hay ventas en este filtro para el ${esc(ddmm(FECHA))}.</div>`
-        : `<div class="table-wrap" style="margin-top:14px"><table class="t">
+        : `<div class="table-wrap" style="margin-top:14px"><table class="t" id="vml-tabla">
             <thead><tr>
-              <th style="width:48px">Hora</th>
+              <th style="width:130px"># Venta</th>
               <th>Producto</th>
               <th style="width:70px">SKU</th>
               <th style="width:38px;text-align:right">Cant</th>
@@ -185,7 +185,9 @@ function filaHTML(v) {
   }
 
   return `<tr class="${rowCls}">
-    <td class="vml-mono">${esc(v.hora_venta ? v.hora_venta.slice(0, 5) : '—')}</td>
+    <td class="vml-mono">${v.ml_order_id
+      ? `<a class="vml-venta-id" href="https://www.mercadolibre.com.ar/ventas/${encodeURIComponent(v.ml_order_id)}/detalle" target="_blank" rel="noopener" title="Abrir la venta en Mercado Libre">${esc(v.ml_order_id)}</a>`
+      : '—'}</td>
     <td>${esc(v.titulo || '—')}</td>
     <td class="vml-mono">${esc(v.sku || '—')}</td>
     <td style="text-align:right">${v.cantidad || 1}</td>
@@ -270,6 +272,8 @@ function inyectarEstilo() {
     .vml-pos{color:#15803D}
     .vml-neg{color:#B91C1C}
     .vml-cero{color:#C7C2BC}
+    .vml-venta-id{color:#0C447C;text-decoration:none;border-bottom:1px dashed #9DB6D4}
+    .vml-venta-id:hover{color:#D97706;border-bottom-color:#D97706}
     .vml-est{font-size:12px;padding:2px 8px;border-radius:6px;background:#F1EFE8;color:#57534E}
     .vml-est-canc{background:#FBEAEA;color:#B42318}
     .vml-est-dev{background:#FAF1E1;color:#92500A}
