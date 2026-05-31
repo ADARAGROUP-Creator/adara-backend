@@ -1,13 +1,14 @@
 import { sbGet } from '../core/sb.js';
 
-// ── Pantalla: Ventas ML (solo lectura) ─────────────────────────────────
+// ── Pantalla: Ventas ML (solo lectura + sincronización) ────────────────
 // Lista las ventas de ML día por día con sus números reales (bruto, comisión,
 // envío, por cobrar) y cruza cada venta contra los cobros del extracto de MP
 // para mostrar cuáles ya se liquidaron y cuáles no.
 //
-// Esta versión NO concilia nada — es para validar que el sync trajo bien los
-// datos y que el cruce venta ↔ cobro funciona, antes de sumar el botón de
-// conciliar. El cruce se hace por mp_payment_id (el REFERENCE_ID del extracto
+// El botón "Sincronizar" dispara POST /ml/sync (trae las ventas de ML al rango
+// elegido). Esta versión NO concilia nada — es para validar que el sync trajo
+// bien los datos y que el cruce venta ↔ cobro funciona, antes de sumar el botón
+// de conciliar. El cruce se hace por mp_payment_id (el REFERENCE_ID del extracto
 // queda embebido en movimientos.referencia_externa como "fecha|REF|monto|saldo").
 
 let VENTAS = [];          // todas las ventas_ml
@@ -18,13 +19,13 @@ let FECHA = '';           // día seleccionado
 const money = n => '$ ' + Math.abs(Number(n) || 0).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const ddmm = f => `${(f || '').slice(8, 10)}/${(f || '').slice(5, 7)}`;
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const hoyISO = () => new Date().toISOString().slice(0, 10);
 const fechaLarga = f => {
   if (!f) return '—';
   const [y, m, d] = f.split('-');
   return new Date(+y, +m - 1, +d).toLocaleDateString('es-AR', { weekday: 'long', day: 'numeric', month: 'long' });
 };
 
-// Estado legible de la venta
 function estadoVenta(v) {
   if (v.ml_status === 'cancelled') return { txt: 'Cancelada', cls: 'canc' };
   if (v.devuelta) return { txt: 'Devuelta', cls: 'dev' };
@@ -32,7 +33,6 @@ function estadoVenta(v) {
   return { txt: map[v.estado_envio] || (v.estado_envio || '—'), cls: '' };
 }
 
-// IDs de pago de una venta (puede tener varios en split payment)
 function paymentIds(v) {
   const ids = [];
   if (v.mp_payment_id) ids.push(String(v.mp_payment_id).trim());
@@ -40,12 +40,9 @@ function paymentIds(v) {
   return [...new Set(ids)];
 }
 
-// Busca los cobros del extracto que matchean los payment_ids de la venta
 function matchCobros(v) {
   const cobros = [];
-  for (const id of paymentIds(v)) {
-    if (COBROS_BY_REF[id]) cobros.push(COBROS_BY_REF[id]);
-  }
+  for (const id of paymentIds(v)) if (COBROS_BY_REF[id]) cobros.push(COBROS_BY_REF[id]);
   return cobros;
 }
 
@@ -54,8 +51,6 @@ export async function loadVentasML() {
   root.innerHTML = `<div class="loading">Cargando ventas de ML…</div>`;
   try {
     VENTAS = await sbGet('ventas_ml', 'order=fecha.asc,hora_venta.asc');
-    // Cobros del extracto de MP (liquidaciones). El REFERENCE_ID está en la
-    // posición 1 de referencia_externa = "fecha|REF|monto|saldo".
     const cobros = await sbGet('movimientos', 'categoria=eq.cobro_venta&order=fecha.asc');
     COBROS_BY_REF = {};
     for (const c of cobros) {
@@ -63,8 +58,7 @@ export async function loadVentasML() {
       if (ref) COBROS_BY_REF[ref.trim()] = c;
     }
   } catch (e) {
-    root.innerHTML = `<div class="error">No se pudieron cargar las ventas: ${esc(e.message)}<br><br>
-      Si la tabla <b>ventas_ml</b> está vacía, corré primero el sync de ML.</div>`;
+    root.innerHTML = `<div class="error">No se pudieron cargar las ventas: ${esc(e.message)}</div>`;
     return;
   }
 
@@ -79,67 +73,68 @@ function pasoDia(delta) {
   if (!DIAS.length) return;
   let i = DIAS.indexOf(FECHA);
   if (i === -1) i = DIAS.length - 1;
-  const j = Math.min(DIAS.length - 1, Math.max(0, i + delta));
-  FECHA = DIAS[j];
+  FECHA = DIAS[Math.min(DIAS.length - 1, Math.max(0, i + delta))];
   render();
 }
 
 function render() {
   const root = document.getElementById('app-screens');
+  const hayVentas = VENTAS.length > 0;
+  const delDia = hayVentas ? VENTAS.filter(v => v.fecha === FECHA) : [];
 
-  if (!VENTAS.length) {
-    root.innerHTML = `<div class="empty">Todavía no hay ventas cargadas. Corré el sync de ML y volvé a entrar.</div>`;
-    return;
-  }
-
-  const delDia = VENTAS.filter(v => v.fecha === FECHA);
-
-  // KPIs del día
   const totBruto = delDia.reduce((s, v) => s + (Number(v.importe_bruto) || 0), 0);
   const totCobrar = delDia.reduce((s, v) => s + (Number(v.por_cobrar) || 0), 0);
   const conCobro = delDia.filter(v => matchCobros(v).length > 0).length;
 
   const idx = DIAS.indexOf(FECHA);
-  const prevDisabled = idx <= 0 ? 'disabled' : '';
-  const nextDisabled = idx >= DIAS.length - 1 ? 'disabled' : '';
+  const prevDis = idx <= 0 ? 'disabled' : '';
+  const nextDis = idx >= DIAS.length - 1 ? 'disabled' : '';
+
+  const navHTML = hayVentas ? `
+    <button class="btn btn-ghost" id="vml-prev" ${prevDis}>‹ Día anterior</button>
+    <input type="date" class="input" id="vml-fecha" value="${FECHA}" style="width:auto">
+    <button class="btn btn-ghost" id="vml-next" ${nextDis}>Día siguiente ›</button>
+    <span class="vml-fechalbl">${esc(fechaLarga(FECHA))}</span>` : '';
 
   root.innerHTML = `
-    <div class="vml-nav">
-      <button class="btn btn-ghost" id="vml-prev" ${prevDisabled}>‹ Día anterior</button>
-      <input type="date" class="input" id="vml-fecha" value="${FECHA}" style="width:auto">
-      <button class="btn btn-ghost" id="vml-next" ${nextDisabled}>Día siguiente ›</button>
-      <span class="vml-fechalbl">${esc(fechaLarga(FECHA))}</span>
+    <div class="vml-bar">
+      <button class="btn btn-primary" id="vml-sync">⟳ Sincronizar ventas</button>
+      ${navHTML}
     </div>
 
-    <div class="kpi-grid" style="margin:14px 0">
-      <div class="kpi"><div class="kpi-label">Ventas del día</div><div class="kpi-value">${delDia.length}</div></div>
-      <div class="kpi"><div class="kpi-label">Bruto</div><div class="kpi-value">${money(totBruto)}</div></div>
-      <div class="kpi"><div class="kpi-label">Por cobrar (neto)</div><div class="kpi-value">${money(totCobrar)}</div></div>
-      <div class="kpi"><div class="kpi-label">Ya cobradas</div><div class="kpi-value">${conCobro} <span class="vml-de">de ${delDia.length}</span></div></div>
-    </div>
-
-    ${delDia.length === 0
-      ? `<div class="empty">No hubo ventas el ${esc(ddmm(FECHA))}.</div>`
-      : `<div class="table-wrap"><table class="t">
-          <thead><tr>
-            <th style="width:52px">Hora</th>
-            <th>Producto</th>
-            <th style="width:80px">SKU</th>
-            <th style="width:42px;text-align:right">Cant</th>
-            <th style="width:120px;text-align:right">Bruto</th>
-            <th style="width:110px;text-align:right">Comisión</th>
-            <th style="width:110px;text-align:right">Envío</th>
-            <th style="width:130px;text-align:right">Por cobrar</th>
-            <th style="width:100px">Estado</th>
-            <th style="width:170px">Cobro</th>
-          </tr></thead>
-          <tbody>${delDia.map(filaHTML).join('')}</tbody>
-        </table></div>`}
+    ${hayVentas ? `
+      <div class="kpi-grid" style="margin:14px 0">
+        <div class="kpi"><div class="kpi-label">Ventas del día</div><div class="kpi-value">${delDia.length}</div></div>
+        <div class="kpi"><div class="kpi-label">Bruto</div><div class="kpi-value">${money(totBruto)}</div></div>
+        <div class="kpi"><div class="kpi-label">Por cobrar (neto)</div><div class="kpi-value">${money(totCobrar)}</div></div>
+        <div class="kpi"><div class="kpi-label">Ya cobradas</div><div class="kpi-value">${conCobro} <span class="vml-de">de ${delDia.length}</span></div></div>
+      </div>
+      ${delDia.length === 0
+        ? `<div class="empty">No hubo ventas el ${esc(ddmm(FECHA))}.</div>`
+        : `<div class="table-wrap"><table class="t">
+            <thead><tr>
+              <th style="width:52px">Hora</th>
+              <th>Producto</th>
+              <th style="width:80px">SKU</th>
+              <th style="width:42px;text-align:right">Cant</th>
+              <th style="width:120px;text-align:right">Bruto</th>
+              <th style="width:110px;text-align:right">Comisión</th>
+              <th style="width:110px;text-align:right">Envío</th>
+              <th style="width:130px;text-align:right">Por cobrar</th>
+              <th style="width:100px">Estado</th>
+              <th style="width:170px">Cobro</th>
+            </tr></thead>
+            <tbody>${delDia.map(filaHTML).join('')}</tbody>
+          </table></div>`}
+    ` : `<div class="empty">Todavía no hay ventas cargadas. Tocá <b>Sincronizar ventas</b> para traerlas de Mercado Libre.</div>`}
   `;
 
-  document.getElementById('vml-prev').addEventListener('click', () => pasoDia(-1));
-  document.getElementById('vml-next').addEventListener('click', () => pasoDia(1));
-  document.getElementById('vml-fecha').addEventListener('change', e => { FECHA = e.target.value; render(); });
+  document.getElementById('vml-sync').addEventListener('click', openSyncModal);
+  if (hayVentas) {
+    document.getElementById('vml-prev').addEventListener('click', () => pasoDia(-1));
+    document.getElementById('vml-next').addEventListener('click', () => pasoDia(1));
+    document.getElementById('vml-fecha').addEventListener('change', e => { FECHA = e.target.value; render(); });
+  }
 }
 
 function filaHTML(v) {
@@ -172,12 +167,74 @@ function filaHTML(v) {
   </tr>`;
 }
 
+function openSyncModal() {
+  const hoy = hoyISO();
+  const hace7 = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal">
+      <div class="card-title">Sincronizar ventas de ML</div>
+      <p class="vml-sub">Trae las ventas de Mercado Libre del rango elegido. Para rangos largos puede tardar
+        un rato; si falla, probá de a un mes.</p>
+      <div class="field"><label>Desde</label><input type="date" class="input" id="vml-desde" value="${hace7}"></div>
+      <div class="field"><label>Hasta</label><input type="date" class="input" id="vml-hasta" value="${hoy}"></div>
+      <p class="vml-sub" style="margin-top:8px">¿ML desconectado? <a href="/ml/auth" target="_blank">Reconectar Mercado Libre</a></p>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="vml-cancel">Cancelar</button>
+        <button class="btn btn-primary" id="vml-go">Traer ventas</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  overlay.querySelector('#vml-cancel').addEventListener('click', close);
+  overlay.querySelector('#vml-go').addEventListener('click', () => {
+    const desde = overlay.querySelector('#vml-desde').value;
+    const hasta = overlay.querySelector('#vml-hasta').value;
+    if (!desde || !hasta) { window.toast('Elegí ambas fechas', 'error'); return; }
+    if (desde > hasta) { window.toast('La fecha "desde" no puede ser mayor que "hasta"', 'error'); return; }
+    sincronizar(desde, hasta, overlay);
+  });
+}
+
+async function sincronizar(desde, hasta, overlay) {
+  const btn = overlay.querySelector('#vml-go');
+  btn.disabled = true;
+  btn.textContent = 'Sincronizando…';
+  window.toast('Sincronizando ventas… puede tardar');
+  try {
+    const r = await fetch('/ml/sync', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ desde, hasta })
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const msg = data.error || (r.status + ' ' + r.statusText);
+      if (/autentic|token|auth/i.test(msg)) {
+        window.toast('ML desconectado. Reconectalo con el link del modal.', 'error');
+        btn.disabled = false; btn.textContent = 'Traer ventas';
+        return;
+      }
+      throw new Error(msg);
+    }
+    overlay.remove();
+    window.toast(`Listo: ${data.insertados ?? 0} ventas sincronizadas`);
+    await loadVentasML();
+  } catch (e) {
+    window.toast('Error al sincronizar: ' + e.message, 'error');
+    btn.disabled = false; btn.textContent = 'Traer ventas';
+  }
+}
+
 function inyectarEstilo() {
   if (document.getElementById('vml-style')) return;
   const css = `
-    .vml-nav{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .vml-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
     .vml-fechalbl{font-size:13px;color:#78716C;text-transform:capitalize;margin-left:4px}
     .vml-de{font-size:14px;color:#A8A29E;font-weight:400}
+    .vml-sub{font-size:13px;color:#78716C;margin:-4px 0 12px}
     .vml-mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums}
     .vml-fuerte{font-weight:600}
     .vml-pos{color:#15803D}
