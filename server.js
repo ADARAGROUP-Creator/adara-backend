@@ -436,29 +436,15 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
     await loadFeriados(y);
   }
 
-  // Cargar maestros para matching de línea por SKU
-  const lineas = await sbGet('lineas_negocio', 'activa=eq.true');
-  const skus   = await sbGet('catalogo_skus', 'limit=500').catch(() => []) || [];
-  const linDefault = lineas?.find(l => l.nombre.toLowerCase().includes('tecnol')) || lineas?.[0];
-
-  // Función para matchear SKU → linea_negocio_id
-  function matchLinea(sellerSku, itemTitle) {
-    if (sellerSku) {
-      // 1. Buscar por seller_sku exacto en tabla sku_adara
-      const skuMatch = skus.find(s => s.sku === sellerSku);
-      if (skuMatch?.linea_negocio_id) return skuMatch.linea_negocio_id;
-    }
-    // 2. Heurística por título del producto
-    const t = (itemTitle || '').toLowerCase();
-    for (const l of (lineas || [])) {
-      const nombre = l.nombre.toLowerCase();
-      if (nombre.includes('mochila') && (t.includes('mochila') || t.includes('bolso') || t.includes('backpack'))) return l.id;
-      if (nombre.includes('vaso')    && (t.includes('vaso')    || t.includes('botella') || t.includes('termo'))) return l.id;
-      if (nombre.includes('luminar') && (t.includes('luminar') || t.includes('lámpara') || t.includes('lampara') || t.includes('led') || t.includes('foco'))) return l.id;
-      if (nombre.includes('tecnol')  && (t.includes('xiaomi')  || t.includes('redmi')   || t.includes('smartwatch') || t.includes('auricular') || t.includes('bluetooth'))) return l.id;
-    }
-    // 3. Default
-    return linDefault?.id || null;
+  // Asignación de línea de negocio: DESACOPLADA del sync (defensiva).
+  // El esquema viejo (catalogo_skus / lineas_negocio.activa/nombre) ya no existe.
+  // La conciliación NO necesita la línea, así que NO la asignamos acá para
+  // evitar (a) que el sync se cuelgue contra el esquema nuevo y (b) ensuciar
+  // datos con líneas mal asignadas. La línea se asigna en el paso de P&L,
+  // mapeando familia del SKU × canal 'ml' → línea (modelo v22).
+  // matchLinea queda como stub para no romper las llamadas existentes.
+  function matchLinea(_sellerSku, _itemTitle) {
+    return null;
   }
 
   // ML API tiene un tope de offset=1000. Para traer más, partimos por rangos de fecha.
