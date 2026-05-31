@@ -419,6 +419,25 @@ function calcFechaDespachoFlex(fechaISO, horaStr) {
   return d.toISOString().split('T')[0];
 }
 
+// Convierte un timestamp ISO de ML (venga en UTC "...Z" o con offset "...-03:00")
+// a fecha + hora en horario de Argentina. Así la app coincide con lo que muestra
+// Mercado Libre (que usa hora local argentina en el panel de ventas y los reportes).
+function fechaHoraARG(iso) {
+  if (!iso) return { fecha: null, hora: null };
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return { fecha: null, hora: null };
+  const partes = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Argentina/Buenos_Aires',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+  }).formatToParts(d).reduce((o, p) => (o[p.type] = p.value, o), {});
+  const hh = partes.hour === '24' ? '00' : partes.hour; // medianoche normalizada
+  return {
+    fecha: `${partes.year}-${partes.month}-${partes.day}`,
+    hora: `${hh}:${partes.minute}:${partes.second}`
+  };
+}
+
 async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null) {
   if (!ML.access) throw new Error('ML no autenticado. Conectá ML primero desde la app.');
 
@@ -490,11 +509,11 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
         const payment = approvedPayments[0] || o.payments?.[0] || {};
         const allPaymentIds = approvedPayments.map(p => String(p.id));
         const bruto   = o.total_amount     || 0;
-        const fechaVenta = o.date_created?.split('T')[0];
-        // Extraer hora de venta de ML (viene como "2026-02-26T14:30:00.000-03:00")
-        // Tomamos solo HH:MM:SS (hora Argentina)
-        const horaMatch = o.date_created ? o.date_created.match(/T(\d{2}:\d{2}:\d{2})/) : null;
-        const horaVenta = horaMatch ? horaMatch[1] : null;
+        // Fecha y hora SIEMPRE en horario de Argentina, para que coincidan
+        // exactamente con lo que muestra Mercado Libre (panel de ventas/envíos).
+        // date_created puede venir en UTC o con offset; convertimos el instante
+        // a America/Argentina/Buenos_Aires antes de derivar fecha / hora / período.
+        const { fecha: fechaVenta, hora: horaVenta } = fechaHoraARG(o.date_created);
 
         const comisionReal = payment.marketplace_fee != null && payment.marketplace_fee !== 0
           ? Math.abs(payment.marketplace_fee)
@@ -692,7 +711,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
 
                   // fecha_cobro: tomar del primer payment que tenga
                   if (!od.row.fecha_cobro) {
-                    od.row.fecha_cobro = pay.money_release_date?.split('T')[0] || pay.date_approved?.split('T')[0] || null;
+                    od.row.fecha_cobro = fechaHoraARG(pay.money_release_date || pay.date_approved).fecha;
                   }
                 }).catch(err => {
                   console.warn(`⚠ Payment ${pid} fetch failed:`, err.message);
