@@ -136,9 +136,10 @@ function lineaHeredada(m) {
   return null;
 }
 
-// Celda "Línea" a nivel OPERACIÓN: editable solo si la operación tiene líneas
-// huérfanas (sin contraparte). Si todas tienen contraparte, la línea aparece
-// BLOQUEADA (heredada de la operación vinculada).
+// Celda "Línea" a nivel OPERACIÓN. Si la operación tiene líneas huérfanas (sin
+// contraparte) se puede asignar: aparece como una etiqueta discreta que, al
+// hacer clic, se convierte en un selector. Si todas tienen contraparte, la
+// línea aparece BLOQUEADA (heredada de la operación vinculada).
 function celdaLineaOp(g) {
   const orphans = g.lines.filter(m => !tieneContraparte(m));
   if (!orphans.length) {
@@ -148,19 +149,34 @@ function celdaLineaOp(g) {
   }
   const actual = orphans[0].linea_id;
   const nroOp = nroOperacion(orphans[0]);
-  const opts = ['<option value="">— Sin asignar —</option>']
-    .concat(LINEAS.map(l => `<option value="${l.id}" ${String(actual) === String(l.id) ? 'selected' : ''}>${esc(LINEA_LABEL[l.id])}</option>`))
-    .join('');
-  return `<select class="select mov-linea-sel" data-mov="${orphans[0].id}" data-op="${esc(nroOp)}" title="Asignar línea (se aplica a toda la operación)">${opts}</select>`;
+  const tieneLinea = actual != null && actual !== '';
+  const label = tieneLinea ? (LINEA_LABEL[actual] || ('#' + actual)) : '+ asignar línea';
+  return `<span class="mov-linea-edit ${tieneLinea ? 'asignada' : 'vacia'}" data-mov="${orphans[0].id}" data-op="${esc(nroOp)}" data-current="${tieneLinea ? actual : ''}" title="${tieneLinea ? 'Cambiar línea' : 'Asignar línea (se aplica a toda la operación)'}">${esc(label)}</span>`;
 }
 
-// N° de operación del extracto (REFERENCE_ID de MP / ref de banco). Vive en el
-// 2° campo de referencia_externa (`fecha|REF|monto|saldo`). Las cargas manuales
-// usan `manual-<uuid>` (sin número) → devuelve ''.
+// Al hacer clic en la etiqueta, la cambia por un selector para elegir la línea.
+function editarLinea(span) {
+  const td = span.closest('td');
+  if (!td) return;
+  const mov = span.dataset.mov, op = span.dataset.op || '', cur = span.dataset.current || '';
+  const opts = ['<option value="">— Sin asignar —</option>']
+    .concat(LINEAS.map(l => `<option value="${l.id}" ${String(cur) === String(l.id) ? 'selected' : ''}>${esc(LINEA_LABEL[l.id])}</option>`))
+    .join('');
+  td.innerHTML = `<select class="select mov-linea-sel">${opts}</select>`;
+  const sel = td.querySelector('select');
+  let cambiado = false;
+  sel.addEventListener('change', () => { cambiado = true; asignarLinea(mov, op, sel.value); });
+  sel.addEventListener('blur', () => { if (!cambiado) render(); });
+  sel.focus();
+}
+
+// N° de operación: SOLO para Mercado Pago (origen mp_account_statement), donde
+// el 2° campo de referencia_externa es el REFERENCE_ID que comparten las líneas
+// de una misma operación. En el banco (Supervielle) ese campo es la HORA y NO
+// agrupa nada; en cargas manuales no hay número. Para esos devuelve ''.
 function nroOperacion(m) {
-  const ref = String(m.referencia_externa || '');
-  if (ref.startsWith('manual-') || ref.startsWith('sin_factura_auto')) return '';
-  const f = ref.split('|');
+  if (m.origen !== 'mp_account_statement') return '';
+  const f = String(m.referencia_externa || '').split('|');
   return f.length > 1 ? f[1].trim() : '';
 }
 
@@ -306,8 +322,8 @@ function render() {
       render();
     });
   });
-  document.querySelectorAll('.mov-linea-sel').forEach(s => {
-    s.addEventListener('change', () => asignarLinea(s.dataset.mov, s.dataset.op, s.value));
+  document.querySelectorAll('.mov-linea-edit').forEach(s => {
+    s.addEventListener('click', () => editarLinea(s));
   });
 }
 
@@ -690,8 +706,13 @@ function inyectarEstilo() {
     .mov-det-row{display:grid;grid-template-columns:1fr 140px 130px 90px;gap:12px;align-items:center;padding:3px 0;font-size:13px}
     .mov-det-desc{color:#57534E}
     .mov-det-cat{color:#A8A29E;font-size:12px}
-    .mov-linea-sel{font-size:12px;padding:3px 6px;max-width:150px}
-    .mov-linea-ro{font-size:12px;color:#A8A29E;font-style:italic}
+    .mov-linea-edit{display:inline-block;font-size:12px;padding:2px 8px;border-radius:6px;cursor:pointer;white-space:nowrap}
+    .mov-linea-edit.asignada{background:#F3EEFB;color:#6D28D9}
+    .mov-linea-edit.asignada:hover{background:#E9DFF8}
+    .mov-linea-edit.vacia{color:#C4BFB8;border:1px dashed #E0DBD2}
+    .mov-linea-edit.vacia:hover{color:#6D28D9;border-color:#C7B8E0;background:#FAF7FF}
+    .mov-linea-sel{font-size:12px;padding:3px 6px;max-width:160px}
+    .mov-linea-ro{font-size:12px;color:#B8B2A9;font-style:italic}
     .mov-tag{font-size:12px;color:#57534E;background:#F5F5F4;padding:2px 8px;border-radius:6px}
     .mov-tag-empty{font-size:12px;color:#A8A29E;border:1px dashed #D6D3D1;padding:2px 8px;border-radius:6px}
     .mov-badge{font-size:12px;padding:2px 8px;border-radius:6px}
