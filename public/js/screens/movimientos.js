@@ -1,4 +1,4 @@
-import { sbGet, sbPost } from '../core/sb.js';
+import { sbGet, sbPost, sbPatch } from '../core/sb.js';
 
 // ── Pantalla: Movimientos ──────────────────────────────────────────────
 // Extracto unificado de cuentas (tabla `movimientos`, capa 4).
@@ -29,6 +29,11 @@ let ESTADO_BY_ID = {};     // movimiento_id -> estado (ÚNICA fuente de verdad: 
 let VINC_OPS = {};         // movimiento_id -> [{op_tipo, op_id}]
 let VENTA_NUM = {};        // ventas_ml.id -> ml_order_id (para mostrar el N° de venta)
 let OP_COUNT = {};         // N° de operación -> cuántas líneas comparten ese número
+let LINEAS = [];           // catálogo de líneas de negocio
+let LINEA_LABEL = {};      // linea_id -> nombre
+let VENTA_LINEA = {};      // ventas_ml.id -> linea_negocio_id (línea heredada)
+let GASTO_LINEA = {};      // gasto id -> linea_id
+let COMPRA_LINEA = {};     // compra_id -> linea_id
 
 // Etiqueta linda por código de cuenta (fallback al código si no está mapeado)
 const LABEL_CUENTA = {
@@ -116,6 +121,38 @@ function vinculadoA(m) {
 
 const LABEL_ESTADO = { auto: 'auto', pendiente: 'pendiente', parcial: 'parcial', conciliado: 'Vinculado' };
 
+// ¿El movimiento tiene contraparte (está vinculado a una operación)?
+function tieneContraparte(m) {
+  return (VINC_OPS[m.id] || []).length > 0;
+}
+
+// Línea HEREDADA de la operación vinculada (opción A). Devuelve el linea_id o null.
+function lineaHeredada(m) {
+  for (const op of (VINC_OPS[m.id] || [])) {
+    if (op.op_tipo === 'venta_ml' && VENTA_LINEA[op.op_id] != null) return VENTA_LINEA[op.op_id];
+    if (op.op_tipo === 'gasto' && GASTO_LINEA[op.op_id] != null) return GASTO_LINEA[op.op_id];
+    if (op.op_tipo === 'compra' && COMPRA_LINEA[op.op_id] != null) return COMPRA_LINEA[op.op_id];
+  }
+  return null;
+}
+
+// Celda "Línea": editable solo para huérfanos (sin contraparte). Para los que
+// tienen contraparte, la línea aparece BLOQUEADA (heredada de la operación).
+function celdaLinea(m) {
+  if (tieneContraparte(m)) {
+    const id = lineaHeredada(m);
+    const txt = id != null ? (LINEA_LABEL[id] || ('#' + id)) : '(heredada)';
+    return `<span class="mov-linea-ro" title="La toma de la operación vinculada (no se edita acá)">${esc(txt)}</span>`;
+  }
+  // Huérfano: dropdown para asignarla a mano.
+  const nroOp = nroOperacion(m);
+  const actual = m.linea_id;
+  const opts = ['<option value="">— Sin asignar —</option>']
+    .concat(LINEAS.map(l => `<option value="${l.id}" ${String(actual) === String(l.id) ? 'selected' : ''}>${esc(LINEA_LABEL[l.id])}</option>`))
+    .join('');
+  return `<select class="select mov-linea-sel" data-mov="${m.id}" data-op="${esc(nroOp)}" title="Asignar línea de negocio (se aplica a toda la operación)">${opts}</select>`;
+}
+
 // N° de operación del extracto (REFERENCE_ID de MP / ref de banco). Vive en el
 // 2° campo de referencia_externa (`fecha|REF|monto|saldo`). Las cargas manuales
 // usan `manual-<uuid>` (sin número) → devuelve ''.
@@ -145,9 +182,18 @@ export async function loadMovimientos() {
     for (const v of vincs) {
       (VINC_OPS[v.movimiento_id] = VINC_OPS[v.movimiento_id] || []).push({ op_tipo: v.op_tipo, op_id: v.op_id });
     }
-    // N° de venta de ML por id (para mostrarlo en la fila vinculada).
-    const ventas = await sbGet('ventas_ml', 'select=id,ml_order_id');
+    // N° de venta de ML por id + línea heredada de la venta.
+    const ventas = await sbGet('ventas_ml', 'select=id,ml_order_id,linea_negocio_id');
     VENTA_NUM = Object.fromEntries(ventas.map(v => [v.id, v.ml_order_id]));
+    VENTA_LINEA = Object.fromEntries(ventas.map(v => [v.id, v.linea_negocio_id]));
+    // Catálogo de líneas de negocio (para el dropdown y las etiquetas).
+    LINEAS = await sbGet('lineas_negocio', 'order=id.asc');
+    LINEA_LABEL = Object.fromEntries(LINEAS.map(l => [l.id, l.nombre || l.descripcion || l.codigo || ('Línea ' + l.id)]));
+    // Líneas heredadas de gastos / compras (para mostrarlas bloqueadas).
+    const gastos = await sbGet('v_gastos_ap', 'select=id,linea_id').catch(() => []);
+    GASTO_LINEA = Object.fromEntries(gastos.map(g => [g.id, g.linea_id]));
+    const compras = await sbGet('v_compras_ap', 'select=compra_id,linea_id').catch(() => []);
+    COMPRA_LINEA = Object.fromEntries(compras.map(c => [c.compra_id, c.linea_id]));
   } catch (e) {
     root.innerHTML = `<div class="error">No se pudieron cargar los movimientos: ${e.message}</div>`;
     return;
@@ -237,6 +283,7 @@ function render() {
             <th>Descripción</th>
             <th style="width:128px">N° operación</th>
             <th style="width:130px">Categoría</th>
+            <th style="width:150px">Línea</th>
             <th style="width:140px;text-align:right">Monto</th>
             <th style="width:150px">Vinculado a</th>
             <th style="width:104px">Estado</th>
@@ -266,6 +313,9 @@ function render() {
       render();
     });
   });
+  document.querySelectorAll('.mov-linea-sel').forEach(s => {
+    s.addEventListener('change', () => asignarLinea(s.dataset.mov, s.dataset.op, s.value));
+  });
 }
 
 function filaHTML(m) {
@@ -286,6 +336,7 @@ function filaHTML(m) {
     <td>${m.descripcion ? esc(m.descripcion) : '<span class="mov-muted">—</span>'}</td>
     <td class="mov-mono mov-op">${nroOp ? `<span title="Copiá este número y buscalo en el extracto de MP">${esc(nroOp)}</span>${badge}` : '<span class="mov-muted">—</span>'}</td>
     <td>${catSinClasif ? '<span class="mov-tag-empty">sin clasificar</span>' : `<span class="mov-tag">${esc(catLabel)}</span>`}</td>
+    <td>${celdaLinea(m)}</td>
     <td style="text-align:right" class="mov-mono ${neg ? 'mov-neg' : 'mov-pos'}">${fmtMonto(m.monto, moneda)}</td>
     <td class="mov-mono mov-vinc">${vinc || '<span class="mov-muted">—</span>'}</td>
     <td><span class="mov-badge mov-badge-${est}">${LABEL_ESTADO[est] || est}</span></td>
@@ -451,7 +502,37 @@ async function borrarMovimiento(id) {
   }
 }
 
-// ── Importar extracto (Supervielle / Mercado Pago) ─────────────────────
+// ── Asignar línea de negocio a un movimiento huérfano (y a toda su operación) ──
+// Se aplica a TODAS las líneas sin contraparte que comparten el número de
+// operación (ej: la transferencia y su impuesto a la vez). Las que ya tienen
+// contraparte no se tocan (heredan su línea de la operación).
+async function asignarLinea(movId, opNum, valor) {
+  const linea_id = valor ? Number(valor) : null;
+  // ¿A qué movimientos? Los huérfanos de la misma operación; si no hay número, solo este.
+  let objetivos;
+  if (opNum) {
+    objetivos = DATA.filter(m => nroOperacion(m) === opNum && !tieneContraparte(m));
+  } else {
+    objetivos = DATA.filter(m => String(m.id) === String(movId));
+  }
+  const ids = objetivos.map(m => m.id);
+  if (!ids.length) return;
+  try {
+    await sbPatch('movimientos', `id=in.(${ids.join(',')})`, { linea_id });
+    for (const m of objetivos) m.linea_id = linea_id;  // reflejar local
+    const nombre = linea_id ? (LINEA_LABEL[linea_id] || ('#' + linea_id)) : 'Sin asignar';
+    window.toast(ids.length > 1 ? `Línea asignada a la operación (${ids.length} líneas): ${nombre}` : `Línea asignada: ${nombre}`);
+    render();
+  } catch (e) {
+    if (/linea_id/.test(e.message) || /column/.test(e.message) || /42703/.test(e.message)) {
+      window.toast('Falta correr la migración (agregar columna linea_id) en Supabase', 'error');
+    } else {
+      window.toast('Error al asignar línea: ' + e.message, 'error');
+    }
+  }
+}
+
+
 function openModalImportar() {
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
@@ -545,6 +626,8 @@ function inyectarEstilo() {
     .mov-op-grupo{font-size:11px;color:#6D28D9;background:#F3EEFB;border-radius:6px;padding:1px 7px;margin-left:6px;cursor:pointer;user-select:none}
     .mov-op-grupo:hover{background:#E9DFF8}
     .mov-row-op td{box-shadow:inset 3px 0 0 #C7B8E0}
+    .mov-linea-sel{font-size:12px;padding:3px 6px;max-width:150px}
+    .mov-linea-ro{font-size:12px;color:#A8A29E;font-style:italic}
     .mov-tag{font-size:12px;color:#57534E;background:#F5F5F4;padding:2px 8px;border-radius:6px}
     .mov-tag-empty{font-size:12px;color:#A8A29E;border:1px dashed #D6D3D1;padding:2px 8px;border-radius:6px}
     .mov-badge{font-size:12px;padding:2px 8px;border-radius:6px}
