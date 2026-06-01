@@ -14,6 +14,7 @@ import { sbGet } from '../core/sb.js';
 
 let VENTAS = [];
 let COBROS_BY_REF = {};      // REFERENCE_ID del extracto -> movimiento (cobro_venta)
+let COBROS_BY_ID = {};       // movimiento.id -> movimiento (cobro_venta) — para el detalle de operaciones
 let BONIFS = [];             // movimientos cobro_venta de "bonificación por envío"
 let VINC_BY_VENTA = {};      // ventas_ml.id -> [vínculos] (op_tipo='venta_ml')
 let VINC_MOV_USADOS = new Set(); // movimiento_id ya vinculados a alguna venta
@@ -119,10 +120,12 @@ export async function loadVentasML() {
     VENTAS = await sbGet('ventas_ml', 'order=fecha.asc,hora_venta.asc');
     const cobros = await sbGet('movimientos', 'categoria=eq.cobro_venta&order=fecha.asc');
     COBROS_BY_REF = {};
+    COBROS_BY_ID = {};
     BONIFS = [];
     for (const c of cobros) {
       const ref = String(c.referencia_externa || '').split('|')[1];
       if (ref) COBROS_BY_REF[ref.trim()] = c;
+      COBROS_BY_ID[c.id] = c;
       if (/bonific/i.test(c.descripcion || '')) BONIFS.push(c);
     }
     const vinc = await sbGet('vinculos', 'op_tipo=eq.venta_ml');
@@ -274,7 +277,7 @@ function celdaMonto(valor) {
   return `<td style="text-align:right" class="vml-mono ${n < 0 ? 'vml-neg' : 'vml-pos'}">${money(n)}</td>`;
 }
 
-function cobroCell(v, bonifMap) {
+function cobroCellInner(v, bonifMap) {
   if (estaConciliada(v)) {
     const n = (VINC_BY_VENTA[v.id] || []).length;
     const detalle = n > 1 ? ' (varios mov.)' : '';
@@ -297,6 +300,72 @@ function cobroCell(v, bonifMap) {
   }
   const motivo = cobros.length > 1 ? 'varios cobros, no cierra' : 'monto ≠';
   return `${ok}<span class="vml-rev" title="No cierra con el por cobrar: conciliar a mano en Conciliación">revisar (${motivo})</span>`;
+}
+
+// Celda de cobro/conciliación: contenido base + un toggle "▾" para desplegar
+// el detalle con los N° de operación del extracto (cuando hay cobros vinculados
+// o la venta está conciliada).
+function cobroCell(v, bonifMap) {
+  const inner = cobroCellInner(v, bonifMap);
+  const hayOps = operacionesDe(v).length > 0;
+  const tog = hayOps
+    ? `<button class="vml-toggle" data-accion="toggle" data-venta="${v.id}" title="Ver N° de operación del extracto (MP)">▾</button>`
+    : '';
+  return inner + tog;
+}
+
+// Operaciones del extracto (MP) asociadas a la venta:
+//  - conciliada → los movimientos efectivamente vinculados (incluye bonificación si la hubo).
+//  - cobrada (sin conciliar) → los cobros que matchean por mp_payment_id.
+// Cada una expone su N° de operación (= ID de liquidación del extracto), fecha y monto.
+function operacionesDe(v) {
+  const out = [];
+  const desdeMov = (mov) => {
+    const op = String(mov.referencia_externa || '').split('|')[1];
+    out.push({ operacion: (op || ('mov. #' + mov.id)).trim(), fecha: mov.fecha || '', monto: Number(mov.monto) || 0 });
+  };
+  if (estaConciliada(v)) {
+    for (const vc of (VINC_BY_VENTA[v.id] || [])) {
+      const mov = COBROS_BY_ID[vc.movimiento_id];
+      if (mov) desdeMov(mov);
+      else out.push({ operacion: 'mov. #' + vc.movimiento_id, fecha: '', monto: Number(vc.monto) || 0 });
+    }
+  } else {
+    for (const c of matchCobros(v)) desdeMov(c);
+  }
+  return out;
+}
+
+function detalleHTML(v) {
+  const ops = operacionesDe(v);
+  const filas = ops.map(o => `
+    <div class="vml-det-op">
+      <span class="vml-det-num" title="N° de operación del extracto (MP)">${esc(o.operacion)}</span>
+      <span class="vml-det-fecha">${o.fecha ? esc(ddmm(o.fecha)) : '—'}</span>
+      <span class="vml-det-monto vml-mono">${money(o.monto)}</span>
+    </div>`).join('');
+  return `<div class="vml-det">
+    <div class="vml-det-head">Orden ML <b>${esc(v.ml_order_id || '—')}</b> · operaciones del extracto (MP):</div>
+    ${filas || '<div class="vml-det-empty">— sin operaciones vinculadas —</div>'}
+  </div>`;
+}
+
+// Inserta/quita una fila de detalle justo debajo de la venta. Se reconstruye en
+// cada render(), así que el estado abierto/cerrado es efímero (no persiste).
+function toggleDetalle(btn) {
+  const tr = btn.closest('tr');
+  if (!tr) return;
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains('vml-detalle-row')) {
+    next.remove(); btn.textContent = '▾'; return;
+  }
+  const v = VENTAS.find(x => String(x.id) === String(btn.dataset.venta));
+  if (!v) return;
+  const det = document.createElement('tr');
+  det.className = 'vml-detalle-row';
+  det.innerHTML = `<td colspan="${tr.children.length}">${detalleHTML(v)}</td>`;
+  tr.after(det);
+  btn.textContent = '▴';
 }
 
 function filaHTML(v, esMes, bonifMap) {
@@ -328,6 +397,7 @@ function onTablaClick(e) {
   if (!btn) return;
   if (btn.dataset.accion === 'conciliar') conciliar(btn.dataset.venta);
   else if (btn.dataset.accion === 'desvincular') desvincular(btn.dataset.venta);
+  else if (btn.dataset.accion === 'toggle') toggleDetalle(btn);
 }
 
 // Vincula el pago principal y, si hace falta para llegar al por_cobrar, también
@@ -539,6 +609,16 @@ function inyectarEstilo() {
     .vml-mini{padding:4px 10px;font-size:13px}
     .vml-x{border:0;background:transparent;color:#A8A29E;cursor:pointer;font-size:13px;padding:0 2px}
     .vml-x:hover{color:#B91C1C}
+    .vml-toggle{border:0;background:transparent;color:#0C447C;cursor:pointer;font-size:12px;padding:0 4px;margin-left:4px}
+    .vml-toggle:hover{color:#D97706}
+    .vml-detalle-row > td{background:#FBFAF6;border-top:0;padding:0!important}
+    .vml-det{padding:8px 14px;font-size:12px;color:#57534E}
+    .vml-det-head{margin-bottom:6px;color:#78716C}
+    .vml-det-op{display:flex;gap:14px;align-items:center;padding:3px 0}
+    .vml-det-num{font-family:'JetBrains Mono',ui-monospace,monospace;color:#0C447C;font-weight:600;user-select:all;cursor:text}
+    .vml-det-fecha{color:#A8A29E;min-width:42px}
+    .vml-det-monto{color:#0F6E56}
+    .vml-det-empty{color:#A8A29E}
   `;
   const style = document.createElement('style');
   style.id = 'vml-style';
