@@ -383,9 +383,13 @@ function inyectarEstilo() {
     .vml-pos{color:#15803D}
     .vml-neg{color:#B91C1C}
     .vml-cero{color:#C7C2BC}
-    #vml-tabla{font-size:13px}
-    #vml-tabla thead th{padding:8px 10px;font-size:11px}
-    #vml-tabla tbody td{padding:8px 10px}
+    /* La tabla se ajusta al ancho del monitor: la fuente y el espaciado escalan
+       entre un mínimo y un máximo según el ancho de pantalla. */
+    #vml-tabla{font-size:clamp(11px, 0.55vw + 4.5px, 16px)}
+    #vml-tabla thead th{padding:clamp(6px,0.5vw,11px) clamp(6px,0.55vw,12px);font-size:clamp(10px, 0.4vw + 4.5px, 13px);white-space:nowrap}
+    #vml-tabla tbody td{padding:clamp(6px,0.5vw,11px) clamp(6px,0.55vw,12px)}
+    /* Los montos y códigos nunca se parten en dos líneas */
+    #vml-tabla tbody td.vml-mono{white-space:nowrap}
     .vml-venta-id{color:#0C447C;text-decoration:none;border-bottom:1px dashed #9DB6D4}
     .vml-venta-id:hover{color:#D97706;border-bottom-color:#D97706}
     .vml-est{font-size:12px;padding:2px 8px;border-radius:6px;background:#F1EFE8;color:#57534E}
