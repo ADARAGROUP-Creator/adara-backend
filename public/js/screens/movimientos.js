@@ -25,7 +25,7 @@ let DATA = [];             // movimientos cargados
 let FILTRO = { cuenta: '', estado: '', q: '' };
 let MES = '';              // YYYY-MM seleccionado (mes del extracto)
 let MESES = [];            // meses disponibles, desc
-let VINC_SUM = {};         // movimiento_id -> Σ monto vinculado (magnitud positiva)
+let ESTADO_BY_ID = {};     // movimiento_id -> estado (ÚNICA fuente de verdad: v_movimientos_estado)
 let VINC_OPS = {};         // movimiento_id -> [{op_tipo, op_id}]
 let VENTA_NUM = {};        // ventas_ml.id -> ml_order_id (para mostrar el N° de venta)
 
@@ -88,16 +88,12 @@ function fmtMonto(valor, moneda) {
   return `${signo}${simbolo}${abs}`;
 }
 
-// Estado real: si el movimiento tiene enganches (vínculos) que cubren su monto
-// → "vinculado"; si los tiene pero no cierra → "parcial"; si no tiene → "auto"
-// (si vino conciliado automático) o "pendiente". Tolerancia 2 centavos (CB3).
+// Estado: ÚNICA fuente de verdad = la vista v_movimientos_estado de la base
+// (la misma que usa la pantalla Conciliación), para que las dos pantallas nunca
+// muestren estados distintos para el mismo movimiento. Fallback solo para filas
+// recién cargadas a mano que todavía no pasaron por la vista.
 function estadoDe(m) {
-  const vsum = VINC_SUM[m.id] || 0;
-  if (vsum > 0.0001) {
-    const saldo = Math.abs(Number(m.monto) || 0) - vsum;
-    return Math.abs(saldo) < 0.02 ? 'conciliado' : 'parcial';
-  }
-  return m.conciliado_auto ? 'auto' : 'pendiente';
+  return ESTADO_BY_ID[m.id] || (m.conciliado_auto ? 'auto' : 'pendiente');
 }
 
 // Texto de "con qué está vinculado": el N° de venta (ml_order_id) para enganches
@@ -138,11 +134,14 @@ export async function loadMovimientos() {
     CUENTAS = await sbGet('cuentas', 'order=id.asc');
     CUENTA_BY_ID = Object.fromEntries(CUENTAS.map(c => [c.id, c]));
     DATA = await sbGet('movimientos', 'order=fecha.desc,id.desc');
-    // Enganches (vínculos) para saber qué está vinculado y con qué.
+    // Estado de conciliación: lo trae la VISTA de la base (misma fuente que
+    // Conciliación). Pedimos solo id + estado (payload chico).
+    const estados = await sbGet('v_movimientos_estado', 'select=id,estado');
+    ESTADO_BY_ID = Object.fromEntries(estados.map(e => [e.id, e.estado]));
+    // Enganches: para mostrar CON QUÉ está vinculado cada movimiento.
     const vincs = await sbGet('vinculos', '');
-    VINC_SUM = {}; VINC_OPS = {};
+    VINC_OPS = {};
     for (const v of vincs) {
-      VINC_SUM[v.movimiento_id] = (VINC_SUM[v.movimiento_id] || 0) + (Number(v.monto) || 0);
       (VINC_OPS[v.movimiento_id] = VINC_OPS[v.movimiento_id] || []).push({ op_tipo: v.op_tipo, op_id: v.op_id });
     }
     // N° de venta de ML por id (para mostrarlo en la fila vinculada).
