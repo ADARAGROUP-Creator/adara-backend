@@ -2822,7 +2822,7 @@ app.post('/mp/import', upload.single('file'), async (req, res) => {
 app.post('/vincular', async (req, res) => {
   try {
     const { movimiento_id, op_tipo, op_id, monto } = req.body || {};
-    const tiposOk = ['venta', 'compra', 'gasto', 'reclamo', 'transferencia', 'ajuste'];
+    const tiposOk = ['venta', 'venta_ml', 'compra', 'gasto', 'reclamo', 'transferencia', 'ajuste'];
     if (!movimiento_id || !op_tipo || !op_id) return res.status(400).json({ error: 'Faltan movimiento_id, op_tipo u op_id' });
     if (!tiposOk.includes(op_tipo)) return res.status(400).json({ error: 'op_tipo inválido' });
     const m = Math.round(Number(monto) * 100) / 100;
