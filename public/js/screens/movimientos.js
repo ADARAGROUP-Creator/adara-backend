@@ -28,7 +28,7 @@ let MESES = [];            // meses disponibles, desc
 let ESTADO_BY_ID = {};     // movimiento_id -> estado (ÚNICA fuente de verdad: v_movimientos_estado)
 let VINC_OPS = {};         // movimiento_id -> [{op_tipo, op_id}]
 let VENTA_NUM = {};        // ventas_ml.id -> ml_order_id (para mostrar el N° de venta)
-let OP_COUNT = {};         // N° de operación -> cuántas líneas comparten ese número
+let EXPANDED = new Set();  // claves de operación actualmente desplegadas
 let LINEAS = [];           // catálogo de líneas de negocio
 let LINEA_LABEL = {};      // linea_id -> nombre
 let VENTA_LINEA = {};      // ventas_ml.id -> linea_negocio_id (línea heredada)
@@ -136,21 +136,22 @@ function lineaHeredada(m) {
   return null;
 }
 
-// Celda "Línea": editable solo para huérfanos (sin contraparte). Para los que
-// tienen contraparte, la línea aparece BLOQUEADA (heredada de la operación).
-function celdaLinea(m) {
-  if (tieneContraparte(m)) {
-    const id = lineaHeredada(m);
+// Celda "Línea" a nivel OPERACIÓN: editable solo si la operación tiene líneas
+// huérfanas (sin contraparte). Si todas tienen contraparte, la línea aparece
+// BLOQUEADA (heredada de la operación vinculada).
+function celdaLineaOp(g) {
+  const orphans = g.lines.filter(m => !tieneContraparte(m));
+  if (!orphans.length) {
+    const id = lineaHeredada(g.lines[0]);
     const txt = id != null ? (LINEA_LABEL[id] || ('#' + id)) : '(heredada)';
     return `<span class="mov-linea-ro" title="La toma de la operación vinculada (no se edita acá)">${esc(txt)}</span>`;
   }
-  // Huérfano: dropdown para asignarla a mano.
-  const nroOp = nroOperacion(m);
-  const actual = m.linea_id;
+  const actual = orphans[0].linea_id;
+  const nroOp = nroOperacion(orphans[0]);
   const opts = ['<option value="">— Sin asignar —</option>']
     .concat(LINEAS.map(l => `<option value="${l.id}" ${String(actual) === String(l.id) ? 'selected' : ''}>${esc(LINEA_LABEL[l.id])}</option>`))
     .join('');
-  return `<select class="select mov-linea-sel" data-mov="${m.id}" data-op="${esc(nroOp)}" title="Asignar línea de negocio (se aplica a toda la operación)">${opts}</select>`;
+  return `<select class="select mov-linea-sel" data-mov="${orphans[0].id}" data-op="${esc(nroOp)}" title="Asignar línea (se aplica a toda la operación)">${opts}</select>`;
 }
 
 // N° de operación del extracto (REFERENCE_ID de MP / ref de banco). Vive en el
@@ -209,14 +210,6 @@ export async function loadMovimientos() {
 function render() {
   const root = document.getElementById('app-screens');
 
-  // Cuántas líneas comparten cada número de operación (para mostrar la operación
-  // completa: ej. transferencia + su impuesto, o cobro + sus devoluciones).
-  OP_COUNT = {};
-  for (const m of DATA) {
-    const op = nroOperacion(m);
-    if (op) OP_COUNT[op] = (OP_COUNT[op] || 0) + 1;
-  }
-
   // Base: respeta MES (extracto) + cuenta + búsqueda (NO el estado, que es la pill)
   const base = DATA.filter(m => {
     if (MES && mesDe(m.fecha) !== MES) return false;
@@ -230,6 +223,7 @@ function render() {
 
   // Lista: base + filtro de estado (la pill activa)
   const filtrados = base.filter(m => !FILTRO.estado || estadoDe(m) === FILTRO.estado);
+  const grupos = gruposDeOperacion(filtrados);
 
   // KPIs (sobre la base filtrada por mes + cuenta + búsqueda)
   const total = base.length;
@@ -289,7 +283,7 @@ function render() {
             <th style="width:104px">Estado</th>
             <th style="width:44px"></th>
           </tr></thead>
-          <tbody>${filtrados.map(filaHTML).join('')}</tbody>
+          <tbody>${grupos.map(filaOperacionHTML).join('')}</tbody>
         </table></div>`}
   `;
 
@@ -305,11 +299,10 @@ function render() {
   document.querySelectorAll('.mov-del').forEach(b => {
     b.addEventListener('click', () => borrarMovimiento(b.dataset.id));
   });
-  document.querySelectorAll('.mov-op-grupo').forEach(b => {
+  document.querySelectorAll('.mov-exp').forEach(b => {
     b.addEventListener('click', () => {
-      FILTRO.q = b.dataset.op;
-      const inp = document.getElementById('f-q');
-      if (inp) inp.value = b.dataset.op;
+      const k = b.dataset.key;
+      if (EXPANDED.has(k)) EXPANDED.delete(k); else EXPANDED.add(k);
       render();
     });
   });
@@ -318,30 +311,97 @@ function render() {
   });
 }
 
-function filaHTML(m) {
-  const moneda = monedaDe(m.cuenta_id);
-  const neg = Number(m.monto) < 0;
-  const est = estadoDe(m);
-  const catLabel = (CATEGORIAS.find(c => c[0] === (m.categoria || ''))?.[1]) || m.categoria;
-  const catSinClasif = !m.categoria || m.categoria === 'sin_clasificar';
-  const vinc = vinculadoA(m);
-  const nroOp = nroOperacion(m);
-  const grupo = nroOp && OP_COUNT[nroOp] > 1 ? OP_COUNT[nroOp] : 0;
-  const badge = grupo
-    ? ` <span class="mov-op-grupo" data-op="${esc(nroOp)}" title="Esta operación tiene ${grupo} líneas (ej. transferencia + su impuesto). Clic para verlas juntas.">${grupo} líneas</span>`
+// Agrupa los movimientos por número de operación (los que no tienen número son
+// su propia operación de 1 línea). Mantiene el orden de aparición.
+function gruposDeOperacion(filtrados) {
+  const map = new Map();
+  const order = [];
+  for (const m of filtrados) {
+    const k = nroOperacion(m) || ('m' + m.id);
+    if (!map.has(k)) { map.set(k, { key: k, lines: [] }); order.push(k); }
+    map.get(k).lines.push(m);
+  }
+  return order.map(k => map.get(k));
+}
+
+// Saca el número de operación del final de la descripción (ya está en su columna).
+function descLimpia(m) {
+  return (m.descripcion || '').replace(/\s*·\s*\d{6,}\s*$/, '').trim();
+}
+
+// Estado agregado de una operación a partir de sus líneas.
+function estadoOp(lines) {
+  const ests = lines.map(estadoDe);
+  if (ests.every(e => e === 'conciliado' || e === 'auto')) return ests.includes('conciliado') ? 'conciliado' : 'auto';
+  if (ests.every(e => e === 'pendiente')) return 'pendiente';
+  return 'parcial';
+}
+
+// Fila de una OPERACIÓN (puede tener varias líneas). Si tiene más de una, se
+// puede desplegar para ver el detalle línea por línea.
+function filaOperacionHTML(g) {
+  const lines = g.lines;
+  const multi = lines.length > 1;
+  const first = lines[0];
+  const moneda = monedaDe(first.cuenta_id);
+  const neto = lines.reduce((s, m) => s + (Number(m.monto) || 0), 0);
+  const neg = neto < 0;
+  const cats = [...new Set(lines.map(m => m.categoria))];
+  const catUnica = cats.length === 1;
+  const catLabel = catUnica ? ((CATEGORIAS.find(c => c[0] === cats[0])?.[1]) || cats[0]) : 'varias';
+  const catSinClasif = catUnica && (!cats[0] || cats[0] === 'sin_clasificar');
+  const est = estadoOp(lines);
+  let vinc = '';
+  for (const m of lines) { const v = vinculadoA(m); if (v) { vinc = v; break; } }
+  const nroOp = nroOperacion(first);
+
+  let desc;
+  if (multi) {
+    const pr = lines.slice().sort((a, b) => Math.abs(Number(b.monto) || 0) - Math.abs(Number(a.monto) || 0))[0];
+    desc = `${esc(descLimpia(pr)) || 'Operación'} <span class="mov-muted">· ${lines.length} líneas</span>`;
+  } else {
+    desc = descLimpia(first) ? esc(descLimpia(first)) : '<span class="mov-muted">—</span>';
+  }
+  const expanded = EXPANDED.has(g.key);
+  const toggle = multi
+    ? `<button class="mov-exp" data-key="${esc(g.key)}" title="Ver las líneas de esta operación">${expanded ? '▾' : '▸'}</button> `
     : '';
-  return `<tr class="${grupo ? 'mov-row-op' : ''}">
-    <td>${(m.fecha || '').slice(8, 10)}/${(m.fecha || '').slice(5, 7)}</td>
-    <td>${cuentaLabel(m.cuenta_id)}</td>
-    <td>${m.descripcion ? esc(m.descripcion) : '<span class="mov-muted">—</span>'}</td>
-    <td class="mov-mono mov-op">${nroOp ? `<span title="Copiá este número y buscalo en el extracto de MP">${esc(nroOp)}</span>${badge}` : '<span class="mov-muted">—</span>'}</td>
+  const delBtn = (!multi && first.origen === 'manual')
+    ? `<button class="mov-del" data-id="${first.id}" title="Borrar movimiento">✕</button>` : '';
+
+  let html = `<tr class="${multi ? 'mov-row-op' : ''}">
+    <td>${(first.fecha || '').slice(8, 10)}/${(first.fecha || '').slice(5, 7)}</td>
+    <td>${cuentaLabel(first.cuenta_id)}</td>
+    <td>${toggle}${desc}</td>
+    <td class="mov-mono mov-op">${nroOp ? esc(nroOp) : '<span class="mov-muted">—</span>'}</td>
     <td>${catSinClasif ? '<span class="mov-tag-empty">sin clasificar</span>' : `<span class="mov-tag">${esc(catLabel)}</span>`}</td>
-    <td>${celdaLinea(m)}</td>
-    <td style="text-align:right" class="mov-mono ${neg ? 'mov-neg' : 'mov-pos'}">${fmtMonto(m.monto, moneda)}</td>
+    <td>${celdaLineaOp(g)}</td>
+    <td style="text-align:right" class="mov-mono ${neg ? 'mov-neg' : 'mov-pos'}">${fmtMonto(neto, moneda)}</td>
     <td class="mov-mono mov-vinc">${vinc || '<span class="mov-muted">—</span>'}</td>
     <td><span class="mov-badge mov-badge-${est}">${LABEL_ESTADO[est] || est}</span></td>
-    <td style="text-align:center">${m.origen === 'manual' ? `<button class="mov-del" data-id="${m.id}" title="Borrar movimiento">✕</button>` : ''}</td>
+    <td style="text-align:center">${delBtn}</td>
   </tr>`;
+
+  if (multi && expanded) {
+    html += `<tr class="mov-detalle"><td colspan="10">${detalleOperacionHTML(lines)}</td></tr>`;
+  }
+  return html;
+}
+
+// Detalle de las líneas de una operación (cuando está desplegada).
+function detalleOperacionHTML(lines) {
+  return `<div class="mov-det">${lines.map(m => {
+    const moneda = monedaDe(m.cuenta_id);
+    const neg = Number(m.monto) < 0;
+    const est = estadoDe(m);
+    const catLabel = (CATEGORIAS.find(c => c[0] === (m.categoria || ''))?.[1]) || m.categoria || '';
+    return `<div class="mov-det-row">
+      <span class="mov-det-desc">${descLimpia(m) ? esc(descLimpia(m)) : '—'}</span>
+      <span class="mov-det-cat">${esc(catLabel)}</span>
+      <span class="mov-mono ${neg ? 'mov-neg' : 'mov-pos'}">${fmtMonto(m.monto, moneda)}</span>
+      <span class="mov-badge mov-badge-${est}">${LABEL_ESTADO[est] || est}</span>
+    </div>`;
+  }).join('')}</div>`;
 }
 
 // ── Modal de carga manual ──────────────────────────────────────────────
@@ -623,9 +683,13 @@ function inyectarEstilo() {
     .mov-muted{color:#A8A29E}
     .mov-vinc{font-size:12px;color:#0C447C}
     .mov-op{font-size:12px;color:#57534E;user-select:all;white-space:nowrap}
-    .mov-op-grupo{font-size:11px;color:#6D28D9;background:#F3EEFB;border-radius:6px;padding:1px 7px;margin-left:6px;cursor:pointer;user-select:none}
-    .mov-op-grupo:hover{background:#E9DFF8}
     .mov-row-op td{box-shadow:inset 3px 0 0 #C7B8E0}
+    .mov-exp{border:0;background:transparent;color:#6D28D9;cursor:pointer;font-size:12px;padding:0 4px}
+    .mov-exp:hover{color:#4C1D95}
+    .mov-detalle > td{background:#FBFAF6;padding:8px 14px 8px 40px!important}
+    .mov-det-row{display:grid;grid-template-columns:1fr 140px 130px 90px;gap:12px;align-items:center;padding:3px 0;font-size:13px}
+    .mov-det-desc{color:#57534E}
+    .mov-det-cat{color:#A8A29E;font-size:12px}
     .mov-linea-sel{font-size:12px;padding:3px 6px;max-width:150px}
     .mov-linea-ro{font-size:12px;color:#A8A29E;font-style:italic}
     .mov-tag{font-size:12px;color:#57534E;background:#F5F5F4;padding:2px 8px;border-radius:6px}
