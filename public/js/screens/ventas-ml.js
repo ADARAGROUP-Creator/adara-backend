@@ -25,6 +25,22 @@ let FECHA = '';              // YYYY-MM-DD (modo día)
 let MES = '';                // YYYY-MM (modo mes)
 let FILTRO = 'todas';        // todas | por_cobrar | cobradas | conciliadas | canceladas | devueltas
 
+// ── Solapas de la pantalla ──────────────────────────────────────────────
+let TAB = 'ventas';          // ventas | devoluciones
+
+// ── Devoluciones (solo lectura, v1) ─────────────────────────────────────
+// Movimientos del extracto que son plata de devolución/cancelación y todavía
+// NO están enganchados a ninguna venta. El extracto no trae el N° de orden,
+// así que el enganche se sugiere por MONTO ESPEJO (el importe de la devolución
+// refleja el de la venta) y se resalta cuando la venta tiene un reclamo (claim)
+// detectado. Esta v1 solo muestra y sugiere — no escribe nada en la base.
+const DEV_CATS = ['devolucion', 'venta_cancelada', 'cargo_envio_devolucion'];
+const DEV_CAT_LBL = { devolucion: 'Devolución', venta_cancelada: 'Venta cancelada', cargo_envio_devolucion: 'Cargo envío devol.' };
+let DEVOLS = [];             // movimientos de devolución (normalizados)
+let DEV_FUENTE = '';         // 'movimientos' | 'movimientos_mp' | '' (de qué cajón se leyeron)
+let MOV_VINCULADOS = new Set(); // movimiento_id ya enganchados a alguna venta_ml
+let DEV_TOL = 1.00;          // tolerancia $ para sugerir match por monto espejo
+
 const TOL = 0.02;
 const r2 = n => Math.round((Number(n) || 0) * 100) / 100;
 const money = n => '$ ' + Math.abs(Number(n) || 0).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -135,6 +151,10 @@ export async function loadVentasML() {
       (VINC_BY_VENTA[v.op_id] = VINC_BY_VENTA[v.op_id] || []).push(v);
       VINC_MOV_USADOS.add(v.movimiento_id);
     }
+    // Movimientos ya enganchados (a cualquier venta_ml): sirve para marcar las
+    // devoluciones que ya tienen su venta asignada.
+    MOV_VINCULADOS = new Set(vinc.map(v => v.movimiento_id));
+    await cargarDevoluciones();
   } catch (e) {
     root.innerHTML = `<div class="error">No se pudieron cargar las ventas: ${esc(e.message)}</div>`;
     return;
@@ -145,6 +165,39 @@ export async function loadVentasML() {
   if (!MES || !MESES.includes(MES)) MES = MESES.length ? MESES[MESES.length - 1] : '';
   inyectarEstilo();
   render();
+}
+
+// Lee los movimientos de plata de devolución/cancelación. Primero del cajón
+// nuevo (`movimientos`); si ahí no hay ninguno, prueba el cajón viejo del
+// extracto (`movimientos_mp`) y lo deja marcado. Devuelve filas normalizadas:
+// { id, fecha, monto, categoria, descripcion }.
+async function cargarDevoluciones() {
+  DEVOLS = [];
+  DEV_FUENTE = '';
+  const inFilter = `(${DEV_CATS.join(',')})`;
+  // 1) Cajón nuevo
+  try {
+    const nuevos = await sbGet('movimientos', `categoria=in.${inFilter}&order=fecha.asc`);
+    if (nuevos.length) {
+      DEV_FUENTE = 'movimientos';
+      DEVOLS = nuevos.map(m => ({
+        id: m.id, fecha: m.fecha, monto: Number(m.monto) || 0,
+        categoria: m.categoria, descripcion: m.descripcion || ''
+      }));
+      return;
+    }
+  } catch (e) { console.warn('Devol (movimientos):', e.message); }
+  // 2) Cajón viejo (extracto MP), por si todavía no se migraron
+  try {
+    const viejos = await sbGet('movimientos_mp', `categoria=in.${inFilter}&order=fecha.asc`);
+    if (viejos.length) {
+      DEV_FUENTE = 'movimientos_mp';
+      DEVOLS = viejos.map(m => ({
+        id: m.id, fecha: m.fecha, monto: Number(m.monto_neto ?? m.monto) || 0,
+        categoria: m.categoria, descripcion: m.descripcion || m.tipo_operacion || ''
+      }));
+    }
+  } catch (e) { console.warn('Devol (movimientos_mp):', e.message); }
 }
 
 function paso(delta) {
@@ -160,7 +213,26 @@ function paso(delta) {
   render();
 }
 
+// Barra de solapas (Ventas / Devoluciones). Visible en ambas vistas.
+function tabBarHTML() {
+  const pend = DEVOLS.filter(d => !MOV_VINCULADOS.has(d.id)).length;
+  return `<div class="vml-tabs">
+    <button class="vml-tab ${TAB === 'ventas' ? 'active' : ''}" data-tab="ventas">Ventas</button>
+    <button class="vml-tab ${TAB === 'devoluciones' ? 'active' : ''}" data-tab="devoluciones">Devoluciones${pend ? ` <span class="vml-tab-n">${pend}</span>` : ''}</button>
+  </div>`;
+}
+function wireTabs(root) {
+  root.querySelectorAll('.vml-tab').forEach(b =>
+    b.addEventListener('click', () => { TAB = b.dataset.tab; render(); }));
+}
+
+// Conmutador de solapas.
 function render() {
+  if (TAB === 'devoluciones') return renderDevoluciones();
+  return renderVentas();
+}
+
+function renderVentas() {
   const root = document.getElementById('app-screens');
   const hayVentas = VENTAS.length > 0;
   const esMes = MODO === 'mes';
@@ -213,6 +285,7 @@ function render() {
   const vacioTxt = esMes ? `el mes de ${esc(mesLargo(MES))}` : `el ${esc(ddmm(FECHA))}`;
 
   root.innerHTML = `
+    ${tabBarHTML()}
     <div class="vml-bar">
       <button class="btn btn-primary" id="vml-sync">⟳ Sincronizar ventas</button>
       ${hayVentas ? modoHTML : ''}
@@ -252,6 +325,7 @@ function render() {
   `;
 
   document.getElementById('vml-sync').addEventListener('click', openSyncModal);
+  wireTabs(root);
   if (hayVentas) {
     root.querySelectorAll('.vml-modo button').forEach(b =>
       b.addEventListener('click', () => { MODO = b.dataset.modo; render(); }));
@@ -569,9 +643,156 @@ async function sincronizar(desde, hasta, overlay) {
   }
 }
 
-function inyectarEstilo() {
+// ── SOLAPA DEVOLUCIONES (v1: solo lectura + sugerencia) ─────────────────
+
+// Indexa las ventas por monto redondeado (por_cobrar e importe_bruto) para
+// buscar rápido la venta que "espeja" el importe de una devolución.
+function indexVentasPorMonto() {
+  const idx = new Map();
+  const push = (val, venta, campo) => {
+    const k = Math.round(Number(val) || 0);
+    if (!k) return;
+    if (!idx.has(k)) idx.set(k, []);
+    idx.get(k).push({ venta, campo });
+  };
+  for (const v of VENTAS) {
+    push(v.por_cobrar, v, 'por_cobrar');
+    push(v.importe_bruto, v, 'bruto');
+  }
+  return idx;
+}
+
+const tieneReclamo = v => !!(v.claim_id || v.devuelta || v.ml_status === 'cancelled' || v.claim_status);
+
+// Devuelve las ventas candidatas para un importe (monto espejo), ordenadas:
+// primero las que tienen reclamo detectado, después por diferencia más chica.
+function candidatosVenta(montoAbs, idx) {
+  const A = montoAbs;
+  const vistos = new Set();
+  const out = [];
+  for (const k of [Math.round(A) - 1, Math.round(A), Math.round(A) + 1]) {
+    for (const { venta, campo } of (idx.get(k) || [])) {
+      const ref = campo === 'bruto' ? venta.importe_bruto : venta.por_cobrar;
+      const diff = Math.abs((Number(ref) || 0) - A);
+      if (diff > DEV_TOL) continue;
+      if (vistos.has(venta.id)) continue;
+      vistos.add(venta.id);
+      out.push({ venta, campo, diff, reclamo: tieneReclamo(venta) });
+    }
+  }
+  out.sort((a, b) => (b.reclamo - a.reclamo) || (a.diff - b.diff));
+  return out;
+}
+
+function renderDevoluciones() {
+  const root = document.getElementById('app-screens');
+  const idx = indexVentasPorMonto();
+
+  // Solo las que faltan enganchar (las ya enganchadas se cuentan aparte).
+  const pendientes = DEVOLS.filter(d => !MOV_VINCULADOS.has(d.id));
+  const yaEng = DEVOLS.length - pendientes.length;
+
+  const filas = pendientes.map(d => {
+    const cands = candidatosVenta(Math.abs(d.monto), idx);
+    return { d, cands };
+  });
+
+  const con1 = filas.filter(f => f.cands.length === 1).length;
+  const conN = filas.filter(f => f.cands.length > 1).length;
+  const sin0 = filas.filter(f => f.cands.length === 0).length;
+
+  const fuenteLbl = DEV_FUENTE === 'movimientos_mp'
+    ? `<span class="vml-dev-warn">leídas del extracto MP (cajón viejo)</span>`
+    : DEV_FUENTE === 'movimientos' ? `` : `<span class="vml-dev-warn">no encontré movimientos de devolución en la base</span>`;
+
+  const banner = `<div class="vml-dev-banner">
+    Cada fila es <b>plata de una devolución o cancelación</b> que cayó en el extracto y todavía
+    <b>no está pegada a su venta</b>. El extracto no trae el N° de orden, así que te propongo la venta
+    cuyo importe <b>espeja</b> el de la devolución (y resalto si esa venta tiene un reclamo detectado).
+    Por ahora esto <b>solo muestra y sugiere</b>: todavía no engancha nada. ${fuenteLbl}
+  </div>`;
+
+  if (!DEVOLS.length) {
+    root.innerHTML = `${tabBarHTML()}${banner}
+      <div class="empty" style="margin-top:14px">No hay movimientos de devolución/cancelación cargados todavía.</div>`;
+    wireTabs(root);
+    return;
+  }
+
+  const kpis = `<div class="kpi-grid" style="margin:14px 0">
+    <div class="kpi"><div class="kpi-label">Devoluciones sin enganchar</div><div class="kpi-value">${pendientes.length}</div></div>
+    <div class="kpi"><div class="kpi-label">Con 1 venta sugerida</div><div class="kpi-value">${con1}</div></div>
+    <div class="kpi"><div class="kpi-label">Con varias candidatas</div><div class="kpi-value">${conN}</div></div>
+    <div class="kpi"><div class="kpi-label">Sin candidata por monto</div><div class="kpi-value">${sin0}</div></div>
+    <div class="kpi"><div class="kpi-label">Ya enganchadas</div><div class="kpi-value">${yaEng}</div></div>
+  </div>`;
+
+  const tabla = !pendientes.length
+    ? `<div class="empty" style="margin-top:14px">¡Listo! No quedan devoluciones sin enganchar.</div>`
+    : `<div class="table-wrap" style="margin-top:14px"><table class="t" id="vml-tabla">
+        <thead><tr>
+          <th style="width:56px">Fecha</th>
+          <th style="width:120px">Tipo</th>
+          <th>Detalle del extracto</th>
+          <th style="width:120px;text-align:right">Monto</th>
+          <th style="width:300px">Venta sugerida (por monto espejo)</th>
+        </tr></thead>
+        <tbody>${filas.map(filaDevolucionHTML).join('')}</tbody>
+      </table></div>`;
+
+  root.innerHTML = `${tabBarHTML()}${banner}${kpis}${tabla}`;
+  wireTabs(root);
+}
+
+function filaDevolucionHTML({ d, cands }) {
+  const debito = d.monto < 0;
+  const montoCls = debito ? 'vml-neg' : 'vml-pos';
+  const montoLbl = debito ? '− pagás' : '+ te devuelven';
+
+  let sug;
+  if (!cands.length) {
+    sug = `<span class="vml-dev-empty">— sin venta del mismo importe —</span>`;
+  } else {
+    const top = cands[0];
+    const v = top.venta;
+    const link = v.ml_order_id
+      ? `<a class="vml-venta-id" href="https://www.mercadolibre.com.ar/ventas/${encodeURIComponent(v.ml_order_id)}/detalle" target="_blank" rel="noopener" title="Abrir la venta en Mercado Libre">${esc(v.ml_order_id)}</a>`
+      : '—';
+    const claim = top.reclamo ? `<span class="vml-dev-claim" title="Esta venta tiene un reclamo/devolución detectado">↩ reclamo</span>` : '';
+    const aprox = top.diff > TOL ? `<span class="vml-dev-aprox" title="Difiere $${top.diff.toFixed(2)} del importe">≈</span>` : '';
+    const masN = cands.length > 1 ? `<span class="vml-dev-mas" title="${esc(cands.slice(1).map(c => c.venta.ml_order_id).filter(Boolean).join(', '))}">+${cands.length - 1} más</span>` : '';
+    sug = `<div class="vml-dev-sug">
+      ${aprox}${link} ${claim}
+      <div class="vml-dev-prod">${esc((v.titulo || '').slice(0, 60))} · ${money(top.campo === 'bruto' ? v.importe_bruto : v.por_cobrar)} ${masN}</div>
+    </div>`;
+  }
+
+  return `<tr>
+    <td class="vml-mono">${esc(ddmm(d.fecha))}</td>
+    <td>${esc(DEV_CAT_LBL[d.categoria] || d.categoria)}</td>
+    <td>${esc(d.descripcion || '—')}</td>
+    <td style="text-align:right" class="vml-mono ${montoCls}">${money(d.monto)}<div class="vml-dev-mlbl">${montoLbl}</div></td>
+    <td>${sug}</td>
+  </tr>`;
+}
+
+
   if (document.getElementById('vml-style')) return;
   const css = `
+    .vml-tabs{display:flex;gap:4px;border-bottom:1px solid var(--border-strong);margin-bottom:14px}
+    .vml-tab{border:0;background:transparent;color:#78716C;font-family:inherit;font-size:15px;font-weight:600;padding:9px 16px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}
+    .vml-tab:hover{color:#0C447C}
+    .vml-tab.active{color:#0C447C;border-bottom-color:#0C447C}
+    .vml-tab-n{font-size:12px;background:#FAF1E1;color:#92500A;border-radius:8px;padding:1px 8px;margin-left:4px}
+    .vml-dev-banner{font-size:13px;color:#57534E;background:#FBFAF6;border:1px solid #EAE6DD;border-radius:var(--r-sm);padding:10px 14px;line-height:1.5}
+    .vml-dev-warn{display:inline-block;margin-left:6px;color:#92500A;background:#FAF1E1;border-radius:6px;padding:1px 8px;font-size:12px}
+    .vml-dev-mlbl{font-size:11px;color:#A8A29E;font-weight:400}
+    .vml-dev-sug{line-height:1.4}
+    .vml-dev-prod{font-size:12px;color:#78716C;margin-top:2px}
+    .vml-dev-claim{font-size:11px;color:#92500A;background:#FAF1E1;border-radius:6px;padding:1px 7px;margin-left:4px}
+    .vml-dev-aprox{color:#A8A29E;margin-right:3px}
+    .vml-dev-mas{font-size:11px;color:#0C447C;background:#E6F1FB;border-radius:6px;padding:1px 7px;margin-left:6px;cursor:help}
+    .vml-dev-empty{color:#A8A29E;font-size:13px}
     .vml-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
     .vml-modo{display:inline-flex;border:1px solid var(--border-strong);border-radius:var(--r-sm);overflow:hidden}
     .vml-modo button{border:0;background:var(--surface);color:var(--text-muted);font-family:inherit;font-size:14px;font-weight:600;padding:8px 16px;cursor:pointer}
