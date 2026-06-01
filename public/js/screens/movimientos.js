@@ -28,6 +28,7 @@ let MESES = [];            // meses disponibles, desc
 let ESTADO_BY_ID = {};     // movimiento_id -> estado (ÚNICA fuente de verdad: v_movimientos_estado)
 let VINC_OPS = {};         // movimiento_id -> [{op_tipo, op_id}]
 let VENTA_NUM = {};        // ventas_ml.id -> ml_order_id (para mostrar el N° de venta)
+let OP_COUNT = {};         // N° de operación -> cuántas líneas comparten ese número
 
 // Etiqueta linda por código de cuenta (fallback al código si no está mapeado)
 const LABEL_CUENTA = {
@@ -162,6 +163,14 @@ export async function loadMovimientos() {
 function render() {
   const root = document.getElementById('app-screens');
 
+  // Cuántas líneas comparten cada número de operación (para mostrar la operación
+  // completa: ej. transferencia + su impuesto, o cobro + sus devoluciones).
+  OP_COUNT = {};
+  for (const m of DATA) {
+    const op = nroOperacion(m);
+    if (op) OP_COUNT[op] = (OP_COUNT[op] || 0) + 1;
+  }
+
   // Base: respeta MES (extracto) + cuenta + búsqueda (NO el estado, que es la pill)
   const base = DATA.filter(m => {
     if (MES && mesDe(m.fecha) !== MES) return false;
@@ -249,6 +258,14 @@ function render() {
   document.querySelectorAll('.mov-del').forEach(b => {
     b.addEventListener('click', () => borrarMovimiento(b.dataset.id));
   });
+  document.querySelectorAll('.mov-op-grupo').forEach(b => {
+    b.addEventListener('click', () => {
+      FILTRO.q = b.dataset.op;
+      const inp = document.getElementById('f-q');
+      if (inp) inp.value = b.dataset.op;
+      render();
+    });
+  });
 }
 
 function filaHTML(m) {
@@ -259,11 +276,15 @@ function filaHTML(m) {
   const catSinClasif = !m.categoria || m.categoria === 'sin_clasificar';
   const vinc = vinculadoA(m);
   const nroOp = nroOperacion(m);
-  return `<tr>
+  const grupo = nroOp && OP_COUNT[nroOp] > 1 ? OP_COUNT[nroOp] : 0;
+  const badge = grupo
+    ? ` <span class="mov-op-grupo" data-op="${esc(nroOp)}" title="Esta operación tiene ${grupo} líneas (ej. transferencia + su impuesto). Clic para verlas juntas.">${grupo} líneas</span>`
+    : '';
+  return `<tr class="${grupo ? 'mov-row-op' : ''}">
     <td>${(m.fecha || '').slice(8, 10)}/${(m.fecha || '').slice(5, 7)}</td>
     <td>${cuentaLabel(m.cuenta_id)}</td>
     <td>${m.descripcion ? esc(m.descripcion) : '<span class="mov-muted">—</span>'}</td>
-    <td class="mov-mono mov-op">${nroOp ? `<span title="Copiá este número y buscalo en el extracto de MP">${esc(nroOp)}</span>` : '<span class="mov-muted">—</span>'}</td>
+    <td class="mov-mono mov-op">${nroOp ? `<span title="Copiá este número y buscalo en el extracto de MP">${esc(nroOp)}</span>${badge}` : '<span class="mov-muted">—</span>'}</td>
     <td>${catSinClasif ? '<span class="mov-tag-empty">sin clasificar</span>' : `<span class="mov-tag">${esc(catLabel)}</span>`}</td>
     <td style="text-align:right" class="mov-mono ${neg ? 'mov-neg' : 'mov-pos'}">${fmtMonto(m.monto, moneda)}</td>
     <td class="mov-mono mov-vinc">${vinc || '<span class="mov-muted">—</span>'}</td>
@@ -521,6 +542,9 @@ function inyectarEstilo() {
     .mov-muted{color:#A8A29E}
     .mov-vinc{font-size:12px;color:#0C447C}
     .mov-op{font-size:12px;color:#57534E;user-select:all;white-space:nowrap}
+    .mov-op-grupo{font-size:11px;color:#6D28D9;background:#F3EEFB;border-radius:6px;padding:1px 7px;margin-left:6px;cursor:pointer;user-select:none}
+    .mov-op-grupo:hover{background:#E9DFF8}
+    .mov-row-op td{box-shadow:inset 3px 0 0 #C7B8E0}
     .mov-tag{font-size:12px;color:#57534E;background:#F5F5F4;padding:2px 8px;border-radius:6px}
     .mov-tag-empty{font-size:12px;color:#A8A29E;border:1px dashed #D6D3D1;padding:2px 8px;border-radius:6px}
     .mov-badge{font-size:12px;padding:2px 8px;border-radius:6px}
