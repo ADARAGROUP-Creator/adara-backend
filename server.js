@@ -2838,6 +2838,34 @@ app.post('/vincular', async (req, res) => {
   }
 });
 
+// Conciliación en lote: inserta muchos vínculos de una sola vez (para "Conciliar
+// todas"). Recibe { vinculos: [{ movimiento_id, op_tipo, op_id, monto }, ...] }.
+// Valida cada uno igual que /vincular y hace un único upsert (idempotente por
+// la clave movimiento_id,op_tipo,op_id, así que reintentar no duplica).
+app.post('/vincular-lote', async (req, res) => {
+  try {
+    const { vinculos } = req.body || {};
+    if (!Array.isArray(vinculos) || !vinculos.length) {
+      return res.status(400).json({ error: 'Faltan vínculos' });
+    }
+    const tiposOk = ['venta', 'venta_ml', 'compra', 'gasto', 'reclamo', 'transferencia', 'ajuste'];
+    const lote = [];
+    for (const v of vinculos) {
+      const { movimiento_id, op_tipo, op_id, monto } = v || {};
+      if (!movimiento_id || !op_tipo || !op_id) return res.status(400).json({ error: 'Vínculo incompleto en el lote' });
+      if (!tiposOk.includes(op_tipo)) return res.status(400).json({ error: 'op_tipo inválido: ' + op_tipo });
+      const m = Math.round(Number(monto) * 100) / 100;
+      if (!(m > 0)) return res.status(400).json({ error: 'monto inválido en el lote' });
+      lote.push({ movimiento_id, op_tipo, op_id, monto: m });
+    }
+    const rows = await sbUpsert('vinculos', lote, 'movimiento_id,op_tipo,op_id');
+    res.json({ ok: true, insertados: Array.isArray(rows) ? rows.length : lote.length });
+  } catch (e) {
+    console.error('vincular-lote:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.delete('/vincular/:id', async (req, res) => {
   try {
     await sb('DELETE', 'vinculos', null, `id=eq.${req.params.id}`);
