@@ -38,7 +38,8 @@ const DEV_CATS = ['devolucion', 'venta_cancelada', 'cargo_envio_devolucion'];
 const DEV_CAT_LBL = { devolucion: 'Devolución', venta_cancelada: 'Venta cancelada', cargo_envio_devolucion: 'Cargo envío devol.' };
 let DEVOLS = [];             // movimientos de devolución (normalizados)
 let DEV_FUENTE = '';         // 'movimientos' | 'movimientos_mp' | '' (de qué cajón se leyeron)
-let MOV_VINCULADOS = new Set(); // movimiento_id ya enganchados a alguna venta_ml
+let MOV_VINCULADOS = new Set(); // movimiento_id de devolución ya enganchados a una venta
+let DEV_LINK_BY_MOV = new Map(); // movimiento_id de devolución -> vínculo (para mostrar venta + deshacer)
 let DEV_TOL = 1.00;          // tolerancia $ para sugerir match por monto espejo
 
 const TOL = 0.02;
@@ -144,17 +145,28 @@ export async function loadVentasML() {
       COBROS_BY_ID[c.id] = c;
       if (/bonific/i.test(c.descripcion || '')) BONIFS.push(c);
     }
+    // Las devoluciones se cargan ANTES de los vínculos para poder separar, al
+    // recorrer los vínculos, los que son de cobro (solapa Ventas) de los que son
+    // de devolución (esta solapa). Así la solapa Ventas no ve los de devolución.
+    await cargarDevoluciones();
+    const DEV_IDS = new Set(DEVOLS.map(d => d.id));
+
     const vinc = await sbGet('vinculos', 'op_tipo=eq.venta_ml');
     VINC_BY_VENTA = {};
     VINC_MOV_USADOS = new Set();
+    MOV_VINCULADOS = new Set();
+    DEV_LINK_BY_MOV = new Map();
     for (const v of vinc) {
-      (VINC_BY_VENTA[v.op_id] = VINC_BY_VENTA[v.op_id] || []).push(v);
-      VINC_MOV_USADOS.add(v.movimiento_id);
+      if (DEV_IDS.has(v.movimiento_id)) {
+        // Vínculo de una DEVOLUCIÓN: no entra en la lógica de cobro de Ventas.
+        MOV_VINCULADOS.add(v.movimiento_id);
+        DEV_LINK_BY_MOV.set(v.movimiento_id, v);
+      } else {
+        // Vínculo de COBRO (lo que usa la solapa Ventas, igual que siempre).
+        (VINC_BY_VENTA[v.op_id] = VINC_BY_VENTA[v.op_id] || []).push(v);
+        VINC_MOV_USADOS.add(v.movimiento_id);
+      }
     }
-    // Movimientos ya enganchados (a cualquier venta_ml): sirve para marcar las
-    // devoluciones que ya tienen su venta asignada.
-    MOV_VINCULADOS = new Set(vinc.map(v => v.movimiento_id));
-    await cargarDevoluciones();
   } catch (e) {
     root.innerHTML = `<div class="error">No se pudieron cargar las ventas: ${esc(e.message)}</div>`;
     return;
@@ -777,19 +789,61 @@ function renderDevoluciones() {
 
   const tabla = !pendientes.length
     ? `<div class="empty" style="margin-top:14px">¡Listo! No quedan devoluciones sin enganchar.</div>`
-    : `<div class="table-wrap" style="margin-top:14px"><table class="t" id="vml-tabla">
+    : `<div class="table-wrap" style="margin-top:14px"><table class="t" id="vml-tabla-dev">
         <thead><tr>
           <th style="width:56px">Fecha</th>
           <th style="width:120px">Tipo</th>
           <th>Detalle del extracto</th>
           <th style="width:120px;text-align:right">Monto</th>
-          <th style="width:320px">Venta (🔗 por número / por monto espejo)</th>
+          <th style="width:300px">Venta (🔗 por número / por monto espejo)</th>
+          <th style="width:160px">Acción</th>
         </tr></thead>
         <tbody>${filas.map(filaDevolucionHTML).join('')}</tbody>
       </table></div>`;
 
-  root.innerHTML = `${tabBarHTML()}${banner}${kpis}${tabla}`;
+  // Sección de las que ya están enganchadas (con botón de deshacer).
+  const enganchadas = DEVOLS.filter(d => MOV_VINCULADOS.has(d.id));
+  const engHTML = !enganchadas.length ? '' : `
+    <div class="card-title" style="margin-top:26px">Ya enganchadas (${enganchadas.length})</div>
+    <div class="table-wrap" style="margin-top:10px"><table class="t" id="vml-tabla-dev-eng">
+      <thead><tr>
+        <th style="width:56px">Fecha</th>
+        <th style="width:120px">Tipo</th>
+        <th>Detalle del extracto</th>
+        <th style="width:120px;text-align:right">Monto</th>
+        <th style="width:300px">Venta enganchada</th>
+        <th style="width:160px">Acción</th>
+      </tr></thead>
+      <tbody>${enganchadas.map(filaEnganchadaHTML).join('')}</tbody>
+    </table></div>`;
+
+  root.innerHTML = `${tabBarHTML()}${banner}${kpis}${tabla}${engHTML}`;
   wireTabs(root);
+  const tDev = document.getElementById('vml-tabla-dev');
+  if (tDev) tDev.addEventListener('click', onDevClick);
+  const tEng = document.getElementById('vml-tabla-dev-eng');
+  if (tEng) tEng.addEventListener('click', onDevClick);
+}
+
+// Devuelve las ventas "objetivo" para enganchar: primero las de match directo
+// por número (alta confianza); si no hay, las candidatas por monto.
+function objetivosDe(directos, cands) {
+  if (directos.length) return directos.map(x => x.venta);
+  return cands.map(c => c.venta);
+}
+
+// Celda de acción: 1 objetivo → botón directo; varios → desplegable + botón.
+function accionDevHTML(d, objetivos) {
+  if (!objetivos.length) return `<span class="vml-dev-empty">—</span>`;
+  const monto = r2(Math.abs(Number(d.monto) || 0));
+  if (objetivos.length === 1) {
+    return `<button class="btn btn-primary vml-mini" data-accion="enganchar" data-mov="${d.id}" data-venta="${objetivos[0].id}" data-monto="${monto}">Enganchar</button>`;
+  }
+  const opts = objetivos.map(v => `<option value="${v.id}">${esc(v.ml_order_id || ('#' + v.id))} · ${esc((v.titulo || '').slice(0, 28))}</option>`).join('');
+  return `<div class="vml-dev-pick">
+    <select class="input vml-dev-select" id="dev-sel-${d.id}">${opts}</select>
+    <button class="btn btn-primary vml-mini" data-accion="enganchar-sel" data-mov="${d.id}" data-monto="${monto}">Enganchar</button>
+  </div>`;
 }
 
 function ventaLink(v) {
@@ -828,13 +882,86 @@ function filaDevolucionHTML({ d, directos, cands }) {
     sug = `<span class="vml-dev-empty">— sin pista (ni número ni monto) —</span>`;
   }
 
+  const objetivos = objetivosDe(directos, cands);
   return `<tr>
     <td class="vml-mono">${esc(ddmm(d.fecha))}</td>
     <td>${esc(DEV_CAT_LBL[d.categoria] || d.categoria)}</td>
     <td>${esc(d.descripcion || '—')}</td>
     <td style="text-align:right" class="vml-mono ${montoCls}">${money(d.monto)}<div class="vml-dev-mlbl">${montoLbl}</div></td>
     <td>${sug}</td>
+    <td>${accionDevHTML(d, objetivos)}</td>
   </tr>`;
+}
+
+// Fila de una devolución ya enganchada: muestra la venta vinculada + deshacer.
+function filaEnganchadaHTML(d) {
+  const debito = d.monto < 0;
+  const montoCls = debito ? 'vml-neg' : 'vml-pos';
+  const link = DEV_LINK_BY_MOV.get(d.id);
+  const v = link ? VENTAS.find(x => String(x.id) === String(link.op_id)) : null;
+  const ventaCell = v
+    ? `<div class="vml-dev-sug">${ventaLink(v)}<div class="vml-dev-prod">${esc((v.titulo || '').slice(0, 60))} · ${money(v.por_cobrar)}</div></div>`
+    : `<span class="vml-dev-empty">venta #${esc(link ? link.op_id : '?')}</span>`;
+  const accion = link
+    ? `<button class="btn btn-ghost vml-mini" data-accion="desenganchar" data-vinc="${link.id}">Desenganchar</button>`
+    : '—';
+  return `<tr class="vml-row-dev">
+    <td class="vml-mono">${esc(ddmm(d.fecha))}</td>
+    <td>${esc(DEV_CAT_LBL[d.categoria] || d.categoria)}</td>
+    <td>${esc(d.descripcion || '—')}</td>
+    <td style="text-align:right" class="vml-mono ${montoCls}">${money(d.monto)}</td>
+    <td>${ventaCell}</td>
+    <td>${accion}</td>
+  </tr>`;
+}
+
+// Manejador de clics de las tablas de devoluciones (enganchar / desenganchar).
+function onDevClick(e) {
+  const btn = e.target.closest('[data-accion]');
+  if (!btn) return;
+  const a = btn.dataset.accion;
+  if (a === 'enganchar') {
+    engancharDev(btn.dataset.mov, btn.dataset.venta, btn.dataset.monto);
+  } else if (a === 'enganchar-sel') {
+    const sel = document.getElementById('dev-sel-' + btn.dataset.mov);
+    if (!sel || !sel.value) { window.toast('Elegí una venta', 'error'); return; }
+    engancharDev(btn.dataset.mov, sel.value, btn.dataset.monto);
+  } else if (a === 'desenganchar') {
+    desengancharDev(btn.dataset.vinc);
+  }
+}
+
+// Crea el vínculo devolución → venta (op_tipo='venta_ml', monto positivo).
+async function engancharDev(movId, ventaId, monto) {
+  const m = r2(Math.abs(Number(monto) || 0));
+  if (!(m > 0)) { window.toast('La devolución tiene monto 0, no se puede enganchar', 'error'); return; }
+  window.toast('Enganchando…');
+  try {
+    const r = await fetch('/vincular', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ movimiento_id: Number(movId), op_tipo: 'venta_ml', op_id: Number(ventaId), monto: m })
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+    window.toast('Devolución enganchada a la venta');
+    await loadVentasML();
+  } catch (e) {
+    window.toast('Error al enganchar: ' + e.message, 'error');
+  }
+}
+
+// Deshace el enganche de una devolución (borra el vínculo).
+async function desengancharDev(vincId) {
+  if (!confirm('¿Desenganchar esta devolución de su venta?')) return;
+  try {
+    const r = await fetch('/vincular/' + vincId, { method: 'DELETE' });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+    window.toast('Devolución desenganchada');
+    await loadVentasML();
+  } catch (e) {
+    window.toast('Error al desenganchar: ' + e.message, 'error');
+  }
 }
 
 function inyectarEstilo() {
@@ -852,6 +979,8 @@ function inyectarEstilo() {
     .vml-dev-prod{font-size:12px;color:#78716C;margin-top:2px}
     .vml-dev-claim{font-size:11px;color:#92500A;background:#FAF1E1;border-radius:6px;padding:1px 7px;margin-left:4px}
     .vml-dev-id{font-size:11px;color:#0F6E56;background:#E1F5EE;border-radius:6px;padding:1px 7px;font-weight:600}
+    .vml-dev-pick{display:flex;gap:6px;align-items:center}
+    .vml-dev-select{padding:4px 6px;font-size:12px;max-width:170px}
     .vml-dev-aprox{color:#A8A29E;margin-right:3px}
     .vml-dev-mas{font-size:11px;color:#0C447C;background:#E6F1FB;border-radius:6px;padding:1px 7px;margin-left:6px;cursor:help}
     .vml-dev-empty{color:#A8A29E;font-size:13px}
