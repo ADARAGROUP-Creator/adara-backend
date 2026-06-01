@@ -1,20 +1,18 @@
 import { sbGet } from '../core/sb.js';
 
-// ── Pantalla: Ventas ML (solo lectura + sincronización + filtros) ──────
-// Lista las ventas de ML día por día con su detalle real (bruto, comisión,
-// envío, impuestos, costo financiero, por cobrar) y cruza cada venta contra
-// los cobros del extracto de MP para mostrar cuáles se liquidaron.
-//
-// Filtros por estado para no perder de vista nada: por cobrar / cobradas /
-// canceladas / devueltas. El cruce venta ↔ cobro se hace por mp_payment_id
-// (el REFERENCE_ID del extracto queda embebido en movimientos.referencia_externa
-// como "fecha|REF|monto|saldo"). NO concilia: es para controlar y validar.
+// ── Pantalla: Ventas ML (control diario + conciliación) ────────────────
+// Lista las ventas de ML día por día con su detalle real y las cruza contra
+// los cobros del extracto de MP. Permite CONCILIAR (vincular venta ↔ cobro)
+// las ventas "limpias" (1 cobro, monto coincide). Las dudosas se marcan para
+// revisar a mano en la pantalla Conciliación. Cruce por mp_payment_id; vínculo
+// op_tipo='venta_ml', op_id=ventas_ml.id, monto=por_cobrar (magnitud positiva).
 
 let VENTAS = [];
-let COBROS_BY_REF = {};
+let COBROS_BY_REF = {};      // REFERENCE_ID del extracto -> movimiento (cobro_venta)
+let VINC_BY_VENTA = {};      // ventas_ml.id -> vínculo (op_tipo='venta_ml')
 let DIAS = [];
 let FECHA = '';
-let FILTRO = 'todas';   // todas | por_cobrar | cobradas | canceladas | devueltas
+let FILTRO = 'todas';        // todas | por_cobrar | cobradas | conciliadas | canceladas | devueltas
 
 const money = n => '$ ' + Math.abs(Number(n) || 0).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const ddmm = f => `${(f || '').slice(8, 10)}/${(f || '').slice(5, 7)}`;
@@ -37,19 +35,31 @@ function matchCobros(v) {
   for (const id of paymentIds(v)) if (COBROS_BY_REF[id]) cobros.push(COBROS_BY_REF[id]);
   return cobros;
 }
+const estaConciliada = v => !!VINC_BY_VENTA[v.id];
 
-// Clasificación de la venta para filtros y estado
+// Conciliable automático: no conciliada, no cancelada/devuelta, exactamente 1
+// cobro y su monto coincide con el por cobrar (tolerancia 2 centavos).
+function conciliable(v) {
+  if (estaConciliada(v) || v.ml_status === 'cancelled' || v.devuelta) return false;
+  const cb = matchCobros(v);
+  if (cb.length !== 1) return false;
+  const sum = cb.reduce((s, c) => s + (Number(c.monto) || 0), 0);
+  return Math.abs(sum - (Number(v.por_cobrar) || 0)) < 0.02;
+}
+
 function clase(v) {
   if (v.ml_status === 'cancelled') return 'canceladas';
   if (v.devuelta) return 'devueltas';
+  if (estaConciliada(v)) return 'conciliadas';
   if (matchCobros(v).length > 0) return 'cobradas';
   return 'por_cobrar';
 }
 const ESTADO_LBL = {
-  canceladas: { txt: 'Cancelada', cls: 'canc' },
-  devueltas:  { txt: 'Devuelta',  cls: 'dev' },
-  cobradas:   { txt: 'Cobrada',   cls: 'cob' },
-  por_cobrar: { txt: 'Por cobrar', cls: '' },
+  canceladas:  { txt: 'Cancelada',  cls: 'canc' },
+  devueltas:   { txt: 'Devuelta',   cls: 'dev' },
+  conciliadas: { txt: 'Conciliada', cls: 'conc' },
+  cobradas:    { txt: 'Cobrada',    cls: 'cob' },
+  por_cobrar:  { txt: 'Por cobrar', cls: '' },
 };
 
 export async function loadVentasML() {
@@ -63,6 +73,9 @@ export async function loadVentasML() {
       const ref = String(c.referencia_externa || '').split('|')[1];
       if (ref) COBROS_BY_REF[ref.trim()] = c;
     }
+    const vinc = await sbGet('vinculos', 'op_tipo=eq.venta_ml');
+    VINC_BY_VENTA = {};
+    for (const v of vinc) VINC_BY_VENTA[v.op_id] = v;
   } catch (e) {
     root.innerHTML = `<div class="error">No se pudieron cargar las ventas: ${esc(e.message)}</div>`;
     return;
@@ -86,13 +99,11 @@ function render() {
   const hayVentas = VENTAS.length > 0;
   const delDia = hayVentas ? VENTAS.filter(v => v.fecha === FECHA) : [];
 
-  // conteos por estado (del día)
-  const cont = { todas: delDia.length, por_cobrar: 0, cobradas: 0, canceladas: 0, devueltas: 0 };
+  const cont = { todas: delDia.length, por_cobrar: 0, cobradas: 0, conciliadas: 0, canceladas: 0, devueltas: 0 };
   delDia.forEach(v => { cont[clase(v)]++; });
 
   const visibles = FILTRO === 'todas' ? delDia : delDia.filter(v => clase(v) === FILTRO);
 
-  // KPIs del día (sobre todas, no sobre el filtro)
   const totBruto = delDia.reduce((s, v) => s + (Number(v.importe_bruto) || 0), 0);
   const totCobrar = delDia.reduce((s, v) => s + (Number(v.por_cobrar) || 0), 0);
 
@@ -112,6 +123,7 @@ function render() {
       ${pill('todas', 'Todas')}
       ${pill('por_cobrar', 'Por cobrar')}
       ${pill('cobradas', 'Cobradas')}
+      ${pill('conciliadas', 'Conciliadas')}
       ${pill('canceladas', 'Canceladas')}
       ${pill('devueltas', 'Devueltas')}
     </div>` : '';
@@ -125,9 +137,9 @@ function render() {
     ${hayVentas ? `
       <div class="kpi-grid" style="margin:14px 0">
         <div class="kpi"><div class="kpi-label">Ventas del día</div><div class="kpi-value">${delDia.length}</div></div>
-        <div class="kpi"><div class="kpi-label">Bruto</div><div class="kpi-value">${money(totBruto)}</div></div>
         <div class="kpi"><div class="kpi-label">Por cobrar (neto)</div><div class="kpi-value">${money(totCobrar)}</div></div>
-        <div class="kpi"><div class="kpi-label">Ya cobradas</div><div class="kpi-value">${cont.cobradas} <span class="vml-de">de ${delDia.length}</span></div></div>
+        <div class="kpi"><div class="kpi-label">Cobradas sin conciliar</div><div class="kpi-value">${cont.cobradas}</div></div>
+        <div class="kpi"><div class="kpi-label">Conciliadas</div><div class="kpi-value">${cont.conciliadas} <span class="vml-de">de ${delDia.length}</span></div></div>
       </div>
       ${pills}
       ${visibles.length === 0
@@ -145,7 +157,7 @@ function render() {
               <th style="width:95px;text-align:right">Financiero</th>
               <th style="width:120px;text-align:right">Por cobrar</th>
               <th style="width:92px">Estado</th>
-              <th style="width:160px">Cobro</th>
+              <th style="width:230px">Cobro / Conciliación</th>
             </tr></thead>
             <tbody>${visibles.map(filaHTML).join('')}</tbody>
           </table></div>`}
@@ -158,6 +170,8 @@ function render() {
     document.getElementById('vml-next').addEventListener('click', () => pasoDia(1));
     document.getElementById('vml-fecha').addEventListener('change', e => { FECHA = e.target.value; render(); });
     root.querySelectorAll('.pill').forEach(p => p.addEventListener('click', () => { FILTRO = p.dataset.f; render(); }));
+    const tabla = document.getElementById('vml-tabla');
+    if (tabla) tabla.addEventListener('click', onTablaClick);
   }
 }
 
@@ -167,22 +181,34 @@ function celdaMonto(valor) {
   return `<td style="text-align:right" class="vml-mono ${n < 0 ? 'vml-neg' : 'vml-pos'}">${money(n)}</td>`;
 }
 
+// Celda de cobro + acción de conciliación según el estado de la venta
+function cobroCell(v) {
+  if (estaConciliada(v)) {
+    const vinc = VINC_BY_VENTA[v.id];
+    return `<span class="vml-conc">✓ conciliada</span>`
+      + `<button class="vml-x" data-accion="desvincular" data-vinculo="${vinc.id}" title="Deshacer conciliación">✕</button>`;
+  }
+  const cobros = matchCobros(v);
+  if (!cobros.length) return `<span class="vml-cobro-no">— sin cobro</span>`;
+
+  const sum = cobros.reduce((s, c) => s + (Number(c.monto) || 0), 0);
+  const ok = `<span class="vml-cobro-ok">✓ ${money(sum)}</span>`;
+
+  if (v.ml_status === 'cancelled' || v.devuelta) {
+    return `${ok}<span class="vml-rev" title="Cancelada/devuelta: revisar en Conciliación">revisar</span>`;
+  }
+  if (conciliable(v)) {
+    return `${ok}<button class="btn btn-primary vml-mini" data-accion="conciliar" data-venta="${v.id}">Conciliar</button>`;
+  }
+  // Tiene cobro pero no es limpia (varios cobros o el monto no coincide)
+  const motivo = cobros.length > 1 ? 'varios cobros' : 'monto ≠';
+  return `${ok}<span class="vml-rev" title="No coincide exacto (${motivo}): conciliar a mano en Conciliación">revisar (${motivo})</span>`;
+}
+
 function filaHTML(v) {
   const cl = clase(v);
   const est = ESTADO_LBL[cl];
   const rowCls = est.cls === 'canc' ? 'vml-row-canc' : est.cls === 'dev' ? 'vml-row-dev' : '';
-  const cobros = matchCobros(v);
-
-  let cobroCell;
-  if (cobros.length) {
-    const sum = cobros.reduce((s, c) => s + (Number(c.monto) || 0), 0);
-    const difiere = Math.abs(sum - (Number(v.por_cobrar) || 0)) > 0.02;
-    cobroCell = `<span class="vml-cobro-ok">✓ ${money(sum)}</span>`
-      + `<span class="vml-cobro-fecha">${ddmm(cobros[0].fecha)}</span>`
-      + (difiere ? `<span class="vml-cobro-dif" title="No coincide con el por cobrar">≠</span>` : '');
-  } else {
-    cobroCell = `<span class="vml-cobro-no">— sin cobro</span>`;
-  }
 
   return `<tr class="${rowCls}">
     <td class="vml-mono">${v.ml_order_id
@@ -198,8 +224,49 @@ function filaHTML(v) {
     ${celdaMonto(v.costo_financiero)}
     <td style="text-align:right" class="vml-mono vml-fuerte">${money(v.por_cobrar)}</td>
     <td><span class="vml-est vml-est-${est.cls || 'ok'}">${esc(est.txt)}</span></td>
-    <td>${cobroCell}</td>
+    <td>${cobroCell(v)}</td>
   </tr>`;
+}
+
+function onTablaClick(e) {
+  const btn = e.target.closest('[data-accion]');
+  if (!btn) return;
+  if (btn.dataset.accion === 'conciliar') conciliar(btn.dataset.venta);
+  else if (btn.dataset.accion === 'desvincular') desvincular(btn.dataset.vinculo);
+}
+
+async function conciliar(ventaId) {
+  const v = VENTAS.find(x => String(x.id) === String(ventaId));
+  if (!v) return;
+  const cobros = matchCobros(v);
+  if (cobros.length !== 1) { window.toast('Esta venta no se puede conciliar automáticamente', 'error'); return; }
+  const monto = Math.round((Number(v.por_cobrar) || 0) * 100) / 100;
+  window.toast('Conciliando…');
+  try {
+    const r = await fetch('/vincular', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ movimiento_id: cobros[0].id, op_tipo: 'venta_ml', op_id: v.id, monto })
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+    window.toast('Venta conciliada');
+    await loadVentasML();
+  } catch (e) {
+    window.toast('Error al conciliar: ' + e.message, 'error');
+  }
+}
+
+async function desvincular(vinculoId) {
+  if (!confirm('¿Deshacer la conciliación de esta venta? El cobro y la venta vuelven a quedar pendientes.')) return;
+  try {
+    const r = await fetch('/vincular/' + vinculoId, { method: 'DELETE' });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+    window.toast('Conciliación deshecha');
+    await loadVentasML();
+  } catch (e) {
+    window.toast('Error: ' + e.message, 'error');
+  }
 }
 
 function openSyncModal() {
@@ -277,13 +344,17 @@ function inyectarEstilo() {
     .vml-est{font-size:12px;padding:2px 8px;border-radius:6px;background:#F1EFE8;color:#57534E}
     .vml-est-canc{background:#FBEAEA;color:#B42318}
     .vml-est-dev{background:#FAF1E1;color:#92500A}
-    .vml-est-cob{background:#E1F5EE;color:#0F6E56}
+    .vml-est-cob{background:#E6F1FB;color:#0C447C}
+    .vml-est-conc{background:#E1F5EE;color:#0F6E56}
     .vml-row-canc{background:rgba(180,35,24,0.05)}
     .vml-row-dev{background:rgba(217,119,6,0.06)}
-    .vml-cobro-ok{color:#0F6E56;font-weight:600;font-family:'JetBrains Mono',ui-monospace,monospace}
-    .vml-cobro-fecha{font-size:11px;color:#A8A29E;margin-left:6px}
-    .vml-cobro-dif{color:#B45309;font-weight:700;margin-left:6px}
+    .vml-cobro-ok{color:#0F6E56;font-weight:600;font-family:'JetBrains Mono',ui-monospace,monospace;margin-right:8px}
     .vml-cobro-no{font-size:12px;color:#857a5c;background:#FAF6EC;border:1px dashed #E3D9BE;border-radius:6px;padding:2px 8px}
+    .vml-conc{color:#0F6E56;font-weight:600;margin-right:6px}
+    .vml-rev{font-size:12px;color:#92500A;background:#FAF1E1;border-radius:6px;padding:2px 8px}
+    .vml-mini{padding:4px 10px;font-size:13px}
+    .vml-x{border:0;background:transparent;color:#A8A29E;cursor:pointer;font-size:13px;padding:0 2px}
+    .vml-x:hover{color:#B91C1C}
   `;
   const style = document.createElement('style');
   style.id = 'vml-style';
