@@ -49,8 +49,12 @@ function paymentIds(v) {
   return [...new Set(ids)];
 }
 function matchCobros(v) {
+  const vistos = new Set();
   const cobros = [];
-  for (const id of paymentIds(v)) if (COBROS_BY_REF[id]) cobros.push(COBROS_BY_REF[id]);
+  for (const id of paymentIds(v)) {
+    const c = COBROS_BY_REF[id];
+    if (c && !vistos.has(c.id)) { vistos.add(c.id); cobros.push(c); }
+  }
   return cobros;
 }
 const estaConciliada = v => !!(VINC_BY_VENTA[v.id] && VINC_BY_VENTA[v.id].length);
@@ -70,8 +74,9 @@ function asignarBonifs(ventas) {
   for (const v of ventas) {
     if (estaConciliada(v) || v.ml_status === 'cancelled' || v.devuelta) continue;
     const cb = matchCobros(v);
-    if (cb.length !== 1) continue;
-    const falta = r2((Number(v.por_cobrar) || 0) - (Number(cb[0].monto) || 0));
+    if (!cb.length) continue;
+    const sum = cb.reduce((s, c) => s + (Number(c.monto) || 0), 0);
+    const falta = r2((Number(v.por_cobrar) || 0) - sum);
     if (Math.abs(falta) < TOL || falta < 0) continue;
     const b = buscarBonif(falta, usados);
     if (b) { map[v.id] = b; usados.add(b.id); }
@@ -83,12 +88,12 @@ function asignarBonifs(ventas) {
 function conciliable(v, bonifMap) {
   if (estaConciliada(v) || v.ml_status === 'cancelled' || v.devuelta) return false;
   const cb = matchCobros(v);
-  if (cb.length !== 1) return false;
-  const pago = Number(cb[0].monto) || 0;
+  if (!cb.length) return false;
+  const sum = cb.reduce((s, c) => s + (Number(c.monto) || 0), 0);
   const pc = Number(v.por_cobrar) || 0;
-  if (Math.abs(pago - pc) < TOL) return true;            // cierra con el pago solo
+  if (Math.abs(sum - pc) < TOL) return true;             // cierra con los cobros
   const b = bonifMap[v.id];
-  if (b && Math.abs(pago + (Number(b.monto) || 0) - pc) < TOL) return true; // pago + bonificación
+  if (b && Math.abs(sum + (Number(b.monto) || 0) - pc) < TOL) return true; // cobros + bonificación
   return false;
 }
 
@@ -272,7 +277,7 @@ function celdaMonto(valor) {
 function cobroCell(v, bonifMap) {
   if (estaConciliada(v)) {
     const n = (VINC_BY_VENTA[v.id] || []).length;
-    const detalle = n > 1 ? ' (pago + bonif.)' : '';
+    const detalle = n > 1 ? ' (varios mov.)' : '';
     return `<span class="vml-conc">✓ conciliada${detalle}</span>`
       + `<button class="vml-x" data-accion="desvincular" data-venta="${v.id}" title="Deshacer conciliación">✕</button>`;
   }
@@ -290,8 +295,8 @@ function cobroCell(v, bonifMap) {
     const extra = b ? `<span class="vml-bonif" title="Bonificación de envío que se suma al conciliar">+ bonif. ${money(b.monto)}</span>` : '';
     return `${ok}${extra}<button class="btn btn-primary vml-mini" data-accion="conciliar" data-venta="${v.id}">Conciliar</button>`;
   }
-  const motivo = cobros.length > 1 ? 'varios cobros' : 'monto ≠';
-  return `${ok}<span class="vml-rev" title="No coincide exacto (${motivo}): conciliar a mano en Conciliación">revisar (${motivo})</span>`;
+  const motivo = cobros.length > 1 ? 'varios cobros, no cierra' : 'monto ≠';
+  return `${ok}<span class="vml-rev" title="No cierra con el por cobrar: conciliar a mano en Conciliación">revisar (${motivo})</span>`;
 }
 
 function filaHTML(v, esMes, bonifMap) {
@@ -331,16 +336,19 @@ async function conciliar(ventaId) {
   const v = VENTAS.find(x => String(x.id) === String(ventaId));
   if (!v) return;
   const cobros = matchCobros(v);
-  if (cobros.length !== 1) { window.toast('Esta venta no se puede conciliar automáticamente', 'error'); return; }
-  const pago = cobros[0];
+  if (!cobros.length) { window.toast('Esta venta no tiene cobro para conciliar', 'error'); return; }
+  const sum = cobros.reduce((s, c) => s + (Number(c.monto) || 0), 0);
   const pc = Number(v.por_cobrar) || 0;
-  const falta = r2(pc - (Number(pago.monto) || 0));
 
-  const aVincular = [{ id: pago.id, monto: r2(Math.abs(Number(pago.monto) || 0)) }];
-  if (Math.abs(falta) >= TOL && falta > 0) {
+  const aVincular = cobros.map(c => ({ id: c.id, monto: r2(Math.abs(Number(c.monto) || 0)) }));
+  let conBonif = false;
+  if (Math.abs(sum - pc) >= TOL) {
+    const falta = r2(pc - sum);
+    if (falta <= TOL) { window.toast('Esta venta no cierra con el por cobrar', 'error'); return; }
     const b = buscarBonif(falta, new Set(VINC_MOV_USADOS));
     if (!b) { window.toast('No encontré una bonificación disponible para completar el monto', 'error'); return; }
     aVincular.push({ id: b.id, monto: r2(Math.abs(Number(b.monto) || 0)) });
+    conBonif = true;
   }
 
   window.toast('Conciliando…');
@@ -353,7 +361,7 @@ async function conciliar(ventaId) {
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
     }
-    window.toast(aVincular.length > 1 ? 'Venta conciliada (pago + bonificación)' : 'Venta conciliada');
+    window.toast(conBonif ? 'Venta conciliada (cobros + bonificación)' : (cobros.length > 1 ? 'Venta conciliada (varios cobros)' : 'Venta conciliada'));
     await loadVentasML();
   } catch (e) {
     window.toast('Error al conciliar: ' + e.message, 'error');
@@ -392,20 +400,20 @@ function armarLoteConciliacion(ventas) {
   for (const v of ventas) {
     if (estaConciliada(v) || v.ml_status === 'cancelled' || v.devuelta) continue;
     const cb = matchCobros(v);
-    if (cb.length !== 1) continue;
-    const pago = cb[0];
-    const pm = Number(pago.monto) || 0;
+    if (!cb.length) continue;
+    const sum = cb.reduce((s, c) => s + (Number(c.monto) || 0), 0);
     const pc = Number(v.por_cobrar) || 0;
-    if (Math.abs(pm - pc) < TOL) {
-      lote.push({ movimiento_id: pago.id, op_tipo: 'venta_ml', op_id: v.id, monto: r2(Math.abs(pm)) });
-    } else {
-      const falta = r2(pc - pm);
+    let bonif = null;
+    if (Math.abs(sum - pc) >= TOL) {
+      const falta = r2(pc - sum);
       if (falta <= TOL) continue;
-      const b = buscarBonif(falta, usados);
-      if (!b) continue;
-      lote.push({ movimiento_id: pago.id, op_tipo: 'venta_ml', op_id: v.id, monto: r2(Math.abs(pm)) });
-      lote.push({ movimiento_id: b.id, op_tipo: 'venta_ml', op_id: v.id, monto: r2(Math.abs(Number(b.monto) || 0)) });
-      usados.add(b.id);
+      bonif = buscarBonif(falta, usados);
+      if (!bonif) continue;
+    }
+    for (const c of cb) lote.push({ movimiento_id: c.id, op_tipo: 'venta_ml', op_id: v.id, monto: r2(Math.abs(Number(c.monto) || 0)) });
+    if (bonif) {
+      lote.push({ movimiento_id: bonif.id, op_tipo: 'venta_ml', op_id: v.id, monto: r2(Math.abs(Number(bonif.monto) || 0)) });
+      usados.add(bonif.id);
     }
   }
   return lote;
