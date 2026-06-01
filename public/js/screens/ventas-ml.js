@@ -182,7 +182,8 @@ async function cargarDevoluciones() {
       DEV_FUENTE = 'movimientos';
       DEVOLS = nuevos.map(m => ({
         id: m.id, fecha: m.fecha, monto: Number(m.monto) || 0,
-        categoria: m.categoria, descripcion: m.descripcion || ''
+        categoria: m.categoria, descripcion: m.descripcion || '',
+        referencia: m.referencia_externa || ''
       }));
       return;
     }
@@ -194,7 +195,8 @@ async function cargarDevoluciones() {
       DEV_FUENTE = 'movimientos_mp';
       DEVOLS = viejos.map(m => ({
         id: m.id, fecha: m.fecha, monto: Number(m.monto_neto ?? m.monto) || 0,
-        categoria: m.categoria, descripcion: m.descripcion || m.tipo_operacion || ''
+        categoria: m.categoria, descripcion: m.descripcion || m.tipo_operacion || '',
+        referencia: m.referencia_mp || ''
       }));
     }
   } catch (e) { console.warn('Devol (movimientos_mp):', e.message); }
@@ -664,6 +666,49 @@ function indexVentasPorMonto() {
 
 const tieneReclamo = v => !!(v.claim_id || v.devuelta || v.ml_status === 'cancelled' || v.claim_status);
 
+// ── Match DIRECTO por número ────────────────────────────────────────────
+// Hipótesis a comprobar: el movimiento de devolución trae, en su detalle o su
+// referencia, un número que identifica la venta original (el mismo id con el que
+// se cruzan los cobros: mp_payment_id / mp_payment_ids / ml_order_id). Indexamos
+// esos ids de todas las ventas y buscamos cualquier número largo del movimiento
+// que matchee. Si esto pega, no hace falta cruzar por monto.
+function indexVentasPorId() {
+  const idx = new Map();
+  const add = (tok, venta) => {
+    const t = String(tok || '').trim();
+    if (t.length < 8) return;            // ids de MP son números largos
+    if (!idx.has(t)) idx.set(t, []);
+    if (!idx.get(t).some(x => x.id === venta.id)) idx.get(t).push(venta);
+  };
+  for (const v of VENTAS) {
+    if (v.mp_payment_id) add(v.mp_payment_id, v);
+    if (v.mp_payment_ids) String(v.mp_payment_ids).split(',').forEach(x => add(x, v));
+    if (v.ml_order_id) add(v.ml_order_id, v);
+  }
+  return idx;
+}
+
+// Saca los números largos (≥8 dígitos) del detalle + la referencia del movimiento.
+function tokensDe(d) {
+  const txt = `${d.descripcion || ''} ${d.referencia || ''}`;
+  return [...new Set((txt.match(/\d{8,}/g) || []))];
+}
+
+// Devuelve las ventas que matchean por número (cualquier token del movimiento
+// que coincida con un id de una venta).
+function matchDirecto(d, idIdx) {
+  const vistos = new Set();
+  const out = [];
+  for (const tok of tokensDe(d)) {
+    for (const v of (idIdx.get(tok) || [])) {
+      if (vistos.has(v.id)) continue;
+      vistos.add(v.id);
+      out.push({ venta: v, token: tok });
+    }
+  }
+  return out;
+}
+
 // Devuelve las ventas candidatas para un importe (monto espejo), ordenadas:
 // primero las que tienen reclamo detectado, después por diferencia más chica.
 function candidatosVenta(montoAbs, idx) {
@@ -687,19 +732,22 @@ function candidatosVenta(montoAbs, idx) {
 function renderDevoluciones() {
   const root = document.getElementById('app-screens');
   const idx = indexVentasPorMonto();
+  const idIdx = indexVentasPorId();
 
   // Solo las que faltan enganchar (las ya enganchadas se cuentan aparte).
   const pendientes = DEVOLS.filter(d => !MOV_VINCULADOS.has(d.id));
   const yaEng = DEVOLS.length - pendientes.length;
 
   const filas = pendientes.map(d => {
+    const directos = matchDirecto(d, idIdx);   // ventas que matchean por número
     const cands = candidatosVenta(Math.abs(d.monto), idx);
-    return { d, cands };
+    return { d, directos, cands };
   });
 
-  const con1 = filas.filter(f => f.cands.length === 1).length;
-  const conN = filas.filter(f => f.cands.length > 1).length;
-  const sin0 = filas.filter(f => f.cands.length === 0).length;
+  const conId = filas.filter(f => f.directos.length > 0).length;
+  const con1 = filas.filter(f => !f.directos.length && f.cands.length === 1).length;
+  const conN = filas.filter(f => !f.directos.length && f.cands.length > 1).length;
+  const sin0 = filas.filter(f => !f.directos.length && f.cands.length === 0).length;
 
   const fuenteLbl = DEV_FUENTE === 'movimientos_mp'
     ? `<span class="vml-dev-warn">leídas del extracto MP (cajón viejo)</span>`
@@ -707,9 +755,9 @@ function renderDevoluciones() {
 
   const banner = `<div class="vml-dev-banner">
     Cada fila es <b>plata de una devolución o cancelación</b> que cayó en el extracto y todavía
-    <b>no está pegada a su venta</b>. El extracto no trae el N° de orden, así que te propongo la venta
-    cuyo importe <b>espeja</b> el de la devolución (y resalto si esa venta tiene un reclamo detectado).
-    Por ahora esto <b>solo muestra y sugiere</b>: todavía no engancha nada. ${fuenteLbl}
+    <b>no está pegada a su venta</b>. Si el detalle del extracto trae un número que identifica una venta,
+    lo engancho <b>directo por ese número</b> (🔗 verde, alta confianza); si no, te propongo la venta cuyo
+    importe <b>espeja</b> el de la devolución. Por ahora esto <b>solo muestra y sugiere</b>: todavía no engancha nada. ${fuenteLbl}
   </div>`;
 
   if (!DEVOLS.length) {
@@ -720,11 +768,11 @@ function renderDevoluciones() {
   }
 
   const kpis = `<div class="kpi-grid" style="margin:14px 0">
-    <div class="kpi"><div class="kpi-label">Devoluciones sin enganchar</div><div class="kpi-value">${pendientes.length}</div></div>
-    <div class="kpi"><div class="kpi-label">Con 1 venta sugerida</div><div class="kpi-value">${con1}</div></div>
-    <div class="kpi"><div class="kpi-label">Con varias candidatas</div><div class="kpi-value">${conN}</div></div>
-    <div class="kpi"><div class="kpi-label">Sin candidata por monto</div><div class="kpi-value">${sin0}</div></div>
-    <div class="kpi"><div class="kpi-label">Ya enganchadas</div><div class="kpi-value">${yaEng}</div></div>
+    <div class="kpi"><div class="kpi-label">Sin enganchar</div><div class="kpi-value">${pendientes.length}</div></div>
+    <div class="kpi"><div class="kpi-label">🔗 Con N° de una venta</div><div class="kpi-value">${conId}</div></div>
+    <div class="kpi"><div class="kpi-label">Solo por monto: 1 sugerida</div><div class="kpi-value">${con1}</div></div>
+    <div class="kpi"><div class="kpi-label">Solo por monto: varias</div><div class="kpi-value">${conN}</div></div>
+    <div class="kpi"><div class="kpi-label">Sin pista</div><div class="kpi-value">${sin0}</div></div>
   </div>`;
 
   const tabla = !pendientes.length
@@ -735,7 +783,7 @@ function renderDevoluciones() {
           <th style="width:120px">Tipo</th>
           <th>Detalle del extracto</th>
           <th style="width:120px;text-align:right">Monto</th>
-          <th style="width:300px">Venta sugerida (por monto espejo)</th>
+          <th style="width:320px">Venta (🔗 por número / por monto espejo)</th>
         </tr></thead>
         <tbody>${filas.map(filaDevolucionHTML).join('')}</tbody>
       </table></div>`;
@@ -744,27 +792,40 @@ function renderDevoluciones() {
   wireTabs(root);
 }
 
-function filaDevolucionHTML({ d, cands }) {
+function ventaLink(v) {
+  return v.ml_order_id
+    ? `<a class="vml-venta-id" href="https://www.mercadolibre.com.ar/ventas/${encodeURIComponent(v.ml_order_id)}/detalle" target="_blank" rel="noopener" title="Abrir la venta en Mercado Libre">${esc(v.ml_order_id)}</a>`
+    : '—';
+}
+
+function filaDevolucionHTML({ d, directos, cands }) {
   const debito = d.monto < 0;
   const montoCls = debito ? 'vml-neg' : 'vml-pos';
   const montoLbl = debito ? '− pagás' : '+ te devuelven';
 
   let sug;
-  if (!cands.length) {
-    sug = `<span class="vml-dev-empty">— sin venta del mismo importe —</span>`;
-  } else {
+  if (directos.length) {
+    // Match directo por número: alta confianza.
+    const top = directos[0];
+    const v = top.venta;
+    const extra = directos.length > 1
+      ? `<span class="vml-dev-mas" title="${esc(directos.slice(1).map(x => x.venta.ml_order_id).filter(Boolean).join(', '))}">+${directos.length - 1} más</span>` : '';
+    sug = `<div class="vml-dev-sug">
+      <span class="vml-dev-id" title="El número ${esc(top.token)} del extracto coincide con esta venta">🔗 por número</span> ${ventaLink(v)} ${extra}
+      <div class="vml-dev-prod">${esc((v.titulo || '').slice(0, 60))} · ${money(v.por_cobrar)}</div>
+    </div>`;
+  } else if (cands.length) {
     const top = cands[0];
     const v = top.venta;
-    const link = v.ml_order_id
-      ? `<a class="vml-venta-id" href="https://www.mercadolibre.com.ar/ventas/${encodeURIComponent(v.ml_order_id)}/detalle" target="_blank" rel="noopener" title="Abrir la venta en Mercado Libre">${esc(v.ml_order_id)}</a>`
-      : '—';
     const claim = top.reclamo ? `<span class="vml-dev-claim" title="Esta venta tiene un reclamo/devolución detectado">↩ reclamo</span>` : '';
     const aprox = top.diff > TOL ? `<span class="vml-dev-aprox" title="Difiere $${top.diff.toFixed(2)} del importe">≈</span>` : '';
     const masN = cands.length > 1 ? `<span class="vml-dev-mas" title="${esc(cands.slice(1).map(c => c.venta.ml_order_id).filter(Boolean).join(', '))}">+${cands.length - 1} más</span>` : '';
     sug = `<div class="vml-dev-sug">
-      ${aprox}${link} ${claim}
+      ${aprox}${ventaLink(v)} ${claim}
       <div class="vml-dev-prod">${esc((v.titulo || '').slice(0, 60))} · ${money(top.campo === 'bruto' ? v.importe_bruto : v.por_cobrar)} ${masN}</div>
     </div>`;
+  } else {
+    sug = `<span class="vml-dev-empty">— sin pista (ni número ni monto) —</span>`;
   }
 
   return `<tr>
@@ -790,6 +851,7 @@ function inyectarEstilo() {
     .vml-dev-sug{line-height:1.4}
     .vml-dev-prod{font-size:12px;color:#78716C;margin-top:2px}
     .vml-dev-claim{font-size:11px;color:#92500A;background:#FAF1E1;border-radius:6px;padding:1px 7px;margin-left:4px}
+    .vml-dev-id{font-size:11px;color:#0F6E56;background:#E1F5EE;border-radius:6px;padding:1px 7px;font-weight:600}
     .vml-dev-aprox{color:#A8A29E;margin-right:3px}
     .vml-dev-mas{font-size:11px;color:#0C447C;background:#E6F1FB;border-radius:6px;padding:1px 7px;margin-left:6px;cursor:help}
     .vml-dev-empty{color:#A8A29E;font-size:13px}
