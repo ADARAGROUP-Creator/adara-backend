@@ -23,6 +23,11 @@ let CUENTAS = [];          // [{id, codigo, moneda, ...}]
 let CUENTA_BY_ID = {};     // id -> cuenta
 let DATA = [];             // movimientos cargados
 let FILTRO = { cuenta: '', estado: '', q: '' };
+let MES = '';              // YYYY-MM seleccionado (mes del extracto)
+let MESES = [];            // meses disponibles, desc
+let VINC_SUM = {};         // movimiento_id -> Σ monto vinculado (magnitud positiva)
+let VINC_OPS = {};         // movimiento_id -> [{op_tipo, op_id}]
+let VENTA_NUM = {};        // ventas_ml.id -> ml_order_id (para mostrar el N° de venta)
 
 // Etiqueta linda por código de cuenta (fallback al código si no está mapeado)
 const LABEL_CUENTA = {
@@ -47,6 +52,12 @@ const CATEGORIAS = [
 ];
 
 const hoyISO = () => new Date().toISOString().slice(0, 10);
+const mesDe = f => (f || '').slice(0, 7);
+const mesLargo = ym => {
+  if (!ym) return '—';
+  const [y, m] = ym.split('-');
+  return new Date(+y, +m - 1, 1).toLocaleDateString('es-AR', { month: 'long', year: 'numeric' });
+};
 
 // Referencia única para cargas manuales (cumple NOT NULL + UNIQUE sin deduplicar
 // por contenido: dos movimientos iguales son válidos, cada uno con su referencia).
@@ -77,12 +88,36 @@ function fmtMonto(valor, moneda) {
   return `${signo}${simbolo}${abs}`;
 }
 
-// estado v1 (sin Conciliación todavía)
+// Estado real: si el movimiento tiene enganches (vínculos) que cubren su monto
+// → "vinculado"; si los tiene pero no cierra → "parcial"; si no tiene → "auto"
+// (si vino conciliado automático) o "pendiente". Tolerancia 2 centavos (CB3).
 function estadoDe(m) {
+  const vsum = VINC_SUM[m.id] || 0;
+  if (vsum > 0.0001) {
+    const saldo = Math.abs(Number(m.monto) || 0) - vsum;
+    return Math.abs(saldo) < 0.02 ? 'conciliado' : 'parcial';
+  }
   return m.conciliado_auto ? 'auto' : 'pendiente';
 }
 
-const LABEL_ESTADO = { auto: 'auto', pendiente: 'pendiente', parcial: 'parcial', conciliado: 'conciliado' };
+// Texto de "con qué está vinculado": el N° de venta (ml_order_id) para enganches
+// a ventas de ML; el tipo de operación para los demás (gasto/compra/…). El N° de
+// factura de Tango se sumará cuando se integre Tango.
+function vinculadoA(m) {
+  const ops = VINC_OPS[m.id] || [];
+  if (!ops.length) return '';
+  const nums = [];
+  for (const op of ops) {
+    if (op.op_tipo === 'venta_ml') nums.push(VENTA_NUM[op.op_id] || ('venta #' + op.op_id));
+    else if (op.op_tipo === 'venta') nums.push('venta #' + op.op_id);
+    else nums.push(op.op_tipo);
+  }
+  const uniq = [...new Set(nums)];
+  const extra = uniq.length > 1 ? ` <span class="mov-muted">+${uniq.length - 1}</span>` : '';
+  return esc(uniq[0]) + extra;
+}
+
+const LABEL_ESTADO = { auto: 'auto', pendiente: 'pendiente', parcial: 'parcial', conciliado: 'Vinculado' };
 
 // ── Render principal ───────────────────────────────────────────────────
 export async function loadMovimientos() {
@@ -93,10 +128,23 @@ export async function loadMovimientos() {
     CUENTAS = await sbGet('cuentas', 'order=id.asc');
     CUENTA_BY_ID = Object.fromEntries(CUENTAS.map(c => [c.id, c]));
     DATA = await sbGet('movimientos', 'order=fecha.desc,id.desc');
+    // Enganches (vínculos) para saber qué está vinculado y con qué.
+    const vincs = await sbGet('vinculos', '');
+    VINC_SUM = {}; VINC_OPS = {};
+    for (const v of vincs) {
+      VINC_SUM[v.movimiento_id] = (VINC_SUM[v.movimiento_id] || 0) + (Number(v.monto) || 0);
+      (VINC_OPS[v.movimiento_id] = VINC_OPS[v.movimiento_id] || []).push({ op_tipo: v.op_tipo, op_id: v.op_id });
+    }
+    // N° de venta de ML por id (para mostrarlo en la fila vinculada).
+    const ventas = await sbGet('ventas_ml', 'select=id,ml_order_id');
+    VENTA_NUM = Object.fromEntries(ventas.map(v => [v.id, v.ml_order_id]));
   } catch (e) {
     root.innerHTML = `<div class="error">No se pudieron cargar los movimientos: ${e.message}</div>`;
     return;
   }
+
+  MESES = [...new Set(DATA.map(m => mesDe(m.fecha)).filter(Boolean))].sort().reverse();
+  if (!MES || !MESES.includes(MES)) MES = MESES.length ? MESES[0] : '';
 
   inyectarEstilo();
   render();
@@ -105,8 +153,9 @@ export async function loadMovimientos() {
 function render() {
   const root = document.getElementById('app-screens');
 
-  // Base: respeta cuenta + búsqueda (NO el estado, que es la pill seleccionada)
+  // Base: respeta MES (extracto) + cuenta + búsqueda (NO el estado, que es la pill)
   const base = DATA.filter(m => {
+    if (MES && mesDe(m.fecha) !== MES) return false;
     if (FILTRO.cuenta && String(m.cuenta_id) !== FILTRO.cuenta) return false;
     if (FILTRO.q) {
       const txt = `${m.descripcion || ''} ${m.categoria || ''}`.toLowerCase();
@@ -118,9 +167,10 @@ function render() {
   // Lista: base + filtro de estado (la pill activa)
   const filtrados = base.filter(m => !FILTRO.estado || estadoDe(m) === FILTRO.estado);
 
-  // KPIs (sobre la base filtrada por cuenta + búsqueda)
+  // KPIs (sobre la base filtrada por mes + cuenta + búsqueda)
   const total = base.length;
   const pendientes = base.filter(m => estadoDe(m) === 'pendiente').length;
+  const vinculados = base.filter(m => estadoDe(m) === 'conciliado').length;
   const netoArs = base
     .filter(m => monedaDe(m.cuenta_id) === 'ARS')
     .reduce((s, m) => s + (Number(m.monto) || 0), 0);
@@ -138,8 +188,13 @@ function render() {
     .concat(CUENTAS.map(c => `<option value="${c.id}" ${FILTRO.cuenta === String(c.id) ? 'selected' : ''}>${cuentaLabel(c.id)}</option>`))
     .join('');
 
+  const opcionesMes = MESES.length
+    ? MESES.map(ym => `<option value="${ym}" ${MES === ym ? 'selected' : ''}>${esc(mesLargo(ym))}</option>`).join('')
+    : '<option value="">—</option>';
+
   root.innerHTML = `
     <div class="toolbar">
+      <select class="select" id="f-mes" style="width:auto;text-transform:capitalize">${opcionesMes}</select>
       <select class="select" id="f-cuenta" style="width:auto">${opcionesCuenta}</select>
       <input class="input grow" id="f-q" type="text" placeholder="Buscar descripción…" value="${FILTRO.q.replace(/"/g, '&quot;')}">
       <button class="btn btn-ghost" id="btn-importar">Importar</button>
@@ -147,7 +202,8 @@ function render() {
     </div>
 
     <div class="kpi-grid" style="margin:14px 0">
-      <div class="kpi"><div class="kpi-label">Movimientos</div><div class="kpi-value">${total}</div></div>
+      <div class="kpi"><div class="kpi-label">Movimientos del mes</div><div class="kpi-value">${total}</div></div>
+      <div class="kpi"><div class="kpi-label">Vinculados</div><div class="kpi-value">${vinculados}</div></div>
       <div class="kpi"><div class="kpi-label">Pendientes</div><div class="kpi-value">${pendientes}</div></div>
       <div class="kpi"><div class="kpi-label">Neto ARS</div><div class="kpi-value">${fmtMonto(netoArs, 'ARS')}</div></div>
     </div>
@@ -155,22 +211,24 @@ function render() {
     <div class="pills">${pills}</div>
 
     ${filtrados.length === 0
-      ? `<div class="empty">No hay movimientos para mostrar. Cargá el primero con “+ Cargar movimiento”.</div>`
+      ? `<div class="empty">No hay movimientos para este mes/filtro.</div>`
       : `<div class="table-wrap"><table class="t">
           <thead><tr>
             <th style="width:74px">Fecha</th>
-            <th style="width:120px">Cuenta</th>
+            <th style="width:110px">Cuenta</th>
             <th>Descripción</th>
-            <th style="width:150px">Categoría</th>
-            <th style="width:150px;text-align:right">Monto</th>
-            <th style="width:110px">Estado</th>
-            <th style="width:54px"></th>
+            <th style="width:140px">Categoría</th>
+            <th style="width:140px;text-align:right">Monto</th>
+            <th style="width:150px">Vinculado a</th>
+            <th style="width:104px">Estado</th>
+            <th style="width:44px"></th>
           </tr></thead>
           <tbody>${filtrados.map(filaHTML).join('')}</tbody>
         </table></div>`}
   `;
 
   // Bindings
+  document.getElementById('f-mes').addEventListener('change', e => { MES = e.target.value; FILTRO.estado = ''; render(); });
   document.getElementById('f-cuenta').addEventListener('change', e => { FILTRO.cuenta = e.target.value; render(); });
   document.getElementById('f-q').addEventListener('input', e => { FILTRO.q = e.target.value; render(); });
   document.getElementById('btn-nuevo').addEventListener('click', openModalNuevo);
@@ -189,12 +247,14 @@ function filaHTML(m) {
   const est = estadoDe(m);
   const catLabel = (CATEGORIAS.find(c => c[0] === (m.categoria || ''))?.[1]) || m.categoria;
   const catSinClasif = !m.categoria || m.categoria === 'sin_clasificar';
+  const vinc = vinculadoA(m);
   return `<tr>
     <td>${(m.fecha || '').slice(8, 10)}/${(m.fecha || '').slice(5, 7)}</td>
     <td>${cuentaLabel(m.cuenta_id)}</td>
     <td>${m.descripcion ? esc(m.descripcion) : '<span class="mov-muted">—</span>'}</td>
     <td>${catSinClasif ? '<span class="mov-tag-empty">sin clasificar</span>' : `<span class="mov-tag">${esc(catLabel)}</span>`}</td>
     <td style="text-align:right" class="mov-mono ${neg ? 'mov-neg' : 'mov-pos'}">${fmtMonto(m.monto, moneda)}</td>
+    <td class="mov-mono mov-vinc">${vinc || '<span class="mov-muted">—</span>'}</td>
     <td><span class="mov-badge mov-badge-${est}">${LABEL_ESTADO[est] || est}</span></td>
     <td style="text-align:center">${m.origen === 'manual' ? `<button class="mov-del" data-id="${m.id}" title="Borrar movimiento">✕</button>` : ''}</td>
   </tr>`;
@@ -332,6 +392,8 @@ function openModalNuevo() {
         conciliado_auto: false,
       });
       DATA.unshift(nuevo);
+      MESES = [...new Set(DATA.map(m => mesDe(m.fecha)).filter(Boolean))].sort().reverse();
+      if (!MESES.includes(MES)) MES = MESES[0] || '';
       window.toast('Movimiento cargado');
       close();
       render();
@@ -425,8 +487,7 @@ async function importarExtracto(file, source) {
     }
     window.toast(`${cfg.label}: importados ${data.importados} · pendientes ${data.pendientes} · auto ${data.auto}`);
 
-    DATA = await sbGet('movimientos', 'order=fecha.desc,id.desc');
-    render();
+    await loadMovimientos();
   } catch (e) {
     window.toast('Error al importar: ' + e.message, 'error');
   }
@@ -446,6 +507,7 @@ function inyectarEstilo() {
     .mov-pos{color:#15803D}
     .mov-neg{color:#B91C1C}
     .mov-muted{color:#A8A29E}
+    .mov-vinc{font-size:12px;color:#0C447C}
     .mov-tag{font-size:12px;color:#57534E;background:#F5F5F4;padding:2px 8px;border-radius:6px}
     .mov-tag-empty{font-size:12px;color:#A8A29E;border:1px dashed #D6D3D1;padding:2px 8px;border-radius:6px}
     .mov-badge{font-size:12px;padding:2px 8px;border-radius:6px}
