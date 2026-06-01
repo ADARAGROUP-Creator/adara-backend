@@ -1136,6 +1136,102 @@ async function mpApi(path, opts = {}) {
   return r;
 }
 
+// ── DEBUG (read-only) — Settlement report: header + filas que matcheen ────
+// Baja el settlement report de MP para el rango dado y devuelve las COLUMNAS
+// reales del CSV + las filas cuyo SOURCE_ID / ORDER_ID / SHIPPING_ID / etc.
+// coincida con los ids buscados (busca el id en CUALQUIER columna, así
+// descubrimos cuál liga la liquidación del envío a la orden). También permite
+// inspeccionar TAXES_DISAGGREGATED para saber qué es la retención del envío.
+// NO escribe nada en la base — es solo lectura/diagnóstico.
+// Uso: GET /debug/settlement?desde=2026-04-01&hasta=2026-04-30&source=152079747157,152079796875
+app.get('/debug/settlement', async (req, res) => {
+  try {
+    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
+
+    const { desde, hasta } = req.query || {};
+    if (!desde || !hasta) return res.status(400).json({ error: 'Faltan desde/hasta (YYYY-MM-DD) en la query' });
+
+    // ids a buscar en CUALQUIER columna (source, order, shipping, external_reference…)
+    const buscados = new Set(
+      [...String(req.query.source || '').split(','), ...String(req.query.order || '').split(',')]
+        .map(s => s.trim()).filter(Boolean)
+    );
+
+    // 1. Crear reporte (mismo flujo que /mp/settlement-sync)
+    const createRes = await mpApi('/v1/account/settlement_report', {
+      method: 'POST',
+      body: JSON.stringify({ begin_date: `${desde}T00:00:00Z`, end_date: `${hasta}T23:59:59Z` })
+    });
+    const createData = await createRes.json();
+    const reportId = createData.id;
+    if (!reportId) return res.status(400).json({ error: 'No se pudo crear reporte', detail: createData });
+
+    // 2. Esperar a que esté listo (polling cada 5s, máx 2 min)
+    let fileUrl = null;
+    for (let i = 0; i < 24; i++) {
+      await new Promise(r => setTimeout(r, 5000));
+      try {
+        const checkRes = await mpApi(`/v1/account/settlement_report/${reportId}`);
+        const checkData = await checkRes.json();
+        if (checkData.status === 'ready' && checkData.download_url) { fileUrl = checkData.download_url; break; }
+        if (checkData.status === 'error') return res.status(400).json({ error: 'Reporte falló', detail: checkData });
+      } catch (e) { break; }
+    }
+    if (!fileUrl) {
+      const listRes = await mpApi('/v1/account/settlement_report/list');
+      const list = await listRes.json();
+      const arr = Array.isArray(list) ? list : [];
+      const found = arr.find(r => r.id === reportId) || arr[0];
+      if (found?.download_url) fileUrl = found.download_url;
+    }
+    if (!fileUrl) return res.status(400).json({ error: 'Reporte no disponible aún, reintentar en unos minutos', reportId });
+
+    // 3. Descargar CSV
+    const csvRes = await fetch(fileUrl, { headers: { 'Authorization': 'Bearer ' + ML.access } });
+    const csvText = await csvRes.text();
+    const lines = csvText.split('\n').filter(l => l.trim());
+    if (lines.length < 2) return res.status(400).json({ error: 'Reporte vacío' });
+
+    // 4. Parsear CSV (maneja comillas con comas adentro)
+    const parseLine = (line) => {
+      const out = []; let cur = '', q = false;
+      for (const ch of line) {
+        if (ch === '"') { q = !q; }
+        else if (ch === ',' && !q) { out.push(cur.trim()); cur = ''; }
+        else { cur += ch; }
+      }
+      out.push(cur.trim());
+      return out;
+    };
+    const clean = (v) => String(v == null ? '' : v).replace(/"/g, '').trim();
+    const headers = parseLine(lines[0]).map(clean);
+    const toObj = (vals) => headers.reduce((o, h, idx) => (o[h] = clean(vals[idx]), o), {});
+
+    // 5. Filas que matcheen alguno de los ids (en cualquier columna)
+    const matched = [];
+    for (let i = 1; i < lines.length && matched.length < 40; i++) {
+      const vals = parseLine(lines[i]);
+      if (buscados.size && vals.some(v => buscados.has(clean(v)))) matched.push(toObj(vals));
+    }
+
+    // 6. Muestra de las primeras filas (para ver el formato general)
+    const sample = lines.slice(1, 4).map(l => toObj(parseLine(l)));
+
+    res.json({
+      reportId,
+      rango: { desde, hasta },
+      total_lines: lines.length - 1,
+      headers,
+      buscados: [...buscados],
+      matched_count: matched.length,
+      matched,
+      sample
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/mp/settlement-sync', async (req, res) => {
   try {
     if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
