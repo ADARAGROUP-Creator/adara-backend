@@ -119,6 +119,16 @@ function vinculadoA(m) {
 
 const LABEL_ESTADO = { auto: 'auto', pendiente: 'pendiente', parcial: 'parcial', conciliado: 'Vinculado' };
 
+// N° de operación del extracto (REFERENCE_ID de MP / ref de banco). Vive en el
+// 2° campo de referencia_externa (`fecha|REF|monto|saldo`). Las cargas manuales
+// usan `manual-<uuid>` (sin número) → devuelve ''.
+function nroOperacion(m) {
+  const ref = String(m.referencia_externa || '');
+  if (ref.startsWith('manual-') || ref.startsWith('sin_factura_auto')) return '';
+  const f = ref.split('|');
+  return f.length > 1 ? f[1].trim() : '';
+}
+
 // ── Render principal ───────────────────────────────────────────────────
 export async function loadMovimientos() {
   const root = document.getElementById('app-screens');
@@ -158,7 +168,7 @@ function render() {
     if (MES && mesDe(m.fecha) !== MES) return false;
     if (FILTRO.cuenta && String(m.cuenta_id) !== FILTRO.cuenta) return false;
     if (FILTRO.q) {
-      const txt = `${m.descripcion || ''} ${m.categoria || ''}`.toLowerCase();
+      const txt = `${m.descripcion || ''} ${m.categoria || ''} ${nroOperacion(m)}`.toLowerCase();
       if (!txt.includes(FILTRO.q.toLowerCase())) return false;
     }
     return true;
@@ -217,7 +227,8 @@ function render() {
             <th style="width:74px">Fecha</th>
             <th style="width:110px">Cuenta</th>
             <th>Descripción</th>
-            <th style="width:140px">Categoría</th>
+            <th style="width:128px">N° operación</th>
+            <th style="width:130px">Categoría</th>
             <th style="width:140px;text-align:right">Monto</th>
             <th style="width:150px">Vinculado a</th>
             <th style="width:104px">Estado</th>
@@ -248,10 +259,12 @@ function filaHTML(m) {
   const catLabel = (CATEGORIAS.find(c => c[0] === (m.categoria || ''))?.[1]) || m.categoria;
   const catSinClasif = !m.categoria || m.categoria === 'sin_clasificar';
   const vinc = vinculadoA(m);
+  const nroOp = nroOperacion(m);
   return `<tr>
     <td>${(m.fecha || '').slice(8, 10)}/${(m.fecha || '').slice(5, 7)}</td>
     <td>${cuentaLabel(m.cuenta_id)}</td>
     <td>${m.descripcion ? esc(m.descripcion) : '<span class="mov-muted">—</span>'}</td>
+    <td class="mov-mono mov-op">${nroOp ? `<span title="Copiá este número y buscalo en el extracto de MP">${esc(nroOp)}</span>` : '<span class="mov-muted">—</span>'}</td>
     <td>${catSinClasif ? '<span class="mov-tag-empty">sin clasificar</span>' : `<span class="mov-tag">${esc(catLabel)}</span>`}</td>
     <td style="text-align:right" class="mov-mono ${neg ? 'mov-neg' : 'mov-pos'}">${fmtMonto(m.monto, moneda)}</td>
     <td class="mov-mono mov-vinc">${vinc || '<span class="mov-muted">—</span>'}</td>
@@ -508,6 +521,7 @@ function inyectarEstilo() {
     .mov-neg{color:#B91C1C}
     .mov-muted{color:#A8A29E}
     .mov-vinc{font-size:12px;color:#0C447C}
+    .mov-op{font-size:12px;color:#57534E;user-select:all;white-space:nowrap}
     .mov-tag{font-size:12px;color:#57534E;background:#F5F5F4;padding:2px 8px;border-radius:6px}
     .mov-tag-empty{font-size:12px;color:#A8A29E;border:1px dashed #D6D3D1;padding:2px 8px;border-radius:6px}
     .mov-badge{font-size:12px;padding:2px 8px;border-radius:6px}
