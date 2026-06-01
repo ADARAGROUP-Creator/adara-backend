@@ -1,27 +1,36 @@
 import { sbGet } from '../core/sb.js';
 
-// ── Pantalla: Ventas ML (control diario + conciliación) ────────────────
-// Lista las ventas de ML día por día con su detalle real y las cruza contra
-// los cobros del extracto de MP. Permite CONCILIAR (vincular venta ↔ cobro)
-// las ventas "limpias" (1 cobro, monto coincide). Las dudosas se marcan para
-// revisar a mano en la pantalla Conciliación. Cruce por mp_payment_id; vínculo
+// ── Pantalla: Ventas ML (control diario/mensual + conciliación) ────────
+// Lista las ventas de ML por día o por mes con su detalle real y las cruza
+// contra los cobros del extracto de MP. Permite CONCILIAR (vincular venta ↔
+// cobro) las ventas "limpias" (1 cobro, monto coincide). Las dudosas se marcan
+// para revisar a mano en Conciliación. Cruce por mp_payment_id; vínculo
 // op_tipo='venta_ml', op_id=ventas_ml.id, monto=por_cobrar (magnitud positiva).
 
 let VENTAS = [];
 let COBROS_BY_REF = {};      // REFERENCE_ID del extracto -> movimiento (cobro_venta)
 let VINC_BY_VENTA = {};      // ventas_ml.id -> vínculo (op_tipo='venta_ml')
 let DIAS = [];
-let FECHA = '';
+let MESES = [];
+let MODO = 'dia';            // dia | mes
+let FECHA = '';              // YYYY-MM-DD (modo día)
+let MES = '';                // YYYY-MM (modo mes)
 let FILTRO = 'todas';        // todas | por_cobrar | cobradas | conciliadas | canceladas | devueltas
 
 const money = n => '$ ' + Math.abs(Number(n) || 0).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const ddmm = f => `${(f || '').slice(8, 10)}/${(f || '').slice(5, 7)}`;
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const hoyISO = () => new Date().toISOString().slice(0, 10);
+const mesDe = f => (f || '').slice(0, 7);
 const fechaLarga = f => {
   if (!f) return '—';
   const [y, m, d] = f.split('-');
   return new Date(+y, +m - 1, +d).toLocaleDateString('es-AR', { weekday: 'long', day: 'numeric', month: 'long' });
+};
+const mesLargo = ym => {
+  if (!ym) return '—';
+  const [y, m] = ym.split('-');
+  return new Date(+y, +m - 1, 1).toLocaleDateString('es-AR', { month: 'long', year: 'numeric' });
 };
 
 function paymentIds(v) {
@@ -37,8 +46,6 @@ function matchCobros(v) {
 }
 const estaConciliada = v => !!VINC_BY_VENTA[v.id];
 
-// Conciliable automático: no conciliada, no cancelada/devuelta, exactamente 1
-// cobro y su monto coincide con el por cobrar (tolerancia 2 centavos).
 function conciliable(v) {
   if (estaConciliada(v) || v.ml_status === 'cancelled' || v.devuelta) return false;
   const cb = matchCobros(v);
@@ -81,41 +88,64 @@ export async function loadVentasML() {
     return;
   }
   DIAS = [...new Set(VENTAS.map(v => v.fecha).filter(Boolean))].sort();
+  MESES = [...new Set(VENTAS.map(v => mesDe(v.fecha)).filter(Boolean))].sort();
   if (!FECHA || !DIAS.includes(FECHA)) FECHA = DIAS.length ? DIAS[DIAS.length - 1] : '';
+  if (!MES || !MESES.includes(MES)) MES = MESES.length ? MESES[MESES.length - 1] : '';
   inyectarEstilo();
   render();
 }
 
-function pasoDia(delta) {
-  if (!DIAS.length) return;
-  let i = DIAS.indexOf(FECHA);
-  if (i === -1) i = DIAS.length - 1;
-  FECHA = DIAS[Math.min(DIAS.length - 1, Math.max(0, i + delta))];
+function paso(delta) {
+  if (MODO === 'dia') {
+    if (!DIAS.length) return;
+    let i = DIAS.indexOf(FECHA); if (i === -1) i = DIAS.length - 1;
+    FECHA = DIAS[Math.min(DIAS.length - 1, Math.max(0, i + delta))];
+  } else {
+    if (!MESES.length) return;
+    let i = MESES.indexOf(MES); if (i === -1) i = MESES.length - 1;
+    MES = MESES[Math.min(MESES.length - 1, Math.max(0, i + delta))];
+  }
   render();
 }
 
 function render() {
   const root = document.getElementById('app-screens');
   const hayVentas = VENTAS.length > 0;
-  const delDia = hayVentas ? VENTAS.filter(v => v.fecha === FECHA) : [];
+  const esMes = MODO === 'mes';
+  const base = !hayVentas ? []
+    : esMes ? VENTAS.filter(v => mesDe(v.fecha) === MES)
+            : VENTAS.filter(v => v.fecha === FECHA);
 
-  const cont = { todas: delDia.length, por_cobrar: 0, cobradas: 0, conciliadas: 0, canceladas: 0, devueltas: 0 };
-  delDia.forEach(v => { cont[clase(v)]++; });
+  const cont = { todas: base.length, por_cobrar: 0, cobradas: 0, conciliadas: 0, canceladas: 0, devueltas: 0 };
+  base.forEach(v => { cont[clase(v)]++; });
 
-  const visibles = FILTRO === 'todas' ? delDia : delDia.filter(v => clase(v) === FILTRO);
+  const visibles = FILTRO === 'todas' ? base : base.filter(v => clase(v) === FILTRO);
+  const totCobrar = base.reduce((s, v) => s + (Number(v.por_cobrar) || 0), 0);
 
-  const totBruto = delDia.reduce((s, v) => s + (Number(v.importe_bruto) || 0), 0);
-  const totCobrar = delDia.reduce((s, v) => s + (Number(v.por_cobrar) || 0), 0);
+  // Selector de modo
+  const modoHTML = `
+    <div class="vml-modo">
+      <button class="${!esMes ? 'active' : ''}" data-modo="dia">Día</button>
+      <button class="${esMes ? 'active' : ''}" data-modo="mes">Mes</button>
+    </div>`;
 
-  const idx = DIAS.indexOf(FECHA);
-  const prevDis = idx <= 0 ? 'disabled' : '';
-  const nextDis = idx >= DIAS.length - 1 ? 'disabled' : '';
-
-  const navHTML = hayVentas ? `
-    <button class="btn btn-ghost" id="vml-prev" ${prevDis}>‹ Día anterior</button>
-    <input type="date" class="input" id="vml-fecha" value="${FECHA}" style="width:auto">
-    <button class="btn btn-ghost" id="vml-next" ${nextDis}>Día siguiente ›</button>
-    <span class="vml-fechalbl">${esc(fechaLarga(FECHA))}</span>` : '';
+  // Navegación (día o mes)
+  let navHTML = '';
+  if (hayVentas && esMes) {
+    const i = MESES.indexOf(MES);
+    navHTML = `
+      <button class="btn btn-ghost" id="vml-prev" ${i <= 0 ? 'disabled' : ''}>‹ Mes anterior</button>
+      <input type="month" class="input" id="vml-mes" value="${MES}" style="width:auto">
+      <button class="btn btn-ghost" id="vml-next" ${i >= MESES.length - 1 ? 'disabled' : ''}>Mes siguiente ›</button>
+      <span class="vml-fechalbl">${esc(mesLargo(MES))}</span>`;
+  } else if (hayVentas) {
+    const i = DIAS.indexOf(FECHA);
+    navHTML = `
+      <button class="btn btn-ghost" id="vml-prev" ${i <= 0 ? 'disabled' : ''}>‹ Día anterior</button>
+      <input type="date" class="input" id="vml-fecha" value="${FECHA}" style="width:auto">
+      <button class="btn btn-ghost" id="vml-next" ${i >= DIAS.length - 1 ? 'disabled' : ''}>Día siguiente ›</button>
+      <span class="vml-fechalbl">${esc(fechaLarga(FECHA))}</span>`;
+  }
 
   const pill = (val, label) =>
     `<button class="pill ${FILTRO === val ? 'active' : ''}" data-f="${val}">${label} <span class="num">${cont[val]}</span></button>`;
@@ -128,24 +158,29 @@ function render() {
       ${pill('devueltas', 'Devueltas')}
     </div>` : '';
 
+  const lblPeriodo = esMes ? 'mes' : 'día';
+  const vacioTxt = esMes ? `el mes de ${esc(mesLargo(MES))}` : `el ${esc(ddmm(FECHA))}`;
+
   root.innerHTML = `
     <div class="vml-bar">
       <button class="btn btn-primary" id="vml-sync">⟳ Sincronizar ventas</button>
+      ${hayVentas ? modoHTML : ''}
       ${navHTML}
     </div>
 
     ${hayVentas ? `
       <div class="kpi-grid" style="margin:14px 0">
-        <div class="kpi"><div class="kpi-label">Ventas del día</div><div class="kpi-value">${delDia.length}</div></div>
+        <div class="kpi"><div class="kpi-label">Ventas del ${lblPeriodo}</div><div class="kpi-value">${base.length}</div></div>
         <div class="kpi"><div class="kpi-label">Por cobrar (neto)</div><div class="kpi-value">${money(totCobrar)}</div></div>
         <div class="kpi"><div class="kpi-label">Cobradas sin conciliar</div><div class="kpi-value">${cont.cobradas}</div></div>
-        <div class="kpi"><div class="kpi-label">Conciliadas</div><div class="kpi-value">${cont.conciliadas} <span class="vml-de">de ${delDia.length}</span></div></div>
+        <div class="kpi"><div class="kpi-label">Conciliadas</div><div class="kpi-value">${cont.conciliadas} <span class="vml-de">de ${base.length}</span></div></div>
       </div>
       ${pills}
       ${visibles.length === 0
-        ? `<div class="empty" style="margin-top:14px">No hay ventas en este filtro para el ${esc(ddmm(FECHA))}.</div>`
+        ? `<div class="empty" style="margin-top:14px">No hay ventas en este filtro para ${vacioTxt}.</div>`
         : `<div class="table-wrap" style="margin-top:14px"><table class="t" id="vml-tabla">
             <thead><tr>
+              ${esMes ? '<th style="width:62px">Fecha</th>' : ''}
               <th style="width:130px"># Venta</th>
               <th>Producto</th>
               <th style="width:70px">SKU</th>
@@ -159,16 +194,23 @@ function render() {
               <th style="width:92px">Estado</th>
               <th style="width:230px">Cobro / Conciliación</th>
             </tr></thead>
-            <tbody>${visibles.map(filaHTML).join('')}</tbody>
+            <tbody>${visibles.map(v => filaHTML(v, esMes)).join('')}</tbody>
           </table></div>`}
     ` : `<div class="empty">Todavía no hay ventas cargadas. Tocá <b>Sincronizar ventas</b> para traerlas de Mercado Libre.</div>`}
   `;
 
   document.getElementById('vml-sync').addEventListener('click', openSyncModal);
   if (hayVentas) {
-    document.getElementById('vml-prev').addEventListener('click', () => pasoDia(-1));
-    document.getElementById('vml-next').addEventListener('click', () => pasoDia(1));
-    document.getElementById('vml-fecha').addEventListener('change', e => { FECHA = e.target.value; render(); });
+    root.querySelectorAll('.vml-modo button').forEach(b =>
+      b.addEventListener('click', () => { MODO = b.dataset.modo; render(); }));
+    const prev = document.getElementById('vml-prev');
+    const next = document.getElementById('vml-next');
+    if (prev) prev.addEventListener('click', () => paso(-1));
+    if (next) next.addEventListener('click', () => paso(1));
+    const inpF = document.getElementById('vml-fecha');
+    const inpM = document.getElementById('vml-mes');
+    if (inpF) inpF.addEventListener('change', e => { FECHA = e.target.value; render(); });
+    if (inpM) inpM.addEventListener('change', e => { MES = e.target.value; render(); });
     root.querySelectorAll('.pill').forEach(p => p.addEventListener('click', () => { FILTRO = p.dataset.f; render(); }));
     const tabla = document.getElementById('vml-tabla');
     if (tabla) tabla.addEventListener('click', onTablaClick);
@@ -181,7 +223,6 @@ function celdaMonto(valor) {
   return `<td style="text-align:right" class="vml-mono ${n < 0 ? 'vml-neg' : 'vml-pos'}">${money(n)}</td>`;
 }
 
-// Celda de cobro + acción de conciliación según el estado de la venta
 function cobroCell(v) {
   if (estaConciliada(v)) {
     const vinc = VINC_BY_VENTA[v.id];
@@ -200,17 +241,17 @@ function cobroCell(v) {
   if (conciliable(v)) {
     return `${ok}<button class="btn btn-primary vml-mini" data-accion="conciliar" data-venta="${v.id}">Conciliar</button>`;
   }
-  // Tiene cobro pero no es limpia (varios cobros o el monto no coincide)
   const motivo = cobros.length > 1 ? 'varios cobros' : 'monto ≠';
   return `${ok}<span class="vml-rev" title="No coincide exacto (${motivo}): conciliar a mano en Conciliación">revisar (${motivo})</span>`;
 }
 
-function filaHTML(v) {
+function filaHTML(v, esMes) {
   const cl = clase(v);
   const est = ESTADO_LBL[cl];
   const rowCls = est.cls === 'canc' ? 'vml-row-canc' : est.cls === 'dev' ? 'vml-row-dev' : '';
 
   return `<tr class="${rowCls}">
+    ${esMes ? `<td class="vml-mono">${esc(ddmm(v.fecha))}</td>` : ''}
     <td class="vml-mono">${v.ml_order_id
       ? `<a class="vml-venta-id" href="https://www.mercadolibre.com.ar/ventas/${encodeURIComponent(v.ml_order_id)}/detalle" target="_blank" rel="noopener" title="Abrir la venta en Mercado Libre">${esc(v.ml_order_id)}</a>`
       : '—'}</td>
@@ -331,6 +372,9 @@ function inyectarEstilo() {
   if (document.getElementById('vml-style')) return;
   const css = `
     .vml-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .vml-modo{display:inline-flex;border:1px solid var(--border-strong);border-radius:var(--r-sm);overflow:hidden}
+    .vml-modo button{border:0;background:var(--surface);color:var(--text-muted);font-family:inherit;font-size:14px;font-weight:600;padding:8px 16px;cursor:pointer}
+    .vml-modo button.active{background:var(--acc-bg);color:var(--acc-dark)}
     .vml-fechalbl{font-size:13px;color:#78716C;text-transform:capitalize;margin-left:4px}
     .vml-de{font-size:14px;color:#A8A29E;font-weight:400}
     .vml-sub{font-size:13px;color:#78716C;margin:-4px 0 12px}
