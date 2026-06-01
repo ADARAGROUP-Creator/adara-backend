@@ -1148,8 +1148,12 @@ app.get('/debug/settlement', async (req, res) => {
   try {
     if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
 
+    // Modos de uso:
+    //  - Crear + esperar:  ?desde=YYYY-MM-DD&hasta=YYYY-MM-DD
+    //  - Reutilizar uno ya creado (solo descarga): ?reportId=NNN
+    //  - Listar reportes disponibles con su estado: ?list=1
     const { desde, hasta } = req.query || {};
-    if (!desde || !hasta) return res.status(400).json({ error: 'Faltan desde/hasta (YYYY-MM-DD) en la query' });
+    const reportIdParam = String(req.query.reportId || '').trim();
 
     // ids a buscar en CUALQUIER columna (source, order, shipping, external_reference…)
     const buscados = new Set(
@@ -1157,34 +1161,49 @@ app.get('/debug/settlement', async (req, res) => {
         .map(s => s.trim()).filter(Boolean)
     );
 
-    // 1. Crear reporte (mismo flujo que /mp/settlement-sync)
-    const createRes = await mpApi('/v1/account/settlement_report', {
-      method: 'POST',
-      body: JSON.stringify({ begin_date: `${desde}T00:00:00Z`, end_date: `${hasta}T23:59:59Z` })
-    });
-    const createData = await createRes.json();
-    const reportId = createData.id;
-    if (!reportId) return res.status(400).json({ error: 'No se pudo crear reporte', detail: createData });
+    // Modo lista: ver qué reportes hay y cuál está "ready" (con su download_url)
+    if (req.query.list) {
+      const listRes = await mpApi('/v1/account/settlement_report/list');
+      const list = await listRes.json();
+      const arr = Array.isArray(list) ? list : [];
+      return res.json({ reportes: arr.map(r => ({ id: r.id, status: r.status, begin: r.begin_date, end: r.end_date, ready: !!r.download_url })) });
+    }
 
-    // 2. Esperar a que esté listo (polling cada 5s, máx 2 min)
+    // 1. Determinar reportId (reutilizar el dado, o crear uno nuevo)
+    let reportId = reportIdParam || null;
+    if (!reportId) {
+      if (!desde || !hasta) return res.status(400).json({ error: 'Pasá ?reportId=NNN, o ?desde=YYYY-MM-DD&hasta=YYYY-MM-DD, o ?list=1' });
+      const createRes = await mpApi('/v1/account/settlement_report', {
+        method: 'POST',
+        body: JSON.stringify({ begin_date: `${desde}T00:00:00Z`, end_date: `${hasta}T23:59:59Z` })
+      });
+      const createData = await createRes.json();
+      reportId = createData.id;
+      if (!reportId) return res.status(400).json({ error: 'No se pudo crear reporte', detail: createData });
+    }
+
+    // 2. Conseguir el download_url del reporte (ya creado o recién pedido).
+    //    Polling corto; si no está listo, devolvemos el reportId para reintentar
+    //    con ?reportId= (sin re-generar).
     let fileUrl = null;
-    for (let i = 0; i < 24; i++) {
-      await new Promise(r => setTimeout(r, 5000));
+    const maxTries = reportIdParam ? 6 : 18;   // menos vueltas si lo estamos reutilizando
+    for (let i = 0; i < maxTries; i++) {
       try {
         const checkRes = await mpApi(`/v1/account/settlement_report/${reportId}`);
         const checkData = await checkRes.json();
         if (checkData.status === 'ready' && checkData.download_url) { fileUrl = checkData.download_url; break; }
         if (checkData.status === 'error') return res.status(400).json({ error: 'Reporte falló', detail: checkData });
-      } catch (e) { break; }
+      } catch (e) { /* sigue intentando */ }
+      await new Promise(r => setTimeout(r, 5000));
     }
     if (!fileUrl) {
       const listRes = await mpApi('/v1/account/settlement_report/list');
       const list = await listRes.json();
       const arr = Array.isArray(list) ? list : [];
-      const found = arr.find(r => r.id === reportId) || arr[0];
+      const found = arr.find(r => String(r.id) === String(reportId));
       if (found?.download_url) fileUrl = found.download_url;
     }
-    if (!fileUrl) return res.status(400).json({ error: 'Reporte no disponible aún, reintentar en unos minutos', reportId });
+    if (!fileUrl) return res.status(202).json({ error: 'Reporte aún generándose', reportId, reintentar_con: `?reportId=${reportId}&source=${[...buscados].join(',')}` });
 
     // 3. Descargar CSV
     const csvRes = await fetch(fileUrl, { headers: { 'Authorization': 'Bearer ' + ML.access } });
