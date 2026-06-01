@@ -156,11 +156,10 @@ function render() {
   const root = document.getElementById('app-screens');
   const hayVentas = VENTAS.length > 0;
   const esMes = MODO === 'mes';
-  const base = !hayVentas ? []
-    : esMes ? VENTAS.filter(v => mesDe(v.fecha) === MES)
-            : VENTAS.filter(v => v.fecha === FECHA);
+  const base = !hayVentas ? [] : conjuntoActual();
 
   const BONIF_MAP = asignarBonifs(base);
+  const conciliablesN = base.filter(v => conciliable(v, BONIF_MAP)).length;
 
   const cont = { todas: base.length, por_cobrar: 0, cobradas: 0, conciliadas: 0, canceladas: 0, devueltas: 0 };
   base.forEach(v => { cont[clase(v)]++; });
@@ -210,6 +209,7 @@ function render() {
       <button class="btn btn-primary" id="vml-sync">⟳ Sincronizar ventas</button>
       ${hayVentas ? modoHTML : ''}
       ${navHTML}
+      ${conciliablesN > 0 ? `<button class="btn btn-conc" id="vml-conc-todas">✓ Conciliar todas (${conciliablesN})</button>` : ''}
     </div>
 
     ${hayVentas ? `
@@ -258,6 +258,8 @@ function render() {
     root.querySelectorAll('.pill').forEach(p => p.addEventListener('click', () => { FILTRO = p.dataset.f; render(); }));
     const tabla = document.getElementById('vml-tabla');
     if (tabla) tabla.addEventListener('click', onTablaClick);
+    const cTodas = document.getElementById('vml-conc-todas');
+    if (cTodas) cTodas.addEventListener('click', conciliarTodas);
   }
 }
 
@@ -376,6 +378,61 @@ async function desvincular(ventaId) {
   }
 }
 
+// Conjunto de ventas visible según el modo (día o mes). Lo usan render y "Conciliar todas".
+function conjuntoActual() {
+  if (MODO === 'mes') return VENTAS.filter(v => mesDe(v.fecha) === MES);
+  return VENTAS.filter(v => v.fecha === FECHA);
+}
+
+// Arma la lista de vínculos de todas las ventas conciliables (pago, y bonificación
+// cuando corresponde), reservando cada bonificación una sola vez.
+function armarLoteConciliacion(ventas) {
+  const usados = new Set(VINC_MOV_USADOS);
+  const lote = [];
+  for (const v of ventas) {
+    if (estaConciliada(v) || v.ml_status === 'cancelled' || v.devuelta) continue;
+    const cb = matchCobros(v);
+    if (cb.length !== 1) continue;
+    const pago = cb[0];
+    const pm = Number(pago.monto) || 0;
+    const pc = Number(v.por_cobrar) || 0;
+    if (Math.abs(pm - pc) < TOL) {
+      lote.push({ movimiento_id: pago.id, op_tipo: 'venta_ml', op_id: v.id, monto: r2(Math.abs(pm)) });
+    } else {
+      const falta = r2(pc - pm);
+      if (falta <= TOL) continue;
+      const b = buscarBonif(falta, usados);
+      if (!b) continue;
+      lote.push({ movimiento_id: pago.id, op_tipo: 'venta_ml', op_id: v.id, monto: r2(Math.abs(pm)) });
+      lote.push({ movimiento_id: b.id, op_tipo: 'venta_ml', op_id: v.id, monto: r2(Math.abs(Number(b.monto) || 0)) });
+      usados.add(b.id);
+    }
+  }
+  return lote;
+}
+
+// Concilia de una sola vez todas las ventas que cierran del período visible.
+async function conciliarTodas() {
+  const lote = armarLoteConciliacion(conjuntoActual());
+  if (!lote.length) { window.toast('No hay ventas para conciliar'); return; }
+  const nVentas = new Set(lote.map(x => x.op_id)).size;
+  const periodo = MODO === 'mes' ? mesLargo(MES) : fechaLarga(FECHA);
+  if (!confirm(`¿Conciliar ${nVentas} ventas de ${periodo}? Se vinculan con su cobro (y la bonificación de envío cuando corresponde). Las que no cierran no se tocan.`)) return;
+  window.toast(`Conciliando ${nVentas} ventas…`);
+  try {
+    const r = await fetch('/vincular-lote', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vinculos: lote })
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+    window.toast(`Listo: ${nVentas} ventas conciliadas`);
+    await loadVentasML();
+  } catch (e) {
+    window.toast('Error al conciliar todas: ' + e.message, 'error');
+  }
+}
+
 function openSyncModal() {
   const hoy = hoyISO();
   const hace7 = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
@@ -441,6 +498,8 @@ function inyectarEstilo() {
     .vml-modo{display:inline-flex;border:1px solid var(--border-strong);border-radius:var(--r-sm);overflow:hidden}
     .vml-modo button{border:0;background:var(--surface);color:var(--text-muted);font-family:inherit;font-size:14px;font-weight:600;padding:8px 16px;cursor:pointer}
     .vml-modo button.active{background:var(--acc-bg);color:var(--acc-dark)}
+    .btn-conc{background:#0F6E56;color:#fff;border:0}
+    .btn-conc:hover{background:#0C5A47}
     .vml-fechalbl{font-size:13px;color:#78716C;text-transform:capitalize;margin-left:4px}
     .vml-de{font-size:14px;color:#A8A29E;font-weight:400}
     .vml-sub{font-size:13px;color:#78716C;margin:-4px 0 12px}
