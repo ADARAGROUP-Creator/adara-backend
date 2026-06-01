@@ -776,7 +776,7 @@ function filaDevolucionHTML({ d, cands }) {
   </tr>`;
 }
 
-
+function inyectarEstilo() {
   if (document.getElementById('vml-style')) return;
   const css = `
     .vml-tabs{display:flex;gap:4px;border-bottom:1px solid var(--border-strong);margin-bottom:14px}
