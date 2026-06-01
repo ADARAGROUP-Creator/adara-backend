@@ -180,19 +180,19 @@ function render() {
         ? `<div class="empty" style="margin-top:14px">No hay ventas en este filtro para ${vacioTxt}.</div>`
         : `<div class="table-wrap" style="margin-top:14px"><table class="t" id="vml-tabla">
             <thead><tr>
-              ${esMes ? '<th style="width:62px">Fecha</th>' : ''}
-              <th style="width:130px"># Venta</th>
+              ${esMes ? '<th style="width:50px">Fecha</th>' : ''}
+              <th style="width:120px"># Venta</th>
               <th>Producto</th>
-              <th style="width:70px">SKU</th>
-              <th style="width:38px;text-align:right">Cant</th>
-              <th style="width:110px;text-align:right">Bruto</th>
-              <th style="width:100px;text-align:right">Comisión</th>
-              <th style="width:95px;text-align:right">Envío</th>
-              <th style="width:95px;text-align:right">Impuestos</th>
-              <th style="width:95px;text-align:right">Financiero</th>
-              <th style="width:120px;text-align:right">Por cobrar</th>
-              <th style="width:92px">Estado</th>
-              <th style="width:230px">Cobro / Conciliación</th>
+              <th style="width:56px">SKU</th>
+              <th style="width:34px;text-align:right">Cant</th>
+              <th style="width:96px;text-align:right">Bruto</th>
+              <th style="width:90px;text-align:right">Comisión</th>
+              <th style="width:84px;text-align:right">Envío</th>
+              <th style="width:84px;text-align:right">Impuestos</th>
+              <th style="width:88px;text-align:right">Financiero</th>
+              <th style="width:104px;text-align:right">Por cobrar</th>
+              <th style="width:84px">Estado</th>
+              <th style="width:198px">Cobro / Conciliación</th>
             </tr></thead>
             <tbody>${visibles.map(v => filaHTML(v, esMes)).join('')}</tbody>
           </table></div>`}
@@ -383,6 +383,9 @@ function inyectarEstilo() {
     .vml-pos{color:#15803D}
     .vml-neg{color:#B91C1C}
     .vml-cero{color:#C7C2BC}
+    #vml-tabla{font-size:13px}
+    #vml-tabla thead th{padding:8px 10px;font-size:11px}
+    #vml-tabla tbody td{padding:8px 10px}
     .vml-venta-id{color:#0C447C;text-decoration:none;border-bottom:1px dashed #9DB6D4}
     .vml-venta-id:hover{color:#D97706;border-bottom-color:#D97706}
     .vml-est{font-size:12px;padding:2px 8px;border-radius:6px;background:#F1EFE8;color:#57534E}
