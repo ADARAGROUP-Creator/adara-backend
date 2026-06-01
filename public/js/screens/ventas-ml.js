@@ -2,14 +2,21 @@ import { sbGet } from '../core/sb.js';
 
 // ── Pantalla: Ventas ML (control diario/mensual + conciliación) ────────
 // Lista las ventas de ML por día o por mes con su detalle real y las cruza
-// contra los cobros del extracto de MP. Permite CONCILIAR (vincular venta ↔
-// cobro) las ventas "limpias" (1 cobro, monto coincide). Las dudosas se marcan
-// para revisar a mano en Conciliación. Cruce por mp_payment_id; vínculo
-// op_tipo='venta_ml', op_id=ventas_ml.id, monto=por_cobrar (magnitud positiva).
+// contra los cobros del extracto de MP. Concilia (vincula venta ↔ cobro) las
+// ventas cuyo cobro cierra con el por_cobrar. Soporta el caso de bonificación
+// de envío: ML liquida la venta en DOS movimientos (pago principal + bonificación
+// de envío, con número de operación distinto y monto neto). Cuando el pago solo
+// no llega al por_cobrar, se busca una "Bonificación por envío" disponible cuyo
+// monto complete la diferencia y se vinculan ambos movimientos a la venta.
+// Las bonificaciones del mismo monto son intercambiables: cada una se usa una
+// sola vez (se excluyen las ya vinculadas). Cruce del pago por mp_payment_id;
+// vínculo op_tipo='venta_ml', op_id=ventas_ml.id, monto = monto de cada movimiento.
 
 let VENTAS = [];
 let COBROS_BY_REF = {};      // REFERENCE_ID del extracto -> movimiento (cobro_venta)
-let VINC_BY_VENTA = {};      // ventas_ml.id -> vínculo (op_tipo='venta_ml')
+let BONIFS = [];             // movimientos cobro_venta de "bonificación por envío"
+let VINC_BY_VENTA = {};      // ventas_ml.id -> [vínculos] (op_tipo='venta_ml')
+let VINC_MOV_USADOS = new Set(); // movimiento_id ya vinculados a alguna venta
 let DIAS = [];
 let MESES = [];
 let MODO = 'dia';            // dia | mes
@@ -17,6 +24,8 @@ let FECHA = '';              // YYYY-MM-DD (modo día)
 let MES = '';                // YYYY-MM (modo mes)
 let FILTRO = 'todas';        // todas | por_cobrar | cobradas | conciliadas | canceladas | devueltas
 
+const TOL = 0.02;
+const r2 = n => Math.round((Number(n) || 0) * 100) / 100;
 const money = n => '$ ' + Math.abs(Number(n) || 0).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const ddmm = f => `${(f || '').slice(8, 10)}/${(f || '').slice(5, 7)}`;
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -44,14 +53,43 @@ function matchCobros(v) {
   for (const id of paymentIds(v)) if (COBROS_BY_REF[id]) cobros.push(COBROS_BY_REF[id]);
   return cobros;
 }
-const estaConciliada = v => !!VINC_BY_VENTA[v.id];
+const estaConciliada = v => !!(VINC_BY_VENTA[v.id] && VINC_BY_VENTA[v.id].length);
 
-function conciliable(v) {
+// Busca una bonificación de envío disponible (no usada) cuyo monto sea ≈ falta.
+function buscarBonif(falta, usados) {
+  if (falta <= TOL) return null;
+  return BONIFS.find(b => !usados.has(b.id) && Math.abs((Number(b.monto) || 0) - falta) < TOL) || null;
+}
+
+// Asigna, de forma greedy, una bonificación a cada venta visible que la necesite
+// (pago principal único + diferencia positiva que matchee una bonificación libre).
+// Devuelve { ventaId: movimientoBonif }. Reserva cada bonificación una sola vez.
+function asignarBonifs(ventas) {
+  const usados = new Set(VINC_MOV_USADOS);
+  const map = {};
+  for (const v of ventas) {
+    if (estaConciliada(v) || v.ml_status === 'cancelled' || v.devuelta) continue;
+    const cb = matchCobros(v);
+    if (cb.length !== 1) continue;
+    const falta = r2((Number(v.por_cobrar) || 0) - (Number(cb[0].monto) || 0));
+    if (Math.abs(falta) < TOL || falta < 0) continue;
+    const b = buscarBonif(falta, usados);
+    if (b) { map[v.id] = b; usados.add(b.id); }
+  }
+  return map;
+}
+
+// Conciliable: pago principal único que cierra el por_cobrar, solo o con su bonificación.
+function conciliable(v, bonifMap) {
   if (estaConciliada(v) || v.ml_status === 'cancelled' || v.devuelta) return false;
   const cb = matchCobros(v);
   if (cb.length !== 1) return false;
-  const sum = cb.reduce((s, c) => s + (Number(c.monto) || 0), 0);
-  return Math.abs(sum - (Number(v.por_cobrar) || 0)) < 0.02;
+  const pago = Number(cb[0].monto) || 0;
+  const pc = Number(v.por_cobrar) || 0;
+  if (Math.abs(pago - pc) < TOL) return true;            // cierra con el pago solo
+  const b = bonifMap[v.id];
+  if (b && Math.abs(pago + (Number(b.monto) || 0) - pc) < TOL) return true; // pago + bonificación
+  return false;
 }
 
 function clase(v) {
@@ -76,13 +114,19 @@ export async function loadVentasML() {
     VENTAS = await sbGet('ventas_ml', 'order=fecha.asc,hora_venta.asc');
     const cobros = await sbGet('movimientos', 'categoria=eq.cobro_venta&order=fecha.asc');
     COBROS_BY_REF = {};
+    BONIFS = [];
     for (const c of cobros) {
       const ref = String(c.referencia_externa || '').split('|')[1];
       if (ref) COBROS_BY_REF[ref.trim()] = c;
+      if (/bonific/i.test(c.descripcion || '')) BONIFS.push(c);
     }
     const vinc = await sbGet('vinculos', 'op_tipo=eq.venta_ml');
     VINC_BY_VENTA = {};
-    for (const v of vinc) VINC_BY_VENTA[v.op_id] = v;
+    VINC_MOV_USADOS = new Set();
+    for (const v of vinc) {
+      (VINC_BY_VENTA[v.op_id] = VINC_BY_VENTA[v.op_id] || []).push(v);
+      VINC_MOV_USADOS.add(v.movimiento_id);
+    }
   } catch (e) {
     root.innerHTML = `<div class="error">No se pudieron cargar las ventas: ${esc(e.message)}</div>`;
     return;
@@ -116,20 +160,20 @@ function render() {
     : esMes ? VENTAS.filter(v => mesDe(v.fecha) === MES)
             : VENTAS.filter(v => v.fecha === FECHA);
 
+  const BONIF_MAP = asignarBonifs(base);
+
   const cont = { todas: base.length, por_cobrar: 0, cobradas: 0, conciliadas: 0, canceladas: 0, devueltas: 0 };
   base.forEach(v => { cont[clase(v)]++; });
 
   const visibles = FILTRO === 'todas' ? base : base.filter(v => clase(v) === FILTRO);
   const totCobrar = base.reduce((s, v) => s + (Number(v.por_cobrar) || 0), 0);
 
-  // Selector de modo
   const modoHTML = `
     <div class="vml-modo">
       <button class="${!esMes ? 'active' : ''}" data-modo="dia">Día</button>
       <button class="${esMes ? 'active' : ''}" data-modo="mes">Mes</button>
     </div>`;
 
-  // Navegación (día o mes)
   let navHTML = '';
   if (hayVentas && esMes) {
     const i = MESES.indexOf(MES);
@@ -192,9 +236,9 @@ function render() {
               <th style="width:88px;text-align:right">Financiero</th>
               <th style="width:104px;text-align:right">Por cobrar</th>
               <th style="width:84px">Estado</th>
-              <th style="width:198px">Cobro / Conciliación</th>
+              <th style="width:230px">Cobro / Conciliación</th>
             </tr></thead>
-            <tbody>${visibles.map(v => filaHTML(v, esMes)).join('')}</tbody>
+            <tbody>${visibles.map(v => filaHTML(v, esMes, BONIF_MAP)).join('')}</tbody>
           </table></div>`}
     ` : `<div class="empty">Todavía no hay ventas cargadas. Tocá <b>Sincronizar ventas</b> para traerlas de Mercado Libre.</div>`}
   `;
@@ -223,11 +267,12 @@ function celdaMonto(valor) {
   return `<td style="text-align:right" class="vml-mono ${n < 0 ? 'vml-neg' : 'vml-pos'}">${money(n)}</td>`;
 }
 
-function cobroCell(v) {
+function cobroCell(v, bonifMap) {
   if (estaConciliada(v)) {
-    const vinc = VINC_BY_VENTA[v.id];
-    return `<span class="vml-conc">✓ conciliada</span>`
-      + `<button class="vml-x" data-accion="desvincular" data-vinculo="${vinc.id}" title="Deshacer conciliación">✕</button>`;
+    const n = (VINC_BY_VENTA[v.id] || []).length;
+    const detalle = n > 1 ? ' (pago + bonif.)' : '';
+    return `<span class="vml-conc">✓ conciliada${detalle}</span>`
+      + `<button class="vml-x" data-accion="desvincular" data-venta="${v.id}" title="Deshacer conciliación">✕</button>`;
   }
   const cobros = matchCobros(v);
   if (!cobros.length) return `<span class="vml-cobro-no">— sin cobro</span>`;
@@ -238,14 +283,16 @@ function cobroCell(v) {
   if (v.ml_status === 'cancelled' || v.devuelta) {
     return `${ok}<span class="vml-rev" title="Cancelada/devuelta: revisar en Conciliación">revisar</span>`;
   }
-  if (conciliable(v)) {
-    return `${ok}<button class="btn btn-primary vml-mini" data-accion="conciliar" data-venta="${v.id}">Conciliar</button>`;
+  if (conciliable(v, bonifMap)) {
+    const b = bonifMap[v.id];
+    const extra = b ? `<span class="vml-bonif" title="Bonificación de envío que se suma al conciliar">+ bonif. ${money(b.monto)}</span>` : '';
+    return `${ok}${extra}<button class="btn btn-primary vml-mini" data-accion="conciliar" data-venta="${v.id}">Conciliar</button>`;
   }
   const motivo = cobros.length > 1 ? 'varios cobros' : 'monto ≠';
   return `${ok}<span class="vml-rev" title="No coincide exacto (${motivo}): conciliar a mano en Conciliación">revisar (${motivo})</span>`;
 }
 
-function filaHTML(v, esMes) {
+function filaHTML(v, esMes, bonifMap) {
   const cl = clase(v);
   const est = ESTADO_LBL[cl];
   const rowCls = est.cls === 'canc' ? 'vml-row-canc' : est.cls === 'dev' ? 'vml-row-dev' : '';
@@ -265,7 +312,7 @@ function filaHTML(v, esMes) {
     ${celdaMonto(v.costo_financiero)}
     <td style="text-align:right" class="vml-mono vml-fuerte">${money(v.por_cobrar)}</td>
     <td><span class="vml-est vml-est-${est.cls || 'ok'}">${esc(est.txt)}</span></td>
-    <td>${cobroCell(v)}</td>
+    <td>${cobroCell(v, bonifMap)}</td>
   </tr>`;
 }
 
@@ -273,36 +320,55 @@ function onTablaClick(e) {
   const btn = e.target.closest('[data-accion]');
   if (!btn) return;
   if (btn.dataset.accion === 'conciliar') conciliar(btn.dataset.venta);
-  else if (btn.dataset.accion === 'desvincular') desvincular(btn.dataset.vinculo);
+  else if (btn.dataset.accion === 'desvincular') desvincular(btn.dataset.venta);
 }
 
+// Vincula el pago principal y, si hace falta para llegar al por_cobrar, también
+// la bonificación de envío. Cada vínculo imputa el monto de su propio movimiento.
 async function conciliar(ventaId) {
   const v = VENTAS.find(x => String(x.id) === String(ventaId));
   if (!v) return;
   const cobros = matchCobros(v);
   if (cobros.length !== 1) { window.toast('Esta venta no se puede conciliar automáticamente', 'error'); return; }
-  const monto = Math.round((Number(v.por_cobrar) || 0) * 100) / 100;
+  const pago = cobros[0];
+  const pc = Number(v.por_cobrar) || 0;
+  const falta = r2(pc - (Number(pago.monto) || 0));
+
+  const aVincular = [{ id: pago.id, monto: r2(Math.abs(Number(pago.monto) || 0)) }];
+  if (Math.abs(falta) >= TOL && falta > 0) {
+    const b = buscarBonif(falta, new Set(VINC_MOV_USADOS));
+    if (!b) { window.toast('No encontré una bonificación disponible para completar el monto', 'error'); return; }
+    aVincular.push({ id: b.id, monto: r2(Math.abs(Number(b.monto) || 0)) });
+  }
+
   window.toast('Conciliando…');
   try {
-    const r = await fetch('/vincular', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ movimiento_id: cobros[0].id, op_tipo: 'venta_ml', op_id: v.id, monto })
-    });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
-    window.toast('Venta conciliada');
+    for (const x of aVincular) {
+      const r = await fetch('/vincular', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ movimiento_id: x.id, op_tipo: 'venta_ml', op_id: v.id, monto: x.monto })
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+    }
+    window.toast(aVincular.length > 1 ? 'Venta conciliada (pago + bonificación)' : 'Venta conciliada');
     await loadVentasML();
   } catch (e) {
     window.toast('Error al conciliar: ' + e.message, 'error');
   }
 }
 
-async function desvincular(vinculoId) {
+// Deshace TODOS los vínculos de la venta (pago y, si corresponde, bonificación).
+async function desvincular(ventaId) {
+  const vincs = VINC_BY_VENTA[ventaId] || [];
+  if (!vincs.length) return;
   if (!confirm('¿Deshacer la conciliación de esta venta? El cobro y la venta vuelven a quedar pendientes.')) return;
   try {
-    const r = await fetch('/vincular/' + vinculoId, { method: 'DELETE' });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+    for (const vc of vincs) {
+      const r = await fetch('/vincular/' + vc.id, { method: 'DELETE' });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+    }
     window.toast('Conciliación deshecha');
     await loadVentasML();
   } catch (e) {
@@ -383,12 +449,11 @@ function inyectarEstilo() {
     .vml-pos{color:#15803D}
     .vml-neg{color:#B91C1C}
     .vml-cero{color:#C7C2BC}
-    /* La tabla se ajusta al ancho del monitor: la fuente y el espaciado escalan
-       entre un mínimo y un máximo según el ancho de pantalla. */
+    /* La tabla se ajusta al ancho del monitor: fuente y espaciado escalan según el ancho. */
     #vml-tabla{font-size:clamp(11px, 0.55vw + 4.5px, 16px)}
     #vml-tabla thead th{padding:clamp(6px,0.5vw,11px) clamp(6px,0.55vw,12px);font-size:clamp(10px, 0.4vw + 4.5px, 13px);white-space:nowrap}
     #vml-tabla tbody td{padding:clamp(6px,0.5vw,11px) clamp(6px,0.55vw,12px)}
-    /* Los montos y códigos nunca se parten en dos líneas */
+    /* Montos y códigos nunca se parten en dos líneas */
     #vml-tabla tbody td.vml-mono{white-space:nowrap}
     .vml-venta-id{color:#0C447C;text-decoration:none;border-bottom:1px dashed #9DB6D4}
     .vml-venta-id:hover{color:#D97706;border-bottom-color:#D97706}
@@ -399,7 +464,8 @@ function inyectarEstilo() {
     .vml-est-conc{background:#E1F5EE;color:#0F6E56}
     .vml-row-canc{background:rgba(180,35,24,0.05)}
     .vml-row-dev{background:rgba(217,119,6,0.06)}
-    .vml-cobro-ok{color:#0F6E56;font-weight:600;font-family:'JetBrains Mono',ui-monospace,monospace;margin-right:8px}
+    .vml-cobro-ok{color:#0F6E56;font-weight:600;font-family:'JetBrains Mono',ui-monospace,monospace;margin-right:8px;white-space:nowrap}
+    .vml-bonif{font-size:11px;color:#0C447C;background:#E6F1FB;border-radius:6px;padding:2px 7px;margin-right:8px;white-space:nowrap}
     .vml-cobro-no{font-size:12px;color:#857a5c;background:#FAF6EC;border:1px dashed #E3D9BE;border-radius:6px;padding:2px 8px}
     .vml-conc{color:#0F6E56;font-weight:600;margin-right:6px}
     .vml-rev{font-size:12px;color:#92500A;background:#FAF1E1;border-radius:6px;padding:2px 8px}
