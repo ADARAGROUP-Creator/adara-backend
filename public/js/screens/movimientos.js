@@ -28,7 +28,7 @@ let MESES = [];            // meses disponibles, desc
 let ESTADO_BY_ID = {};     // movimiento_id -> estado (ÚNICA fuente de verdad: v_movimientos_estado)
 let VINC_OPS = {};         // movimiento_id -> [{op_tipo, op_id}]
 let VENTA_NUM = {};        // ventas_ml.id -> ml_order_id (para mostrar el N° de venta)
-let EXPANDED = new Set();  // claves de operación actualmente desplegadas
+let OP_SIBLINGS = {};      // N° de operación MP -> movimientos que lo comparten (en el mes)
 let LINEAS = [];           // catálogo de líneas de negocio
 let LINEA_LABEL = {};      // linea_id -> nombre
 let VENTA_LINEA = {};      // ventas_ml.id -> linea_negocio_id (línea heredada)
@@ -136,22 +136,41 @@ function lineaHeredada(m) {
   return null;
 }
 
-// Celda "Línea" a nivel OPERACIÓN. Si la operación tiene líneas huérfanas (sin
-// contraparte) se puede asignar: aparece como una etiqueta discreta que, al
-// hacer clic, se convierte en un selector. Si todas tienen contraparte, la
-// línea aparece BLOQUEADA (heredada de la operación vinculada).
-function celdaLineaOp(g) {
-  const orphans = g.lines.filter(m => !tieneContraparte(m));
-  if (!orphans.length) {
-    const id = lineaHeredada(g.lines[0]);
+// Etiqueta de categoría legible.
+function catLabelDe(m) {
+  return (CATEGORIAS.find(c => c[0] === (m.categoria || ''))?.[1]) || m.categoria || '';
+}
+
+// Columna "Vinculado a": si tiene enganche real, el N° de venta. Si no, pero
+// comparte N° de operación de MP con otros (ej. impuesto por extracción ↔ su
+// transferencia), muestra con qué va y deja hacer clic para verlos juntos.
+function vinculadoCol(m) {
+  const v = vinculadoA(m);
+  if (v) return v;
+  const op = nroOperacion(m);
+  if (!op) return '';
+  const sibs = (OP_SIBLINGS[op] || []).filter(x => x.id !== m.id);
+  if (!sibs.length) return '';
+  const cats = [...new Set(sibs.map(catLabelDe))].filter(Boolean);
+  const etiqueta = cats.length ? cats.slice(0, 2).join(', ') : `${sibs.length} mov`;
+  const extra = sibs.length > 1 ? ` <span class="mov-muted">·${sibs.length}</span>` : '';
+  return `<span class="mov-op-link" data-op="${esc(op)}" title="Misma operación ${esc(op)} — clic para verlos juntos">${esc(etiqueta)}${extra}</span>`;
+}
+
+// Celda "Línea" por movimiento. Huérfano (sin contraparte) → etiqueta editable
+// (clic para elegir; se aplica a toda la operación si comparte N°). Con
+// contraparte → línea heredada de su operación, bloqueada.
+function celdaLinea(m) {
+  if (tieneContraparte(m)) {
+    const id = lineaHeredada(m);
     const txt = id != null ? (LINEA_LABEL[id] || ('#' + id)) : '(heredada)';
     return `<span class="mov-linea-ro" title="La toma de la operación vinculada (no se edita acá)">${esc(txt)}</span>`;
   }
-  const actual = orphans[0].linea_id;
-  const nroOp = nroOperacion(orphans[0]);
+  const actual = m.linea_id;
+  const nroOp = nroOperacion(m);
   const tieneLinea = actual != null && actual !== '';
   const label = tieneLinea ? (LINEA_LABEL[actual] || ('#' + actual)) : '+ asignar línea';
-  return `<span class="mov-linea-edit ${tieneLinea ? 'asignada' : 'vacia'}" data-mov="${orphans[0].id}" data-op="${esc(nroOp)}" data-current="${tieneLinea ? actual : ''}" title="${tieneLinea ? 'Cambiar línea' : 'Asignar línea (se aplica a toda la operación)'}">${esc(label)}</span>`;
+  return `<span class="mov-linea-edit ${tieneLinea ? 'asignada' : 'vacia'}" data-mov="${m.id}" data-op="${esc(nroOp)}" data-current="${tieneLinea ? actual : ''}" title="${tieneLinea ? 'Cambiar línea' : 'Asignar línea'}">${esc(label)}</span>`;
 }
 
 // Al hacer clic en la etiqueta, la cambia por un selector para elegir la línea.
@@ -239,7 +258,16 @@ function render() {
 
   // Lista: base + filtro de estado (la pill activa)
   const filtrados = base.filter(m => !FILTRO.estado || estadoDe(m) === FILTRO.estado);
-  const grupos = gruposDeOperacion(filtrados);
+
+  // Hermanos por operación MP (mismo N° de operación dentro del mes), para
+  // mostrar con quién va cada movimiento (ej. impuesto por extracción ↔ su
+  // transferencia). Se calcula sobre el mes, no sobre la búsqueda.
+  OP_SIBLINGS = {};
+  for (const m of DATA) {
+    if (MES && mesDe(m.fecha) !== MES) continue;
+    const op = nroOperacion(m);
+    if (op) (OP_SIBLINGS[op] = OP_SIBLINGS[op] || []).push(m);
+  }
 
   // KPIs (sobre la base filtrada por mes + cuenta + búsqueda)
   const total = base.length;
@@ -299,7 +327,7 @@ function render() {
             <th style="width:104px">Estado</th>
             <th style="width:44px"></th>
           </tr></thead>
-          <tbody>${grupos.map(filaOperacionHTML).join('')}</tbody>
+          <tbody>${filtrados.map(filaHTML).join('')}</tbody>
         </table></div>`}
   `;
 
@@ -315,10 +343,11 @@ function render() {
   document.querySelectorAll('.mov-del').forEach(b => {
     b.addEventListener('click', () => borrarMovimiento(b.dataset.id));
   });
-  document.querySelectorAll('.mov-exp').forEach(b => {
+  document.querySelectorAll('.mov-op-num, .mov-op-link').forEach(b => {
     b.addEventListener('click', () => {
-      const k = b.dataset.key;
-      if (EXPANDED.has(k)) EXPANDED.delete(k); else EXPANDED.add(k);
+      FILTRO.q = b.dataset.op;
+      const inp = document.getElementById('f-q');
+      if (inp) inp.value = b.dataset.op;
       render();
     });
   });
@@ -327,97 +356,33 @@ function render() {
   });
 }
 
-// Agrupa los movimientos por número de operación (los que no tienen número son
-// su propia operación de 1 línea). Mantiene el orden de aparición.
-function gruposDeOperacion(filtrados) {
-  const map = new Map();
-  const order = [];
-  for (const m of filtrados) {
-    const k = nroOperacion(m) || ('m' + m.id);
-    if (!map.has(k)) { map.set(k, { key: k, lines: [] }); order.push(k); }
-    map.get(k).lines.push(m);
-  }
-  return order.map(k => map.get(k));
-}
-
-// Saca el número de operación del final de la descripción (ya está en su columna).
-function descLimpia(m) {
-  return (m.descripcion || '').replace(/\s*·\s*\d{6,}\s*$/, '').trim();
-}
-
-// Estado agregado de una operación a partir de sus líneas.
-function estadoOp(lines) {
-  const ests = lines.map(estadoDe);
-  if (ests.every(e => e === 'conciliado' || e === 'auto')) return ests.includes('conciliado') ? 'conciliado' : 'auto';
-  if (ests.every(e => e === 'pendiente')) return 'pendiente';
-  return 'parcial';
-}
-
-// Fila de una OPERACIÓN (puede tener varias líneas). Si tiene más de una, se
-// puede desplegar para ver el detalle línea por línea.
-function filaOperacionHTML(g) {
-  const lines = g.lines;
-  const multi = lines.length > 1;
-  const first = lines[0];
-  const moneda = monedaDe(first.cuenta_id);
-  const neto = lines.reduce((s, m) => s + (Number(m.monto) || 0), 0);
-  const neg = neto < 0;
-  const cats = [...new Set(lines.map(m => m.categoria))];
-  const catUnica = cats.length === 1;
-  const catLabel = catUnica ? ((CATEGORIAS.find(c => c[0] === cats[0])?.[1]) || cats[0]) : 'varias';
-  const catSinClasif = catUnica && (!cats[0] || cats[0] === 'sin_clasificar');
-  const est = estadoOp(lines);
-  let vinc = '';
-  for (const m of lines) { const v = vinculadoA(m); if (v) { vinc = v; break; } }
-  const nroOp = nroOperacion(first);
-
-  let desc;
-  if (multi) {
-    const pr = lines.slice().sort((a, b) => Math.abs(Number(b.monto) || 0) - Math.abs(Number(a.monto) || 0))[0];
-    desc = `${esc(descLimpia(pr)) || 'Operación'} <span class="mov-muted">· ${lines.length} líneas</span>`;
-  } else {
-    desc = descLimpia(first) ? esc(descLimpia(first)) : '<span class="mov-muted">—</span>';
-  }
-  const expanded = EXPANDED.has(g.key);
-  const toggle = multi
-    ? `<button class="mov-exp" data-key="${esc(g.key)}" title="Ver las líneas de esta operación">${expanded ? '▾' : '▸'}</button> `
-    : '';
-  const delBtn = (!multi && first.origen === 'manual')
-    ? `<button class="mov-del" data-id="${first.id}" title="Borrar movimiento">✕</button>` : '';
-
-  let html = `<tr class="${multi ? 'mov-row-op' : ''}">
-    <td>${(first.fecha || '').slice(8, 10)}/${(first.fecha || '').slice(5, 7)}</td>
-    <td>${cuentaLabel(first.cuenta_id)}</td>
-    <td>${toggle}${desc}</td>
-    <td class="mov-mono mov-op">${nroOp ? esc(nroOp) : '<span class="mov-muted">—</span>'}</td>
+// Una fila por movimiento, con su monto real. El N° de operación es clicable
+// cuando comparte operación con otros (para verlos juntos), y "Vinculado a"
+// muestra con qué va.
+function filaHTML(m) {
+  const moneda = monedaDe(m.cuenta_id);
+  const neg = Number(m.monto) < 0;
+  const est = estadoDe(m);
+  const catLabel = catLabelDe(m);
+  const catSinClasif = !m.categoria || m.categoria === 'sin_clasificar';
+  const nroOp = nroOperacion(m);
+  const nSibs = nroOp ? (OP_SIBLINGS[nroOp] || []).filter(x => x.id !== m.id).length : 0;
+  const opCell = nroOp
+    ? `<span class="mov-op-num" data-op="${esc(nroOp)}" title="${nSibs ? `Operación con ${nSibs + 1} movimientos — clic para verlos juntos` : 'N° de operación de Mercado Pago'}">${esc(nroOp)}</span>${nSibs ? ` <span class="mov-op-n">·${nSibs + 1}</span>` : ''}`
+    : '<span class="mov-muted">—</span>';
+  const vinc = vinculadoCol(m);
+  return `<tr>
+    <td>${(m.fecha || '').slice(8, 10)}/${(m.fecha || '').slice(5, 7)}</td>
+    <td>${cuentaLabel(m.cuenta_id)}</td>
+    <td>${m.descripcion ? esc(m.descripcion) : '<span class="mov-muted">—</span>'}</td>
+    <td class="mov-mono mov-op">${opCell}</td>
     <td>${catSinClasif ? '<span class="mov-tag-empty">sin clasificar</span>' : `<span class="mov-tag">${esc(catLabel)}</span>`}</td>
-    <td>${celdaLineaOp(g)}</td>
-    <td style="text-align:right" class="mov-mono ${neg ? 'mov-neg' : 'mov-pos'}">${fmtMonto(neto, moneda)}</td>
+    <td>${celdaLinea(m)}</td>
+    <td style="text-align:right" class="mov-mono ${neg ? 'mov-neg' : 'mov-pos'}">${fmtMonto(m.monto, moneda)}</td>
     <td class="mov-mono mov-vinc">${vinc || '<span class="mov-muted">—</span>'}</td>
     <td><span class="mov-badge mov-badge-${est}">${LABEL_ESTADO[est] || est}</span></td>
-    <td style="text-align:center">${delBtn}</td>
+    <td style="text-align:center">${m.origen === 'manual' ? `<button class="mov-del" data-id="${m.id}" title="Borrar movimiento">✕</button>` : ''}</td>
   </tr>`;
-
-  if (multi && expanded) {
-    html += `<tr class="mov-detalle"><td colspan="10">${detalleOperacionHTML(lines)}</td></tr>`;
-  }
-  return html;
-}
-
-// Detalle de las líneas de una operación (cuando está desplegada).
-function detalleOperacionHTML(lines) {
-  return `<div class="mov-det">${lines.map(m => {
-    const moneda = monedaDe(m.cuenta_id);
-    const neg = Number(m.monto) < 0;
-    const est = estadoDe(m);
-    const catLabel = (CATEGORIAS.find(c => c[0] === (m.categoria || ''))?.[1]) || m.categoria || '';
-    return `<div class="mov-det-row">
-      <span class="mov-det-desc">${descLimpia(m) ? esc(descLimpia(m)) : '—'}</span>
-      <span class="mov-det-cat">${esc(catLabel)}</span>
-      <span class="mov-mono ${neg ? 'mov-neg' : 'mov-pos'}">${fmtMonto(m.monto, moneda)}</span>
-      <span class="mov-badge mov-badge-${est}">${LABEL_ESTADO[est] || est}</span>
-    </div>`;
-  }).join('')}</div>`;
 }
 
 // ── Modal de carga manual ──────────────────────────────────────────────
@@ -698,14 +663,12 @@ function inyectarEstilo() {
     .mov-neg{color:#B91C1C}
     .mov-muted{color:#A8A29E}
     .mov-vinc{font-size:12px;color:#0C447C}
-    .mov-op{font-size:12px;color:#57534E;user-select:all;white-space:nowrap}
-    .mov-row-op td{box-shadow:inset 3px 0 0 #C7B8E0}
-    .mov-exp{border:0;background:transparent;color:#6D28D9;cursor:pointer;font-size:12px;padding:0 4px}
-    .mov-exp:hover{color:#4C1D95}
-    .mov-detalle > td{background:#FBFAF6;padding:8px 14px 8px 40px!important}
-    .mov-det-row{display:grid;grid-template-columns:1fr 140px 130px 90px;gap:12px;align-items:center;padding:3px 0;font-size:13px}
-    .mov-det-desc{color:#57534E}
-    .mov-det-cat{color:#A8A29E;font-size:12px}
+    .mov-op{font-size:12px;color:#57534E;white-space:nowrap}
+    .mov-op-num{cursor:pointer;border-bottom:1px dotted #C4BFB8}
+    .mov-op-num:hover{color:#6D28D9;border-bottom-color:#6D28D9}
+    .mov-op-n{font-size:11px;color:#A8A29E}
+    .mov-op-link{font-size:12px;color:#6D28D9;cursor:pointer}
+    .mov-op-link:hover{text-decoration:underline}
     .mov-linea-edit{display:inline-block;font-size:12px;padding:2px 8px;border-radius:6px;cursor:pointer;white-space:nowrap}
     .mov-linea-edit.asignada{background:#F3EEFB;color:#6D28D9}
     .mov-linea-edit.asignada:hover{background:#E9DFF8}
