@@ -1217,12 +1217,16 @@ app.get('/debug/settlement', async (req, res) => {
     const lines = csvText.split('\n').filter(l => l.trim());
     if (lines.length < 2) return res.status(400).json({ error: 'Reporte vacío' });
 
-    // 4. Parsear CSV (maneja comillas con comas adentro)
+    // 4. Parsear CSV. El settlement de la API de MP viene separado por ';'
+    //    (y los campos JSON TAXES_DISAGGREGATED/METADATA traen ',' adentro, por eso
+    //    NO se puede splitear por coma). Autodetecta: ';' si está en el header, si no ','.
+    //    Se puede forzar con ?sep=; o ?sep=,
+    const sep = (req.query.sep && String(req.query.sep)) || (lines[0].includes(';') ? ';' : ',');
     const parseLine = (line) => {
       const out = []; let cur = '', q = false;
       for (const ch of line) {
         if (ch === '"') { q = !q; }
-        else if (ch === ',' && !q) { out.push(cur.trim()); cur = ''; }
+        else if (ch === sep && !q) { out.push(cur.trim()); cur = ''; }
         else { cur += ch; }
       }
       out.push(cur.trim());
@@ -1230,7 +1234,21 @@ app.get('/debug/settlement', async (req, res) => {
     };
     const clean = (v) => String(v == null ? '' : v).replace(/"/g, '').trim();
     const headers = parseLine(lines[0]).map(clean);
+    const idxType = headers.indexOf('TRANSACTION_TYPE');
     const toObj = (vals) => headers.reduce((o, h, idx) => (o[h] = clean(vals[idx]), o), {});
+
+    // Modo diagnóstico de tipos: ?types=1 → conteo por TRANSACTION_TYPE + una fila
+    // de muestra de cada tipo que NO sea SETTLEMENT (ahí caen refunds/reversos).
+    if (req.query.types) {
+      const counts = {}; const ejemplos = {};
+      for (let i = 1; i < lines.length; i++) {
+        const vals = parseLine(lines[i]);
+        const t = clean(vals[idxType]) || '(vacío)';
+        counts[t] = (counts[t] || 0) + 1;
+        if (t !== 'SETTLEMENT' && !ejemplos[t]) ejemplos[t] = toObj(vals);
+      }
+      return res.json({ file: fileName, sep, total_lines: lines.length - 1, tipos: counts, ejemplos_no_settlement: ejemplos });
+    }
 
     // 5. Filas que matcheen alguno de los ids (en cualquier columna)
     const matched = [];
@@ -1245,6 +1263,7 @@ app.get('/debug/settlement', async (req, res) => {
     res.json({
       reportId,
       file: fileName,
+      sep,
       rango: { desde, hasta },
       total_lines: lines.length - 1,
       headers,
