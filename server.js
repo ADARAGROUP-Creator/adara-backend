@@ -1235,7 +1235,24 @@ app.get('/debug/settlement', async (req, res) => {
     const clean = (v) => String(v == null ? '' : v).replace(/"/g, '').trim();
     const headers = parseLine(lines[0]).map(clean);
     const idxType = headers.indexOf('TRANSACTION_TYPE');
+    const idxTax = headers.indexOf('TAXES_DISAGGREGATED');
     const toObj = (vals) => headers.reduce((o, h, idx) => (o[h] = clean(vals[idx]), o), {});
+
+    // Parser del campo TAXES_DISAGGREGATED. NO es JSON válido (claves/valores sin
+    // comillas): ej. [{financial_entity:caba,amount:-107.73,detail:tax_withholding_sirtac}, {...}]
+    const parseTaxes = (raw) => {
+      const out = [];
+      const objs = String(raw || '').match(/\{[^}]*\}/g) || [];
+      for (const o of objs) {
+        const fe = (o.match(/financial_entity:([^,}]*)/) || [])[1];
+        const am = (o.match(/amount:([^,}]*)/) || [])[1];
+        const de = (o.match(/detail:([^,}]*)/) || [])[1];
+        if ((fe && fe.trim()) || (de && de.trim())) {
+          out.push({ financial_entity: (fe || '').trim(), amount: parseFloat(am) || 0, detail: (de || '').trim() });
+        }
+      }
+      return out;
+    };
 
     // Modo diagnóstico de tipos: ?types=1 → conteo por TRANSACTION_TYPE + una fila
     // de muestra de cada tipo que NO sea SETTLEMENT (ahí caen refunds/reversos).
@@ -1248,6 +1265,28 @@ app.get('/debug/settlement', async (req, res) => {
         if (t !== 'SETTLEMENT' && !ejemplos[t]) ejemplos[t] = toObj(vals);
       }
       return res.json({ file: fileName, sep, total_lines: lines.length - 1, tipos: counts, ejemplos_no_settlement: ejemplos });
+    }
+
+    // Modo mapa de impuestos: ?taxmap=1 → recorre TODO el archivo y arma
+    // transaction_type → "detail | financial_entity" → { count, sum }.
+    // Sirve para validar qué impuesto trae cada tipo (p.ej. si algún CASHBACK
+    // trae IIBB, o solo imp. al cheque) sobre el universo completo, no por muestra.
+    if (req.query.taxmap) {
+      const map = {};
+      const r2 = (n) => Math.round(n * 100) / 100;
+      for (let i = 1; i < lines.length; i++) {
+        const vals = parseLine(lines[i]);
+        const tt = clean(vals[idxType]) || '(vacío)';
+        const taxes = parseTaxes(vals[idxTax]);
+        for (const t of taxes) {
+          const key = `${t.detail} | ${t.financial_entity}`;
+          map[tt] = map[tt] || {};
+          map[tt][key] = map[tt][key] || { count: 0, sum: 0 };
+          map[tt][key].count++;
+          map[tt][key].sum = r2(map[tt][key].sum + t.amount);
+        }
+      }
+      return res.json({ file: fileName, sep, total_lines: lines.length - 1, taxmap: map });
     }
 
     // 5. Filas que matcheen alguno de los ids (en cualquier columna)
