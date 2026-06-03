@@ -1341,7 +1341,8 @@ let retencionesEstado = {
   ultimo_resumen: null,
   ultimo_ok: null,           // ISO del último OK
   error: null,
-  corriendo: false
+  corriendo: false,
+  pending_report_id: null    // reporte generándose; se reanuda en la próxima sync
 };
 
 // Núcleo de la ingesta: descarga el CSV por file_name, parsea, clasifica,
@@ -1460,59 +1461,81 @@ async function ingestRetenciones(fileName, write) {
   };
 }
 
-// Crea un settlement para [desde,hasta], espera a que esté 'processed' (poll del
-// listado, ~3 min máx) y lo ingiere. Devuelve el resumen.
-async function generarEIngestarRetenciones(desde, hasta) {
-  const createRes = await mpApi('/v1/account/settlement_report', {
-    method: 'POST',
-    body: JSON.stringify({ begin_date: `${desde}T00:00:00Z`, end_date: `${hasta}T23:59:59Z` })
-  });
-  const createData = await createRes.json();
-  const reportId = createData.id;
-  if (!reportId) throw new Error('No se pudo crear el reporte de settlement');
+// Núcleo del background: si hay un reporte pendiente lo retoma; si no, crea uno
+// para [mes anterior → hoy]. Poll largo (~12 min). Si MP todavía no terminó,
+// deja el reporte como pendiente (se reanuda en la próxima sync, sin regenerar).
+// Devuelve { ok:true, resumen } si ingirió, o { ok:false } si sigue generándose.
+async function correrRetenciones() {
+  let reportId = retencionesEstado.pending_report_id;
 
+  if (!reportId) {
+    const hoy = new Date();
+    const hasta = hoy.toISOString().substring(0, 10);
+    const desde = new Date(hoy.getFullYear(), hoy.getMonth() - 1, 1).toISOString().substring(0, 10);  // 1° del mes anterior
+    const createRes = await mpApi('/v1/account/settlement_report', {
+      method: 'POST',
+      body: JSON.stringify({ begin_date: `${desde}T00:00:00Z`, end_date: `${hasta}T23:59:59Z` })
+    });
+    const createData = await createRes.json();
+    reportId = createData.id;
+    if (!reportId) throw new Error('No se pudo crear el reporte de settlement');
+    retencionesEstado.pending_report_id = String(reportId);
+    retencionesEstado.desde = desde;
+    retencionesEstado.hasta = hasta;
+  }
+
+  // Poll del listado hasta ~12 min (48 × 15s)
   let fileName = null;
-  for (let i = 0; i < 36; i++) {                 // hasta ~3 min
+  for (let i = 0; i < 48; i++) {
     const listRes = await mpApi('/v1/account/settlement_report/list');
     const arr = await listRes.json();
     const list = Array.isArray(arr) ? arr : [];
     const found = list.find(r => String(r.id) === String(reportId));
-    if (found && (found.status === 'error' || found.status === 'failed')) throw new Error('El reporte de settlement falló');
+    if (found && (found.status === 'error' || found.status === 'failed')) {
+      retencionesEstado.pending_report_id = null;
+      throw new Error(`El reporte ${reportId} falló`);
+    }
     if (found?.status === 'processed' && found?.file_name) { fileName = found.file_name; break; }
-    await new Promise(r => setTimeout(r, 5000));
+    await new Promise(r => setTimeout(r, 15000));
   }
-  if (!fileName) throw new Error(`Reporte ${reportId} no quedó listo a tiempo`);
-  if (/\.xlsx?$/i.test(fileName)) throw new Error('El reporte salió XLSX, se esperaba CSV');
-  return ingestRetenciones(fileName, true);
+
+  if (!fileName) return { ok: false };          // sigue generándose → queda pendiente
+  if (/\.xlsx?$/i.test(fileName)) {
+    retencionesEstado.pending_report_id = null;
+    throw new Error('El reporte salió XLSX, se esperaba CSV');
+  }
+
+  const resumen = await ingestRetenciones(fileName, true);
+  retencionesEstado.pending_report_id = null;
+  return { ok: true, resumen };
 }
 
-// Dispara la ingesta en segundo plano (sin bloquear). Throttle: no re-corre si
-// ya está corriendo o si el último OK fue hace < 6 h. Ventana: mes anterior → hoy
-// (ahí caen los releases). Idempotente, así que re-correr es seguro.
+// Dispara la ingesta en segundo plano (sin bloquear). Si hay un reporte pendiente,
+// lo retoma (sin throttle). Si no, aplica throttle de 6 h antes de generar uno nuevo.
 function kickRetenciones() {
   if (retencionesEstado.corriendo) return;
   if (!ML.access) return;
-  const ahora = Date.now();
-  if (retencionesEstado.ultimo_ok && (ahora - new Date(retencionesEstado.ultimo_ok).getTime()) < 6 * 3600 * 1000) return;
-
-  const hoy = new Date();
-  const finStr = hoy.toISOString().substring(0, 10);
-  const ini = new Date(hoy.getFullYear(), hoy.getMonth() - 1, 1);   // 1° del mes anterior
-  const iniStr = ini.toISOString().substring(0, 10);
+  if (!retencionesEstado.pending_report_id) {
+    const ahora = Date.now();
+    if (retencionesEstado.ultimo_ok && (ahora - new Date(retencionesEstado.ultimo_ok).getTime()) < 6 * 3600 * 1000) return;
+  }
 
   retencionesEstado.corriendo = true;
   retencionesEstado.estado = 'actualizando';
-  retencionesEstado.desde = iniStr;
-  retencionesEstado.hasta = finStr;
   retencionesEstado.error = null;
 
-  // Fire-and-forget: MP tarda minutos en generar el reporte.
-  generarEIngestarRetenciones(iniStr, finStr)
-    .then((resumen) => {
-      retencionesEstado.estado = 'al_dia';
-      retencionesEstado.ultimo_resumen = resumen;
-      retencionesEstado.ultimo_ok = new Date().toISOString();
-      console.log(`✓ Retenciones (bg): ${resumen.upserted} filas (${iniStr} → ${finStr})`);
+  correrRetenciones()
+    .then((r) => {
+      if (r.ok) {
+        retencionesEstado.estado = 'al_dia';
+        retencionesEstado.ultimo_resumen = r.resumen;
+        retencionesEstado.ultimo_ok = new Date().toISOString();
+        console.log(`✓ Retenciones (bg): ${r.resumen.upserted} filas (${retencionesEstado.desde} → ${retencionesEstado.hasta})`);
+      } else {
+        // Sigue generándose: queda pendiente, se reanuda en la próxima sync.
+        retencionesEstado.estado = 'actualizando';
+        console.log(`… Retenciones (bg): reporte ${retencionesEstado.pending_report_id} aún generándose; se reanuda en la próxima sync`);
+      }
     })
     .catch((e) => {
       retencionesEstado.estado = 'error';
@@ -1554,6 +1577,12 @@ app.get('/mp/retenciones-sync', async (req, res) => {
 
 // Estado de la ingesta en background (para el indicador "al día / actualizando")
 app.get('/mp/retenciones-estado', (_, res) => res.json(retencionesEstado));
+
+// Dispara/reanuda la ingesta en background a demanda (respeta throttle y pendiente).
+app.get('/mp/retenciones-refresh', (_, res) => {
+  kickRetenciones();
+  res.json({ ok: true, ...retencionesEstado });
+});
 
 app.post('/mp/settlement-sync', async (req, res) => {
   try {
