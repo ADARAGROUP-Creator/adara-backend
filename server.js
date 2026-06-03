@@ -840,6 +840,9 @@ app.post('/ml/sync', async (req, res) => {
       console.log(`  → Auto-descartadas: cancelaciones sin entrega`);
     }
 
+    // Ingesta de retenciones IIBB en segundo plano (no bloquea; idempotente; throttle 6h)
+    kickRetenciones();
+
     res.json({ ok: true, ...result });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1331,15 +1334,203 @@ app.get('/debug/settlement', async (req, res) => {
 //   tax_withholding_payer*                         → IGNORAR (es del comprador)
 // Excluye transaction_type CASHBACK / CASHBACK_CANCEL.
 //   Por defecto NO escribe (dry-run / preview). Para escribir: agregar ?write=1
+// ── RETENCIONES IIBB — estado + ingesta compartida (paso 2b) ─────────────────
+let retencionesEstado = {
+  estado: 'al_dia',          // al_dia | actualizando | error
+  desde: null, hasta: null,
+  ultimo_resumen: null,
+  ultimo_ok: null,           // ISO del último OK
+  error: null,
+  corriendo: false
+};
+
+// Núcleo de la ingesta: descarga el CSV por file_name, parsea, clasifica,
+// resuelve venta_id e (si write) hace upsert idempotente. Devuelve el resumen.
+async function ingestRetenciones(fileName, write) {
+  const csvRes = await mpApi(`/v1/account/settlement_report/${encodeURIComponent(fileName)}`);
+  const csvText = await csvRes.text();
+  const lines = csvText.split('\n').filter(l => l.trim());
+  if (lines.length < 2) throw new Error('Reporte vacío');
+
+  const sep = lines[0].includes(';') ? ';' : ',';
+  const parseLine = (line) => {
+    const out = []; let cur = '', q = false;
+    for (const ch of line) {
+      if (ch === '"') q = !q;
+      else if (ch === sep && !q) { out.push(cur.trim()); cur = ''; }
+      else cur += ch;
+    }
+    out.push(cur.trim());
+    return out;
+  };
+  const clean = (v) => String(v == null ? '' : v).replace(/"/g, '').trim();
+  const headers = parseLine(lines[0]).map(clean);
+  const H = {}; headers.forEach((h, i) => H[h] = i);
+  const get = (vals, name) => clean(vals[H[name]]);
+
+  const parseTaxes = (raw) => {
+    const out = [];
+    const objs = String(raw || '').match(/\{[^}]*\}/g) || [];
+    for (const o of objs) {
+      const fe = (o.match(/financial_entity:([^,}]*)/) || [])[1];
+      const am = (o.match(/amount:([^,}]*)/) || [])[1];
+      const de = (o.match(/detail:([^,}]*)/) || [])[1];
+      if ((fe && fe.trim()) || (de && de.trim())) {
+        out.push({ financial_entity: (fe || '').trim(), amount: parseFloat(am) || 0, detail: (de || '').trim() });
+      }
+    }
+    return out;
+  };
+
+  const r2 = (n) => Math.round(n * 100) / 100;
+  const TIPOS_EXCLUIDOS = new Set(['CASHBACK', 'CASHBACK_CANCEL']);
+  const clasificar = (detail, fe) => {
+    if (detail.startsWith('tax_withholding_payer')) return null;                 // comprador → ignorar
+    if (detail === 'tax_withholding_sirtac') return { tipo: 'iibb_provincial', jur: fe };
+    if (detail === 'tax_withholding')        return { tipo: 'iibb_provincial', jur: fe };
+    if (detail === 'tax_withholding_collector' && fe === 'iibb_tucuman')     return { tipo: 'iibb_tucuman',    jur: null };
+    if (detail === 'tax_withholding_collector' && fe === 'debitos_creditos') return { tipo: 'impuesto_cheque', jur: null };
+    if (detail === 'tax_withholding_payout') return { tipo: 'payout', jur: null };
+    return undefined;                                                            // desconocido → reportar
+  };
+
+  const filas = [];
+  const desconocidos = {};
+  const acum = {};            // acumulado IIBB por provincia (NETO, todas las transaction_type)
+  const sourceSet = new Set();
+  const packSet = new Set();
+
+  for (let i = 1; i < lines.length; i++) {
+    const vals = parseLine(lines[i]);
+    const tt = get(vals, 'TRANSACTION_TYPE');
+    if (!tt || TIPOS_EXCLUIDOS.has(tt)) continue;
+    const taxes = parseTaxes(get(vals, 'TAXES_DISAGGREGATED'));
+    if (!taxes.length) continue;
+    const sourceId = get(vals, 'SOURCE_ID');
+    const orderId  = get(vals, 'ORDER_ID');
+    const packId   = get(vals, 'PACK_ID');
+    const fecha = (get(vals, 'MONEY_RELEASE_DATE') || get(vals, 'SETTLEMENT_DATE') || get(vals, 'TRANSACTION_DATE') || '').substring(0, 10) || null;
+    for (const t of taxes) {
+      const cls = clasificar(t.detail, t.financial_entity);
+      if (cls === null) continue;
+      if (cls === undefined) { const k = `${t.detail} | ${t.financial_entity}`; desconocidos[k] = (desconocidos[k] || 0) + 1; continue; }
+      filas.push({
+        mp_source_id: sourceId || null, transaction_type: tt, tipo: cls.tipo, jurisdiccion: cls.jur,
+        detail: t.detail, financial_entity: t.financial_entity, monto: r2(t.amount),
+        venta_id: null, order_id: orderId || null, pack_id: packId || null, fecha, settlement_file: fileName
+      });
+      if (cls.tipo === 'iibb_provincial') acum[cls.jur] = r2((acum[cls.jur] || 0) + t.amount);
+      if (sourceId) sourceSet.add(sourceId);
+      if (packId)   packSet.add(packId);
+    }
+  }
+
+  const chunk = (arr, n) => { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o; };
+  const ventaPorSource = {};
+  const ventaPorPack = {};
+  for (const grp of chunk([...sourceSet], 150)) {
+    const rows = await sbGet('ventas_ml', `select=id,mp_payment_id&mp_payment_id=in.(${grp.join(',')})`).catch(() => []);
+    for (const v of (rows || [])) if (v.mp_payment_id) ventaPorSource[String(v.mp_payment_id)] = v.id;
+  }
+  const sinSource = [...sourceSet].filter(s => !ventaPorSource[s]);
+  for (const s of sinSource) {
+    const rows = await sbGet('ventas_ml', `select=id&mp_payment_ids=like.*${s}*&limit=1`).catch(() => []);
+    if (rows && rows[0]) ventaPorSource[s] = rows[0].id;
+  }
+  for (const grp of chunk([...packSet], 150)) {
+    const rows = await sbGet('ventas_ml', `select=id,pack_id&pack_id=in.(${grp.join(',')})`).catch(() => []);
+    for (const v of (rows || [])) if (v.pack_id) ventaPorPack[String(v.pack_id)] = v.id;
+  }
+  let conMatch = 0, sinMatch = 0;
+  for (const f of filas) {
+    const vid = ventaPorSource[f.mp_source_id] || (f.pack_id ? ventaPorPack[f.pack_id] : null) || null;
+    f.venta_id = vid;
+    if (vid) conMatch++; else sinMatch++;
+  }
+  let upserted = 0;
+  if (write) {
+    for (const grp of chunk(filas, 200)) {
+      const r = await sbUpsert('retenciones', grp, 'mp_source_id,transaction_type,detail,financial_entity');
+      upserted += Array.isArray(r) ? r.length : grp.length;
+    }
+  }
+  return {
+    file: fileName, total_lines: lines.length - 1, retenciones_armadas: filas.length, upserted,
+    venta_con_match: conMatch, venta_sin_match: sinMatch, desconocidos, acumulado_iibb_por_provincia_neto: acum
+  };
+}
+
+// Crea un settlement para [desde,hasta], espera a que esté 'processed' (poll del
+// listado, ~3 min máx) y lo ingiere. Devuelve el resumen.
+async function generarEIngestarRetenciones(desde, hasta) {
+  const createRes = await mpApi('/v1/account/settlement_report', {
+    method: 'POST',
+    body: JSON.stringify({ begin_date: `${desde}T00:00:00Z`, end_date: `${hasta}T23:59:59Z` })
+  });
+  const createData = await createRes.json();
+  const reportId = createData.id;
+  if (!reportId) throw new Error('No se pudo crear el reporte de settlement');
+
+  let fileName = null;
+  for (let i = 0; i < 36; i++) {                 // hasta ~3 min
+    const listRes = await mpApi('/v1/account/settlement_report/list');
+    const arr = await listRes.json();
+    const list = Array.isArray(arr) ? arr : [];
+    const found = list.find(r => String(r.id) === String(reportId));
+    if (found && (found.status === 'error' || found.status === 'failed')) throw new Error('El reporte de settlement falló');
+    if (found?.status === 'processed' && found?.file_name) { fileName = found.file_name; break; }
+    await new Promise(r => setTimeout(r, 5000));
+  }
+  if (!fileName) throw new Error(`Reporte ${reportId} no quedó listo a tiempo`);
+  if (/\.xlsx?$/i.test(fileName)) throw new Error('El reporte salió XLSX, se esperaba CSV');
+  return ingestRetenciones(fileName, true);
+}
+
+// Dispara la ingesta en segundo plano (sin bloquear). Throttle: no re-corre si
+// ya está corriendo o si el último OK fue hace < 6 h. Ventana: mes anterior → hoy
+// (ahí caen los releases). Idempotente, así que re-correr es seguro.
+function kickRetenciones() {
+  if (retencionesEstado.corriendo) return;
+  if (!ML.access) return;
+  const ahora = Date.now();
+  if (retencionesEstado.ultimo_ok && (ahora - new Date(retencionesEstado.ultimo_ok).getTime()) < 6 * 3600 * 1000) return;
+
+  const hoy = new Date();
+  const finStr = hoy.toISOString().substring(0, 10);
+  const ini = new Date(hoy.getFullYear(), hoy.getMonth() - 1, 1);   // 1° del mes anterior
+  const iniStr = ini.toISOString().substring(0, 10);
+
+  retencionesEstado.corriendo = true;
+  retencionesEstado.estado = 'actualizando';
+  retencionesEstado.desde = iniStr;
+  retencionesEstado.hasta = finStr;
+  retencionesEstado.error = null;
+
+  // Fire-and-forget: MP tarda minutos en generar el reporte.
+  generarEIngestarRetenciones(iniStr, finStr)
+    .then((resumen) => {
+      retencionesEstado.estado = 'al_dia';
+      retencionesEstado.ultimo_resumen = resumen;
+      retencionesEstado.ultimo_ok = new Date().toISOString();
+      console.log(`✓ Retenciones (bg): ${resumen.upserted} filas (${iniStr} → ${finStr})`);
+    })
+    .catch((e) => {
+      retencionesEstado.estado = 'error';
+      retencionesEstado.error = e.message;
+      console.error('Retenciones (bg):', e.message);
+    })
+    .finally(() => { retencionesEstado.corriendo = false; });
+}
+
+// Endpoint manual / diagnóstico de la ingesta (paso 2a). Por defecto dry-run.
+//   ?file=NOMBRE.csv | ?reportId=NNN   ·   escribir: &write=1
 app.get('/mp/retenciones-sync', async (req, res) => {
   try {
     if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
-
     const fileParam     = String(req.query.file     || req.body?.file     || '').trim();
     const reportIdParam = String(req.query.reportId || req.body?.reportId || '').trim();
-    const dry = !(req.query.write || req.body?.write);   // por defecto dry; escribe solo con ?write=1
+    const dry = !(req.query.write || req.body?.write);
 
-    // 1. Resolver file_name (por ?file= directo, o por ?reportId= desde el listado)
     let fileName = fileParam || null;
     if (!fileName) {
       if (!reportIdParam) return res.status(400).json({ error: 'Pasá ?file=NOMBRE.csv o ?reportId=NNN' });
@@ -1348,163 +1539,21 @@ app.get('/mp/retenciones-sync', async (req, res) => {
       const list = Array.isArray(arr) ? arr : [];
       const found = list.find(r => String(r.id) === String(reportIdParam));
       if (!found) return res.status(404).json({ error: 'reportId no encontrado', reportId: reportIdParam });
-      if (found.status !== 'processed' || !found.file_name) {
-        return res.status(202).json({ error: 'Reporte aún no procesado', reportId: reportIdParam, status: found.status });
-      }
+      if (found.status !== 'processed' || !found.file_name) return res.status(202).json({ error: 'Reporte aún no procesado', reportId: reportIdParam, status: found.status });
       fileName = found.file_name;
     }
     if (/\.xlsx?$/i.test(fileName)) return res.status(400).json({ error: 'El reporte es XLSX; necesito CSV', file: fileName });
 
-    // 2. Descargar el CSV por nombre de archivo
-    const csvRes = await mpApi(`/v1/account/settlement_report/${encodeURIComponent(fileName)}`);
-    const csvText = await csvRes.text();
-    const lines = csvText.split('\n').filter(l => l.trim());
-    if (lines.length < 2) return res.status(400).json({ error: 'Reporte vacío', file: fileName });
-
-    // 3. Parser CSV (separador ';'; los campos JSON traen ',' adentro)
-    const sep = lines[0].includes(';') ? ';' : ',';
-    const parseLine = (line) => {
-      const out = []; let cur = '', q = false;
-      for (const ch of line) {
-        if (ch === '"') q = !q;
-        else if (ch === sep && !q) { out.push(cur.trim()); cur = ''; }
-        else cur += ch;
-      }
-      out.push(cur.trim());
-      return out;
-    };
-    const clean = (v) => String(v == null ? '' : v).replace(/"/g, '').trim();
-    const headers = parseLine(lines[0]).map(clean);
-    const H = {}; headers.forEach((h, i) => H[h] = i);
-    const get = (vals, name) => clean(vals[H[name]]);
-
-    const parseTaxes = (raw) => {
-      const out = [];
-      const objs = String(raw || '').match(/\{[^}]*\}/g) || [];
-      for (const o of objs) {
-        const fe = (o.match(/financial_entity:([^,}]*)/) || [])[1];
-        const am = (o.match(/amount:([^,}]*)/) || [])[1];
-        const de = (o.match(/detail:([^,}]*)/) || [])[1];
-        if ((fe && fe.trim()) || (de && de.trim())) {
-          out.push({ financial_entity: (fe || '').trim(), amount: parseFloat(am) || 0, detail: (de || '').trim() });
-        }
-      }
-      return out;
-    };
-
-    const r2 = (n) => Math.round(n * 100) / 100;
-    const TIPOS_EXCLUIDOS = new Set(['CASHBACK', 'CASHBACK_CANCEL']);
-    const clasificar = (detail, fe) => {
-      if (detail.startsWith('tax_withholding_payer')) return null;                 // comprador → ignorar
-      if (detail === 'tax_withholding_sirtac') return { tipo: 'iibb_provincial', jur: fe };
-      if (detail === 'tax_withholding')        return { tipo: 'iibb_provincial', jur: fe };
-      if (detail === 'tax_withholding_collector' && fe === 'iibb_tucuman')     return { tipo: 'iibb_tucuman',    jur: null };
-      if (detail === 'tax_withholding_collector' && fe === 'debitos_creditos') return { tipo: 'impuesto_cheque', jur: null };
-      if (detail === 'tax_withholding_payout') return { tipo: 'payout', jur: null };
-      return undefined;                                                            // desconocido → reportar
-    };
-
-    // 4. Recorrer filas → armar retenciones + juntar ids para resolver venta
-    const filas = [];
-    const desconocidos = {};
-    const acum = {};            // acumulado IIBB por provincia (NETO, todas las transaction_type)
-    const sourceSet = new Set();
-    const packSet = new Set();
-
-    for (let i = 1; i < lines.length; i++) {
-      const vals = parseLine(lines[i]);
-      const tt = get(vals, 'TRANSACTION_TYPE');
-      if (!tt || TIPOS_EXCLUIDOS.has(tt)) continue;
-
-      const taxes = parseTaxes(get(vals, 'TAXES_DISAGGREGATED'));
-      if (!taxes.length) continue;
-
-      const sourceId = get(vals, 'SOURCE_ID');
-      const orderId  = get(vals, 'ORDER_ID');
-      const packId   = get(vals, 'PACK_ID');
-      const fecha = (get(vals, 'MONEY_RELEASE_DATE') || get(vals, 'SETTLEMENT_DATE') || get(vals, 'TRANSACTION_DATE') || '').substring(0, 10) || null;
-
-      for (const t of taxes) {
-        const cls = clasificar(t.detail, t.financial_entity);
-        if (cls === null) continue;
-        if (cls === undefined) {
-          const k = `${t.detail} | ${t.financial_entity}`;
-          desconocidos[k] = (desconocidos[k] || 0) + 1;
-          continue;
-        }
-        filas.push({
-          mp_source_id: sourceId || null,
-          transaction_type: tt,
-          tipo: cls.tipo,
-          jurisdiccion: cls.jur,
-          detail: t.detail,
-          financial_entity: t.financial_entity,
-          monto: r2(t.amount),
-          venta_id: null,
-          order_id: orderId || null,
-          pack_id: packId || null,
-          fecha,
-          settlement_file: fileName
-        });
-        if (cls.tipo === 'iibb_provincial') acum[cls.jur] = r2((acum[cls.jur] || 0) + t.amount);
-        if (sourceId) sourceSet.add(sourceId);
-        if (packId)   packSet.add(packId);
-      }
-    }
-
-    // 5. Resolver venta_id (cacheado, en chunks)
-    const chunk = (arr, n) => { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o; };
-    const ventaPorSource = {};
-    const ventaPorPack = {};
-
-    for (const grp of chunk([...sourceSet], 150)) {
-      const rows = await sbGet('ventas_ml', `select=id,mp_payment_id&mp_payment_id=in.(${grp.join(',')})`).catch(() => []);
-      for (const v of (rows || [])) if (v.mp_payment_id) ventaPorSource[String(v.mp_payment_id)] = v.id;
-    }
-    const sinSource = [...sourceSet].filter(s => !ventaPorSource[s]);
-    for (const s of sinSource) {
-      const rows = await sbGet('ventas_ml', `select=id&mp_payment_ids=like.*${s}*&limit=1`).catch(() => []);
-      if (rows && rows[0]) ventaPorSource[s] = rows[0].id;
-    }
-    for (const grp of chunk([...packSet], 150)) {
-      const rows = await sbGet('ventas_ml', `select=id,pack_id&pack_id=in.(${grp.join(',')})`).catch(() => []);
-      for (const v of (rows || [])) if (v.pack_id) ventaPorPack[String(v.pack_id)] = v.id;
-    }
-
-    let conMatch = 0, sinMatch = 0;
-    for (const f of filas) {
-      const vid = ventaPorSource[f.mp_source_id] || (f.pack_id ? ventaPorPack[f.pack_id] : null) || null;
-      f.venta_id = vid;
-      if (vid) conMatch++; else sinMatch++;
-    }
-
-    // 6. Upsert idempotente
-    let upserted = 0;
-    if (!dry) {
-      for (const grp of chunk(filas, 200)) {
-        const r = await sbUpsert('retenciones', grp, 'mp_source_id,transaction_type,detail,financial_entity');
-        upserted += Array.isArray(r) ? r.length : grp.length;
-      }
-    }
-
-    res.json({
-      ok: true,
-      dry,
-      file: fileName,
-      total_lines: lines.length - 1,
-      retenciones_armadas: filas.length,
-      upserted,
-      venta_con_match: conMatch,
-      venta_sin_match: sinMatch,
-      desconocidos,
-      acumulado_iibb_por_provincia_neto: acum
-    });
-
+    const out = await ingestRetenciones(fileName, !dry);
+    res.json({ ok: true, dry, ...out });
   } catch (e) {
     console.error('retenciones-sync:', e);
     res.status(500).json({ error: e.message });
   }
 });
+
+// Estado de la ingesta en background (para el indicador "al día / actualizando")
+app.get('/mp/retenciones-estado', (_, res) => res.json(retencionesEstado));
 
 app.post('/mp/settlement-sync', async (req, res) => {
   try {
