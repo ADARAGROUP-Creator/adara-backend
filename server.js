@@ -1154,6 +1154,7 @@ app.get('/debug/settlement', async (req, res) => {
     //  - Listar reportes disponibles con su estado: ?list=1
     const { desde, hasta } = req.query || {};
     const reportIdParam = String(req.query.reportId || '').trim();
+    const fileParam = String(req.query.file || '').trim();
 
     // ids a buscar en CUALQUIER columna (source, order, shipping, external_reference…)
     const buscados = new Set(
@@ -1161,52 +1162,57 @@ app.get('/debug/settlement', async (req, res) => {
         .map(s => s.trim()).filter(Boolean)
     );
 
-    // Modo lista: ver qué reportes hay y cuál está "ready" (con su download_url)
+    // Modo lista: ver qué reportes hay, su estado, formato y nombre de archivo
     if (req.query.list) {
       const listRes = await mpApi('/v1/account/settlement_report/list');
       const list = await listRes.json();
       const arr = Array.isArray(list) ? list : [];
-      return res.json({ reportes: arr.map(r => ({ id: r.id, status: r.status, begin: r.begin_date, end: r.end_date, ready: !!r.download_url })) });
+      return res.json({ reportes: arr.map(r => ({ id: r.id, status: r.status, format: r.format, file_name: r.file_name, begin: r.begin_date, end: r.end_date })) });
     }
 
-    // 1. Determinar reportId (reutilizar el dado, o crear uno nuevo)
+    // 1. Determinar el file_name a descargar.
+    //    MP descarga el settlement por NOMBRE DE ARCHIVO (file_name), NO por id
+    //    (el GET por id numérico devuelve 403). El listado trae el file_name y el
+    //    status ('processed' cuando está listo). No existe 'download_url'.
+    let fileName = fileParam || null;
     let reportId = reportIdParam || null;
-    if (!reportId) {
-      if (!desde || !hasta) return res.status(400).json({ error: 'Pasá ?reportId=NNN, o ?desde=YYYY-MM-DD&hasta=YYYY-MM-DD, o ?list=1' });
-      const createRes = await mpApi('/v1/account/settlement_report', {
-        method: 'POST',
-        body: JSON.stringify({ begin_date: `${desde}T00:00:00Z`, end_date: `${hasta}T23:59:59Z` })
-      });
-      const createData = await createRes.json();
-      reportId = createData.id;
-      if (!reportId) return res.status(400).json({ error: 'No se pudo crear reporte', detail: createData });
+
+    if (!fileName) {
+      // Si no pasaron ?file=, hay que resolverlo: por reportId existente, o creando uno.
+      if (!reportId) {
+        if (!desde || !hasta) return res.status(400).json({ error: 'Pasá ?file=NOMBRE.csv, ?reportId=NNN, ?desde=YYYY-MM-DD&hasta=YYYY-MM-DD, o ?list=1' });
+        const createRes = await mpApi('/v1/account/settlement_report', {
+          method: 'POST',
+          body: JSON.stringify({ begin_date: `${desde}T00:00:00Z`, end_date: `${hasta}T23:59:59Z` })
+        });
+        const createData = await createRes.json();
+        reportId = createData.id;
+        if (!reportId) return res.status(400).json({ error: 'No se pudo crear reporte', detail: createData });
+      }
+
+      // Polling corto del listado hasta que el reporte esté 'processed' con file_name.
+      const maxTries = reportIdParam ? 6 : 18;   // menos vueltas si reutilizamos uno ya pedido
+      for (let i = 0; i < maxTries; i++) {
+        const listRes = await mpApi('/v1/account/settlement_report/list');
+        const list = await listRes.json();
+        const arr = Array.isArray(list) ? list : [];
+        const found = arr.find(r => String(r.id) === String(reportId));
+        if (found && (found.status === 'error' || found.status === 'failed')) {
+          return res.status(400).json({ error: 'Reporte falló', detail: found });
+        }
+        if (found?.status === 'processed' && found?.file_name) { fileName = found.file_name; break; }
+        await new Promise(r => setTimeout(r, 5000));
+      }
+      if (!fileName) return res.status(202).json({ error: 'Reporte aún generándose', reportId, reintentar_con: `?reportId=${reportId}&source=${[...buscados].join(',')}` });
     }
 
-    // 2. Conseguir el download_url del reporte (ya creado o recién pedido).
-    //    Polling corto; si no está listo, devolvemos el reportId para reintentar
-    //    con ?reportId= (sin re-generar).
-    let fileUrl = null;
-    const maxTries = reportIdParam ? 6 : 18;   // menos vueltas si lo estamos reutilizando
-    for (let i = 0; i < maxTries; i++) {
-      try {
-        const checkRes = await mpApi(`/v1/account/settlement_report/${reportId}`);
-        const checkData = await checkRes.json();
-        if (checkData.status === 'ready' && checkData.download_url) { fileUrl = checkData.download_url; break; }
-        if (checkData.status === 'error') return res.status(400).json({ error: 'Reporte falló', detail: checkData });
-      } catch (e) { /* sigue intentando */ }
-      await new Promise(r => setTimeout(r, 5000));
+    // Este parser es CSV. Si el reporte es XLSX, avisar (no intentar parsear binario).
+    if (/\.xlsx?$/i.test(fileName)) {
+      return res.status(400).json({ error: 'Ese reporte es XLSX; este endpoint parsea CSV. Elegí/generá uno en formato CSV.', file: fileName });
     }
-    if (!fileUrl) {
-      const listRes = await mpApi('/v1/account/settlement_report/list');
-      const list = await listRes.json();
-      const arr = Array.isArray(list) ? list : [];
-      const found = arr.find(r => String(r.id) === String(reportId));
-      if (found?.download_url) fileUrl = found.download_url;
-    }
-    if (!fileUrl) return res.status(202).json({ error: 'Reporte aún generándose', reportId, reintentar_con: `?reportId=${reportId}&source=${[...buscados].join(',')}` });
 
-    // 3. Descargar CSV
-    const csvRes = await fetch(fileUrl, { headers: { 'Authorization': 'Bearer ' + ML.access } });
+    // 2. Descargar el archivo por nombre: GET /v1/account/settlement_report/{file_name}
+    const csvRes = await mpApi(`/v1/account/settlement_report/${encodeURIComponent(fileName)}`);
     const csvText = await csvRes.text();
     const lines = csvText.split('\n').filter(l => l.trim());
     if (lines.length < 2) return res.status(400).json({ error: 'Reporte vacío' });
@@ -1238,6 +1244,7 @@ app.get('/debug/settlement', async (req, res) => {
 
     res.json({
       reportId,
+      file: fileName,
       rango: { desde, hasta },
       total_lines: lines.length - 1,
       headers,
