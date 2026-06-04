@@ -16,6 +16,7 @@ let VENTAS = [];
 let COBROS_BY_REF = {};      // REFERENCE_ID del extracto -> movimiento (cobro_venta)
 let COBROS_BY_ID = {};       // movimiento.id -> movimiento (cobro_venta) — para el detalle de operaciones
 let BONIFS = [];             // movimientos cobro_venta de "bonificación por envío"
+let SHIP_BY_VENTA = {};      // clave (v:venta_id | o:ml_order_id | p:pack_id) -> { liqIds:Set, retEnvio } — envío colecta O8 (retenciones SETTLEMENT_SHIPPING)
 let VINC_BY_VENTA = {};      // ventas_ml.id -> [vínculos] (op_tipo='venta_ml')
 let VINC_MOV_USADOS = new Set(); // movimiento_id ya vinculados a alguna venta
 let DIAS = [];
@@ -66,11 +67,38 @@ function paymentIds(v) {
   if (v.mp_payment_ids) String(v.mp_payment_ids).split(',').forEach(x => { const t = x.trim(); if (t) ids.push(t); });
   return [...new Set(ids)];
 }
+// Envío colecta a cargo del comprador (caso O8). La venta genera DOS liquidaciones en
+// el extracto: el producto (con el mp_payment_id de la venta) y el pago del envío (con
+// SOURCE_ID propio, que MP no asocia a la venta). La fila SETTLEMENT_SHIPPING de
+// `retenciones` es el puente venta ↔ liquidación de envío. Se resuelve con PRIORIDAD
+// venta_id → ml_order_id → pack_id: una sola clave por venta, NUNCA se suman las tres
+// (así no se cuenta dos veces en un pack cuya retención cuelgue solo del pack_id).
+function shipDe(v) {
+  return SHIP_BY_VENTA[`v:${v.id}`]
+    || (v.ml_order_id ? SHIP_BY_VENTA[`o:${String(v.ml_order_id).trim()}`] : null)
+    || (v.pack_id ? SHIP_BY_VENTA[`p:${String(v.pack_id).trim()}`] : null)
+    || null;
+}
+// Retención de IIBB sobre el envío (≤ 0). 0 si la venta no tiene envío colecta.
+const retEnvioDe = v => { const s = shipDe(v); return s ? (Number(s.retEnvio) || 0) : 0; };
+// Objetivo de cierre de la venta. Flex/sueltas: retEnvio = 0 → objetivo = por_cobrar (sin
+// cambios). Colecta con envío del comprador: objetivo = por_cobrar + retEnvio (retEnvio ≤ 0),
+// que es exactamente el cash que entra (producto + envío). Identidad O8.
+const objetivoDe = v => r2((Number(v.por_cobrar) || 0) + retEnvioDe(v));
+
 function matchCobros(v) {
   const vistos = new Set();
   const cobros = [];
   for (const id of paymentIds(v)) {
     const c = COBROS_BY_REF[id];
+    if (c && !vistos.has(c.id)) { vistos.add(c.id); cobros.push(c); }
+  }
+  // Cobro del envío (colecta O8): su mp_source_id (= liqId) está embebido en la
+  // referencia del movimiento del envío, así que ya vive en COBROS_BY_REF. Se suma
+  // como un cobro más; el resto del flujo (conciliable, lote, detalle) lo trata igual.
+  const ship = shipDe(v);
+  if (ship) for (const liq of ship.liqIds) {
+    const c = COBROS_BY_REF[liq];
     if (c && !vistos.has(c.id)) { vistos.add(c.id); cobros.push(c); }
   }
   return cobros;
@@ -94,7 +122,7 @@ function asignarBonifs(ventas) {
     const cb = matchCobros(v);
     if (!cb.length) continue;
     const sum = cb.reduce((s, c) => s + (Number(c.monto) || 0), 0);
-    const falta = r2((Number(v.por_cobrar) || 0) - sum);
+    const falta = r2(objetivoDe(v) - sum);
     if (Math.abs(falta) < TOL || falta < 0) continue;
     const b = buscarBonif(falta, usados);
     if (b) { map[v.id] = b; usados.add(b.id); }
@@ -108,7 +136,7 @@ function conciliable(v, bonifMap) {
   const cb = matchCobros(v);
   if (!cb.length) return false;
   const sum = cb.reduce((s, c) => s + (Number(c.monto) || 0), 0);
-  const pc = Number(v.por_cobrar) || 0;
+  const pc = objetivoDe(v);
   if (Math.abs(sum - pc) < TOL) return true;             // cierra con los cobros
   const b = bonifMap[v.id];
   if (b && Math.abs(sum + (Number(b.monto) || 0) - pc) < TOL) return true; // cobros + bonificación
@@ -144,6 +172,34 @@ export async function loadVentasML() {
       if (ref) COBROS_BY_REF[ref.trim()] = c;
       COBROS_BY_ID[c.id] = c;
       if (/bonific/i.test(c.descripcion || '')) BONIFS.push(c);
+    }
+    // Envío colecta (O8): índice de la retención de IIBB sobre la liquidación del envío.
+    // Cada fila se indexa por venta_id, ml_order_id y pack_id; la clave guarda los liqIds
+    // (mp_source_id del envío, para encontrar su cobro en COBROS_BY_REF) y la suma de la
+    // retención. La venta usa UNA sola clave al consultar (shipDe), nunca las tres.
+    SHIP_BY_VENTA = {};
+    try {
+      const retEnvio = await sbGet('retenciones',
+        'transaction_type=eq.SETTLEMENT_SHIPPING&select=venta_id,order_id,pack_id,mp_source_id,monto');
+      const addShip = (pref, val, row) => {
+        if (val == null) return;
+        const t = String(val).trim();
+        if (!t) return;
+        const k = `${pref}:${t}`;
+        const e = SHIP_BY_VENTA[k] || (SHIP_BY_VENTA[k] = { liqIds: new Set(), retEnvio: 0 });
+        if (row.mp_source_id) e.liqIds.add(String(row.mp_source_id).trim());
+        e.retEnvio = r2(e.retEnvio + (Number(row.monto) || 0));
+      };
+      for (const row of retEnvio) {
+        addShip('v', row.venta_id, row);
+        addShip('o', row.order_id, row);
+        addShip('p', row.pack_id, row);
+      }
+    } catch (e) {
+      // Si `retenciones` no estuviera disponible, la conciliación sigue igual que antes:
+      // solo las colecta con envío del comprador quedarían en "revisar", como hasta ahora.
+      console.warn('No se pudieron leer las retenciones de envío:', e.message);
+      SHIP_BY_VENTA = {};
     }
     // Las devoluciones se cargan ANTES de los vínculos para poder separar, al
     // recorrer los vínculos, los que son de cobro (solapa Ventas) de los que son
@@ -496,7 +552,7 @@ async function conciliar(ventaId) {
   const cobros = matchCobros(v);
   if (!cobros.length) { window.toast('Esta venta no tiene cobro para conciliar', 'error'); return; }
   const sum = cobros.reduce((s, c) => s + (Number(c.monto) || 0), 0);
-  const pc = Number(v.por_cobrar) || 0;
+  const pc = objetivoDe(v);
 
   const aVincular = cobros.map(c => ({ id: c.id, monto: r2(Math.abs(Number(c.monto) || 0)) }));
   let conBonif = false;
@@ -560,7 +616,7 @@ function armarLoteConciliacion(ventas) {
     const cb = matchCobros(v);
     if (!cb.length) continue;
     const sum = cb.reduce((s, c) => s + (Number(c.monto) || 0), 0);
-    const pc = Number(v.por_cobrar) || 0;
+    const pc = objetivoDe(v);
     let bonif = null;
     if (Math.abs(sum - pc) >= TOL) {
       const falta = r2(pc - sum);
