@@ -570,14 +570,14 @@ async function openVentaDetalle(ventaId) {
     const r = await fetch('/venta/' + encodeURIComponent(ventaId) + '/detalle');
     const data = await r.json().catch(() => ({}));
     if (!r.ok || !data.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
-    pintar(detalleHTML(data));
+    pintar(ventaDetalleHTML(data));
   } catch (e) {
     pintar(`<div class="card-title">Detalle de la venta</div><div class="error">No se pudo cargar: ${esc(e.message)}</div>`);
   }
 }
 
 // Arma el HTML del detalle a partir de { venta, cobros, devoluciones, retenciones }.
-function detalleHTML({ venta, cobros, devoluciones, retenciones }) {
+function ventaDetalleHTML({ venta, cobros, devoluciones, retenciones }) {
   const sum = arr => arr.reduce((s, x) => s + (Number(x.monto) || 0), 0);
   const lineaMov = m => `<div class="vml-dev-linea">
       <span class="vml-det-fecha">${esc(ddmm(m.fecha))}</span>
