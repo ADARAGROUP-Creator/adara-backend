@@ -27,7 +27,6 @@ let MES = '';                // YYYY-MM (modo mes)
 let FILTRO = 'todas';        // todas | por_cobrar | cobradas | conciliadas | canceladas | devueltas
 
 // ── Solapas de la pantalla ──────────────────────────────────────────────
-let TAB = 'ventas';          // ventas | devoluciones
 
 // ── Devoluciones (solo lectura, v1) ─────────────────────────────────────
 // Movimientos del extracto que son plata de devolución/cancelación y todavía
@@ -46,7 +45,6 @@ let DEV_TOL = 1.00;          // tolerancia $ para sugerir match por monto espejo
 // ── Devoluciones v2: bundles resueltos por op_id (endpoint /devoluciones/resolver) ──
 let DEV_BUNDLES = null;      // [{op_id, neto, capa, estado, venta, lineas[]}] | null = no cargado
 let DEV_RESUMEN = null;      // {total, pendiente, parcial, vinculada, agregado, revision}
-let DEV_MES = '';            // 'YYYY-MM' seleccionado en la solapa Devoluciones ('' = todos), por fecha de la línea del AS
 
 const TOL = 0.02;
 const r2 = n => Math.round((Number(n) || 0) * 100) / 100;
@@ -237,6 +235,8 @@ export async function loadVentasML() {
   MESES = [...new Set(VENTAS.map(v => mesDe(v.fecha)).filter(Boolean))].sort();
   if (!FECHA || !DIAS.includes(FECHA)) FECHA = DIAS.length ? DIAS[DIAS.length - 1] : '';
   if (!MES || !MESES.includes(MES)) MES = MESES.length ? MESES[MESES.length - 1] : '';
+  try { await cargarBundlesDevol(); }
+  catch (e) { DEV_BUNDLES = null; DEV_RESUMEN = null; console.warn('bundles devoluciones:', e.message); }
   inyectarEstilo();
   render();
 }
@@ -289,24 +289,9 @@ function paso(delta) {
   render();
 }
 
-// Barra de solapas (Ventas / Devoluciones). Visible en ambas vistas.
-function tabBarHTML() {
-  const pend = DEV_RESUMEN
-    ? (DEV_RESUMEN.pendiente + DEV_RESUMEN.parcial)
-    : DEVOLS.filter(d => !MOV_VINCULADOS.has(d.id)).length;
-  return `<div class="vml-tabs">
-    <button class="vml-tab ${TAB === 'ventas' ? 'active' : ''}" data-tab="ventas">Ventas</button>
-    <button class="vml-tab ${TAB === 'devoluciones' ? 'active' : ''}" data-tab="devoluciones">Devoluciones${pend ? ` <span class="vml-tab-n">${pend}</span>` : ''}</button>
-  </div>`;
-}
-function wireTabs(root) {
-  root.querySelectorAll('.vml-tab').forEach(b =>
-    b.addEventListener('click', () => { TAB = b.dataset.tab; render(); }));
-}
-
-// Conmutador de solapas.
+// Render principal de la pantalla Ventas ML (incluye, en el chip "Devueltas",
+// la herramienta de conciliación de devoluciones por bundle).
 function render() {
-  if (TAB === 'devoluciones') return renderDevoluciones();
   return renderVentas();
 }
 
@@ -321,6 +306,10 @@ function renderVentas() {
 
   const cont = { todas: base.length, por_cobrar: 0, cobradas: 0, conciliadas: 0, canceladas: 0, devueltas: 0 };
   base.forEach(v => { cont[clase(v)]++; });
+
+  const esDevueltas = FILTRO === 'devueltas';
+  const perDev = bundlesPeriodo();   // bundles de devolución del período (por fecha de línea del AS)
+  if (perDev) cont.devueltas = perDev.filter(b => b.estado === 'pendiente' || b.estado === 'parcial').length;
 
   const visibles = FILTRO === 'todas' ? base : base.filter(v => clase(v) === FILTRO);
   const totCobrar = base.reduce((s, v) => s + (Number(v.por_cobrar) || 0), 0);
@@ -363,15 +352,17 @@ function renderVentas() {
   const vacioTxt = esMes ? `el mes de ${esc(mesLargo(MES))}` : `el ${esc(ddmm(FECHA))}`;
 
   root.innerHTML = `
-    ${tabBarHTML()}
     <div class="vml-bar">
       <button class="btn btn-primary" id="vml-sync">⟳ Sincronizar ventas</button>
       ${hayVentas ? modoHTML : ''}
       ${navHTML}
-      ${conciliablesN > 0 ? `<button class="btn btn-conc" id="vml-conc-todas">✓ Conciliar todas (${conciliablesN})</button>` : ''}
+      ${(!esDevueltas && conciliablesN > 0) ? `<button class="btn btn-conc" id="vml-conc-todas">✓ Conciliar todas (${conciliablesN})</button>` : ''}
     </div>
 
     ${hayVentas ? `
+      ${esDevueltas
+        ? `${pills}${devolucionesHTML()}`
+        : `
       <div class="kpi-grid" style="margin:14px 0">
         <div class="kpi"><div class="kpi-label">Ventas del ${lblPeriodo}</div><div class="kpi-value">${base.length}</div></div>
         <div class="kpi"><div class="kpi-label">Por cobrar (neto)</div><div class="kpi-value">${money(totCobrar)}</div></div>
@@ -399,11 +390,11 @@ function renderVentas() {
             </tr></thead>
             <tbody>${visibles.map(v => filaHTML(v, esMes, BONIF_MAP)).join('')}</tbody>
           </table></div>`}
+        `}
     ` : `<div class="empty">Todavía no hay ventas cargadas. Tocá <b>Sincronizar ventas</b> para traerlas de Mercado Libre.</div>`}
   `;
 
   document.getElementById('vml-sync').addEventListener('click', openSyncModal);
-  wireTabs(root);
   if (hayVentas) {
     root.querySelectorAll('.vml-modo button').forEach(b =>
       b.addEventListener('click', () => { MODO = b.dataset.modo; render(); }));
@@ -416,10 +407,14 @@ function renderVentas() {
     if (inpF) inpF.addEventListener('change', e => { FECHA = e.target.value; render(); });
     if (inpM) inpM.addEventListener('change', e => { MES = e.target.value; render(); });
     root.querySelectorAll('.pill').forEach(p => p.addEventListener('click', () => { FILTRO = p.dataset.f; render(); }));
-    const tabla = document.getElementById('vml-tabla');
-    if (tabla) tabla.addEventListener('click', onTablaClick);
-    const cTodas = document.getElementById('vml-conc-todas');
-    if (cTodas) cTodas.addEventListener('click', conciliarTodas);
+    if (esDevueltas) {
+      root.querySelectorAll('.vml-tabla-dev').forEach(t => t.addEventListener('click', onDevClick));
+    } else {
+      const tabla = document.getElementById('vml-tabla');
+      if (tabla) tabla.addEventListener('click', onTablaClick);
+      const cTodas = document.getElementById('vml-conc-todas');
+      if (cTodas) cTodas.addEventListener('click', conciliarTodas);
+    }
   }
 }
 
@@ -741,11 +736,11 @@ const mmaa = ym => (ym || '').slice(5, 7) + '/' + (ym || '').slice(0, 4);
 function mesesDeBundle(b) {
   return [...new Set(b.lineas.map(l => (l.fecha || '').slice(0, 7)).filter(Boolean))].sort();
 }
-// Badge para cuando, con un mes filtrado, el bundle también tiene líneas en otros meses
-// (su impacto se reparte entre períodos: P3 imputa cada línea al mes de su fecha).
-function multiMesBadge(b) {
-  if (!DEV_MES) return '';
-  const otros = mesesDeBundle(b).filter(m => m !== DEV_MES);
+// Badge para cuando, con un mes de referencia, el bundle también tiene líneas en
+// otros meses (su impacto se reparte entre períodos: P3 imputa cada línea a su mes).
+function multiMesBadge(b, refMes) {
+  if (!refMes) return '';
+  const otros = mesesDeBundle(b).filter(m => m !== refMes);
   if (!otros.length) return '';
   return ` <span class="vml-dev-mas" title="Este bundle también tiene líneas en: ${otros.join(', ')}">también ${otros.map(mmaa).join(', ')}</span>`;
 }
@@ -777,7 +772,7 @@ function netoCell(neto) {
 }
 
 // Fila de un bundle accionable (pendiente / parcial).
-function bundleRowHTML(b) {
+function bundleRowHTML(b, refMes) {
   const v = b.venta;
   const ventaCell = v
     ? `<div class="vml-dev-sug">${ventaLink(v)}<div class="vml-dev-prod">cobro ${money(v.por_cobrar)}${v.devuelta ? ' · <span class="vml-dev-claim">marcada devuelta</span>' : ''}</div></div>`
@@ -787,7 +782,7 @@ function bundleRowHTML(b) {
     : '—';
   const parcial = b.estado === 'parcial' ? `<span class="vml-rev">parcial</span> ` : '';
   return `<tr>
-    <td class="vml-mono">${esc(b.op_id)}${multiMesBadge(b)}</td>
+    <td class="vml-mono">${esc(b.op_id)}${multiMesBadge(b, refMes)}</td>
     <td>${ventaCell}</td>
     <td style="text-align:right">${netoCell(b.neto)}</td>
     <td>${parcial}${lineasHTML(b)}</td>
@@ -796,7 +791,7 @@ function bundleRowHTML(b) {
 }
 
 // Fila de bundle informativo (ya vinculada / cargo ML / revisión).
-function bundleInfoRowHTML(b, conDesvincular) {
+function bundleInfoRowHTML(b, conDesvincular, refMes) {
   const v = b.venta;
   const ventaCell = v
     ? `<div class="vml-dev-sug">${ventaLink(v)}<div class="vml-dev-prod">cobro ${money(v.por_cobrar)}</div></div>`
@@ -805,7 +800,7 @@ function bundleInfoRowHTML(b, conDesvincular) {
     ? `<button class="btn btn-ghost vml-mini" data-accion="desvincular-bundle" data-op="${esc(b.op_id)}">Desvincular</button>`
     : '—';
   return `<tr class="vml-row-dev">
-    <td class="vml-mono">${esc(b.op_id)}${multiMesBadge(b)}</td>
+    <td class="vml-mono">${esc(b.op_id)}${multiMesBadge(b, refMes)}</td>
     <td>${ventaCell}</td>
     <td style="text-align:right">${netoCell(b.neto)}</td>
     <td>${lineasHTML(b)}</td>
@@ -826,54 +821,37 @@ function tablaBundles(rows, fn) {
   </table></div>`;
 }
 
-function renderDevoluciones() {
-  const root = document.getElementById('app-screens');
+// Bundles del período actual del navegador (Día/Mes), por fecha de la línea del AS.
+// Devuelve null si los bundles no se pudieron cargar.
+function bundlesPeriodo() {
+  if (!Array.isArray(DEV_BUNDLES)) return null;
+  const esMes = MODO === 'mes';
+  const ref = esMes ? MES : FECHA;
+  if (!ref) return DEV_BUNDLES.slice();
+  const key = esMes ? (f => (f || '').slice(0, 7)) : (f => f || '');
+  return DEV_BUNDLES.filter(b => b.lineas.some(l => key(l.fecha) === ref));
+}
 
-  // Carga perezosa: la primera vez que se abre la solapa (o tras recargar) se
-  // pide el resolver al backend y se vuelve a pintar.
-  if (DEV_BUNDLES === null) {
-    root.innerHTML = `${tabBarHTML()}<div class="empty" style="margin-top:14px">Cargando devoluciones…</div>`;
-    wireTabs(root);
-    cargarBundlesDevol().then(render).catch(e => {
-      const r2el = document.getElementById('app-screens');
-      r2el.innerHTML = `${tabBarHTML()}<div class="error" style="margin-top:14px">No se pudieron cargar las devoluciones: ${esc(e.message)}</div>`;
-      wireTabs(r2el);
-    });
-    return;
+// Contenido de la herramienta de devoluciones (KPIs + tablas de bundles) para el
+// chip "Devueltas". Se embebe dentro de renderVentas, usando el navegador Día/Mes
+// de la página (no tiene selector propio). Devuelve HTML.
+function devolucionesHTML() {
+  const per = bundlesPeriodo();
+  if (per === null) {
+    return `<div class="error" style="margin-top:14px">No se pudieron cargar las devoluciones. Probá <b>Sincronizar</b> o recargar.</div>`;
   }
-
-  // Meses disponibles para el filtro, tomados de la fecha de cada línea del AS.
-  const meses = [...new Set(
-    DEV_BUNDLES.flatMap(b => b.lineas.map(l => (l.fecha || '').slice(0, 7))).filter(Boolean)
-  )].sort();
-  if (DEV_MES && !meses.includes(DEV_MES)) DEV_MES = '';
-
-  const enMes = b => !DEV_MES || b.lineas.some(l => (l.fecha || '').slice(0, 7) === DEV_MES);
-  const F = DEV_BUNDLES.filter(enMes);
-
-  const pend = F.filter(b => b.estado === 'pendiente');
-  const parc = F.filter(b => b.estado === 'parcial');
-  const vinc = F.filter(b => b.estado === 'vinculada');
-  const agg  = F.filter(b => b.estado === 'agregado');
-  const rev  = F.filter(b => b.estado === 'revision');
+  const refMes = MODO === 'mes' ? MES : (FECHA || '').slice(0, 7);
+  const pend = per.filter(b => b.estado === 'pendiente');
+  const parc = per.filter(b => b.estado === 'parcial');
+  const vinc = per.filter(b => b.estado === 'vinculada');
+  const agg  = per.filter(b => b.estado === 'agregado');
+  const rev  = per.filter(b => b.estado === 'revision');
   const accionables = [...pend, ...parc];
 
   const banner = `<div class="vml-dev-banner">
-    Cada fila es una <b>devolución del Account Statement</b> agrupada por su <b>liquidación (op_id)</b>.
-    El sistema la engancha a su venta <b>por op_id</b> (no por monto): directo por <code>mp_payment_id</code> o
-    puenteando por <code>retenciones</code>. <b>Vincular bundle</b> pega <b>todas las líneas</b> (neto + envío + impuestos)
-    a la venta; si el neto es negativo, marca la venta como devuelta. No toca <code>por_cobrar</code>.
-  </div>`;
-
-  // Filtro por mes (fecha de la línea del AS). Un bundle aparece si tiene al menos
-  // una línea en el mes elegido; si además toca otro mes, se marca con un badge.
-  const opts = ['<option value="">Todos los meses</option>']
-    .concat(meses.map(m => `<option value="${m}"${m === DEV_MES ? ' selected' : ''}>${esc(mesLargo(m))}</option>`))
-    .join('');
-  const barra = `<div class="vml-bar" style="margin:12px 0">
-    <span class="vml-de">Mes del movimiento (AS):</span>
-    <select class="input vml-dev-select" id="dev-mes" style="max-width:230px">${opts}</select>
-    ${DEV_MES ? `<span class="vml-sub" style="margin:0">Bundles con al menos una línea en ${esc(mesLargo(DEV_MES))}.</span>` : ''}
+    Devoluciones del Account Statement del período elegido (por <b>fecha del movimiento</b>), agrupadas por
+    <b>liquidación (op_id)</b>. <b>Vincular bundle</b> pega todas las líneas (neto + envío + impuestos) a su venta
+    y, si el neto es negativo, la marca como devuelta. No toca <code>por_cobrar</code>.
   </div>`;
 
   const kpis = `<div class="kpi-grid" style="margin:14px 0">
@@ -883,34 +861,28 @@ function renderDevoluciones() {
     <div class="kpi"><div class="kpi-label">Revisión</div><div class="kpi-value">${rev.length}</div></div>
   </div>`;
 
-  let html = `${tabBarHTML()}${banner}${barra}${kpis}`;
-
+  let html = banner + kpis;
   if (accionables.length) {
     html += `<div class="card-title" style="margin-top:18px">Para vincular (${accionables.length})</div>`;
-    html += tablaBundles(accionables, bundleRowHTML);
+    html += tablaBundles(accionables, b => bundleRowHTML(b, refMes));
   } else {
-    html += `<div class="empty" style="margin-top:14px">¡Listo! No quedan devoluciones para vincular${DEV_MES ? ' en ' + esc(mesLargo(DEV_MES)) : ''}.</div>`;
+    html += `<div class="empty" style="margin-top:14px">No hay devoluciones para vincular en este período.</div>`;
   }
   if (vinc.length) {
     html += `<div class="card-title" style="margin-top:26px">Ya vinculadas (${vinc.length})</div>`;
-    html += tablaBundles(vinc, b => bundleInfoRowHTML(b, true));
+    html += tablaBundles(vinc, b => bundleInfoRowHTML(b, true, refMes));
   }
   if (agg.length) {
     html += `<div class="card-title" style="margin-top:26px">Cargos ML — no son devolución de venta (${agg.length})</div>`;
-    html += `<div class="vml-sub">Facturas vencidas, reintegros batcheados y otros agregados de ML. Se apartan; no se imputan a una venta.</div>`;
-    html += tablaBundles(agg, b => bundleInfoRowHTML(b, false));
+    html += `<div class="vml-sub">Facturas vencidas, reintegros batcheados y otros agregados de ML. No se imputan a una venta.</div>`;
+    html += tablaBundles(agg, b => bundleInfoRowHTML(b, false, refMes));
   }
   if (rev.length) {
     html += `<div class="card-title" style="margin-top:26px">Revisión (${rev.length})</div>`;
-    html += `<div class="vml-sub">No se pudo resolver la venta (típicamente ventas anteriores al 31/12/2025). Impacto de caja casi siempre nulo.</div>`;
-    html += tablaBundles(rev, b => bundleInfoRowHTML(b, false));
+    html += `<div class="vml-sub">No se pudo resolver la venta (típicamente anteriores al 31/12/2025). Impacto de caja casi siempre nulo.</div>`;
+    html += tablaBundles(rev, b => bundleInfoRowHTML(b, false, refMes));
   }
-
-  root.innerHTML = html;
-  wireTabs(root);
-  root.querySelectorAll('.vml-tabla-dev').forEach(t => t.addEventListener('click', onDevClick));
-  const selMes = document.getElementById('dev-mes');
-  if (selMes) selMes.addEventListener('change', () => { DEV_MES = selMes.value; render(); });
+  return html;
 }
 
 // Clics de las tablas de devoluciones (vincular / desvincular bundle).
