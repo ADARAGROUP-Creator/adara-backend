@@ -3507,6 +3507,49 @@ app.post('/devoluciones/vincular', async (req, res) => {
   }
 });
 
+// Detalle completo de una venta: junta toda su "vida de plata" en una llamada.
+// Devuelve { venta, cobros[], devoluciones[], retenciones[] }:
+//   cobros        = movimientos categoria 'cobro_venta' vinculados a la venta
+//   devoluciones  = movimientos de devolución/cancelación vinculados a la venta
+//   retenciones   = filas de la tabla retenciones por venta_id / order_id / mp_source_id
+// No modifica nada (solo lectura).
+app.get('/venta/:id/detalle', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const vs = await sbGet('ventas_ml', `id=eq.${id}&limit=1`);
+    const venta = vs[0];
+    if (!venta) return res.status(404).json({ error: 'Venta no encontrada' });
+
+    // Movimientos vinculados a la venta (op_tipo='venta_ml', op_id=venta.id)
+    const vincs = await sbGet('vinculos', `op_tipo=eq.venta_ml&op_id=eq.${id}&select=movimiento_id`);
+    let movs = [];
+    for (const ch of _chunk(vincs.map(v => v.movimiento_id), 200)) {
+      if (!ch.length) continue;
+      const r = await sbGet('movimientos',
+        `id=in.(${ch.join(',')})&select=id,fecha,categoria,monto,descripcion`);
+      movs = movs.concat(r);
+    }
+    const byFecha = (a, b) => String(a.fecha).localeCompare(String(b.fecha));
+    const DEVCATS = ['devolucion', 'venta_cancelada', 'cargo_envio_devolucion'];
+    const cobros       = movs.filter(m => m.categoria === 'cobro_venta').sort(byFecha);
+    const devoluciones = movs.filter(m => DEVCATS.includes(m.categoria)).sort(byFecha);
+
+    // Retenciones: por venta_id, por orden, o por source del pago (dedup por id)
+    const retSel = 'select=id,tipo,jurisdiccion,detail,monto,fecha,mp_source_id,order_id';
+    const retMap = new Map();
+    const addRets = rows => rows.forEach(r => { if (!retMap.has(r.id)) retMap.set(r.id, r); });
+    addRets(await sbGet('retenciones', `venta_id=eq.${id}&${retSel}`));
+    if (venta.ml_order_id)  addRets(await sbGet('retenciones', `order_id=eq.${encodeURIComponent(venta.ml_order_id)}&${retSel}`));
+    if (venta.mp_payment_id) addRets(await sbGet('retenciones', `mp_source_id=eq.${encodeURIComponent(venta.mp_payment_id)}&${retSel}`));
+    const retenciones = [...retMap.values()].sort((a, b) => String(a.tipo || '').localeCompare(String(b.tipo || '')));
+
+    res.json({ ok: true, venta, cobros, devoluciones, retenciones });
+  } catch (e) {
+    console.error('venta/detalle:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Conciliación: transferencia interna entre cuentas propias (CB8) ──────
 // Empareja dos movimientos (salida en una cuenta, entrada en otra) con vínculos
 // cruzados op_tipo='transferencia' (op_id = el OTRO movimiento). Cada lado
