@@ -520,7 +520,7 @@ function filaHTML(v, esMes, bonifMap) {
   const est = ESTADO_LBL[cl];
   const rowCls = est.cls === 'canc' ? 'vml-row-canc' : est.cls === 'dev' ? 'vml-row-dev' : '';
 
-  return `<tr class="${rowCls}">
+  return `<tr class="vml-row-click ${rowCls}" data-venta="${v.id}" title="Ver detalle de la venta">
     ${esMes ? `<td class="vml-mono">${esc(ddmm(v.fecha))}</td>` : ''}
     <td class="vml-mono">${v.ml_order_id
       ? `<a class="vml-venta-id" href="https://www.mercadolibre.com.ar/ventas/${encodeURIComponent(v.ml_order_id)}/detalle" target="_blank" rel="noopener" title="Abrir la venta en Mercado Libre">${esc(v.ml_order_id)}</a>`
@@ -541,10 +541,76 @@ function filaHTML(v, esMes, bonifMap) {
 
 function onTablaClick(e) {
   const btn = e.target.closest('[data-accion]');
-  if (!btn) return;
-  if (btn.dataset.accion === 'conciliar') conciliar(btn.dataset.venta);
-  else if (btn.dataset.accion === 'desvincular') desvincular(btn.dataset.venta);
-  else if (btn.dataset.accion === 'toggle') toggleDetalle(btn);
+  if (btn) {
+    if (btn.dataset.accion === 'conciliar') conciliar(btn.dataset.venta);
+    else if (btn.dataset.accion === 'desvincular') desvincular(btn.dataset.venta);
+    else if (btn.dataset.accion === 'toggle') toggleDetalle(btn);
+    return;
+  }
+  if (e.target.closest('a')) return;                 // el N° de venta sigue abriendo ML
+  const tr = e.target.closest('tr[data-venta]');
+  if (tr) openVentaDetalle(tr.dataset.venta);
+}
+
+// Abre un modal con TODA la vida de plata de la venta: cobro + impuestos +
+// devoluciones (endpoint /venta/:id/detalle). Solo lectura.
+async function openVentaDetalle(ventaId) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal vml-detalle-modal"><div class="card-title">Detalle de la venta</div><div class="empty" style="margin-top:10px">Cargando…</div></div>`;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  const pintar = (inner) => {
+    overlay.querySelector('.modal').innerHTML = inner +
+      `<div class="modal-actions"><button class="btn btn-ghost" id="vd-close">Cerrar</button></div>`;
+    overlay.querySelector('#vd-close').addEventListener('click', close);
+  };
+  try {
+    const r = await fetch('/venta/' + encodeURIComponent(ventaId) + '/detalle');
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+    pintar(detalleHTML(data));
+  } catch (e) {
+    pintar(`<div class="card-title">Detalle de la venta</div><div class="error">No se pudo cargar: ${esc(e.message)}</div>`);
+  }
+}
+
+// Arma el HTML del detalle a partir de { venta, cobros, devoluciones, retenciones }.
+function detalleHTML({ venta, cobros, devoluciones, retenciones }) {
+  const sum = arr => arr.reduce((s, x) => s + (Number(x.monto) || 0), 0);
+  const lineaMov = m => `<div class="vml-dev-linea">
+      <span class="vml-det-fecha">${esc(ddmm(m.fecha))}</span>
+      <span class="vml-dev-ldesc">${esc(m.descripcion || m.categoria || '—')}</span>
+      <span class="vml-mono ${m.monto < 0 ? 'vml-neg' : m.monto > 0 ? 'vml-pos' : 'vml-cero'}">${m.monto < 0 ? '−' : ''}${money(m.monto)}</span>
+    </div>`;
+  const lineaRet = r => `<div class="vml-dev-linea">
+      <span class="vml-det-fecha">${r.fecha ? esc(ddmm(r.fecha)) : '—'}</span>
+      <span class="vml-dev-ldesc">${esc([r.tipo, r.jurisdiccion].filter(Boolean).join(' · ') || r.detail || '—')}</span>
+      <span class="vml-mono ${r.monto < 0 ? 'vml-neg' : 'vml-pos'}">${r.monto < 0 ? '−' : ''}${money(r.monto)}</span>
+    </div>`;
+  const bloque = (titulo, total, rows, vacio) => `
+    <div class="vml-det-bloque">
+      <div class="vml-det-h"><b>${titulo}</b>${rows.length ? `<span class="vml-mono ${total < 0 ? 'vml-neg' : total > 0 ? 'vml-pos' : ''}">${total < 0 ? '−' : ''}${money(total)}</span>` : ''}</div>
+      ${rows.length ? `<div class="vml-dev-lineas">${rows.join('')}</div>` : `<div class="vml-sub" style="margin:4px 0 0">${vacio}</div>`}
+    </div>`;
+
+  const est = ESTADO_LBL[clase(venta)] || { txt: '—', cls: 'ok' };
+  const cab = `
+    <div class="vml-det-cab">
+      ${venta.ml_order_id
+        ? `<a class="vml-venta-id" href="https://www.mercadolibre.com.ar/ventas/${encodeURIComponent(venta.ml_order_id)}/detalle" target="_blank" rel="noopener">${esc(venta.ml_order_id)}</a>`
+        : '—'}
+      <div class="vml-dev-prod">${esc(venta.titulo || '—')}${venta.sku ? ' · SKU ' + esc(venta.sku) : ''}</div>
+      <div class="vml-sub" style="margin:4px 0 0">${esc(ddmm(venta.fecha))}/${(venta.fecha || '').slice(0, 4)} ·
+        <span class="vml-est vml-est-${est.cls || 'ok'}">${esc(est.txt)}</span> ·
+        Por cobrar <b class="vml-mono">${money(venta.por_cobrar)}</b>${venta.devuelta ? ' · <span class="vml-dev-claim">devuelta</span>' : ''}</div>
+    </div>`;
+
+  return `<div class="card-title">Detalle de la venta</div>${cab}
+    ${bloque('Cobro', sum(cobros), cobros.map(lineaMov), 'Sin cobro conciliado todavía (puede faltar cargar el AS de ese mes).')}
+    ${bloque('Impuestos / retenciones', sum(retenciones), retenciones.map(lineaRet), 'Sin retenciones cargadas para esta venta.')}
+    ${bloque('Devoluciones', sum(devoluciones), devoluciones.map(lineaMov), 'Sin devoluciones.')}`;
 }
 
 // Vincula el pago principal y, si hace falta para llegar al por_cobrar, también
@@ -954,6 +1020,12 @@ function inyectarEstilo() {
     .vml-dev-lineas{display:flex;flex-direction:column;gap:2px}
     .vml-dev-linea{display:grid;grid-template-columns:42px 1fr auto;gap:10px;align-items:baseline;font-size:12px}
     .vml-dev-ldesc{color:#57534E;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .vml-row-click{cursor:pointer}
+    .vml-row-click:hover td{background:#FAF7F2}
+    .vml-detalle-modal{max-width:560px;width:92vw}
+    .vml-det-cab{margin:10px 0 4px}
+    .vml-det-bloque{margin-top:14px;border-top:1px solid #EFEAE3;padding-top:10px}
+    .vml-det-h{display:flex;justify-content:space-between;align-items:baseline;font-size:14px;margin-bottom:6px}
     .vml-dev-claim{font-size:11px;color:#92500A;background:#FAF1E1;border-radius:6px;padding:1px 7px;margin-left:4px}
     .vml-dev-id{font-size:11px;color:#0F6E56;background:#E1F5EE;border-radius:6px;padding:1px 7px;font-weight:600}
     .vml-dev-pick{display:flex;gap:6px;align-items:center}
