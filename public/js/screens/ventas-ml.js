@@ -46,6 +46,7 @@ let DEV_TOL = 1.00;          // tolerancia $ para sugerir match por monto espejo
 // ── Devoluciones v2: bundles resueltos por op_id (endpoint /devoluciones/resolver) ──
 let DEV_BUNDLES = null;      // [{op_id, neto, capa, estado, venta, lineas[]}] | null = no cargado
 let DEV_RESUMEN = null;      // {total, pendiente, parcial, vinculada, agregado, revision}
+let DEV_MES = '';            // 'YYYY-MM' seleccionado en la solapa Devoluciones ('' = todos), por fecha de la línea del AS
 
 const TOL = 0.02;
 const r2 = n => Math.round((Number(n) || 0) * 100) / 100;
@@ -736,6 +737,19 @@ async function cargarBundlesDevol() {
   DEV_RESUMEN = data.resumen || {};
 }
 
+const mmaa = ym => (ym || '').slice(5, 7) + '/' + (ym || '').slice(0, 4);
+function mesesDeBundle(b) {
+  return [...new Set(b.lineas.map(l => (l.fecha || '').slice(0, 7)).filter(Boolean))].sort();
+}
+// Badge para cuando, con un mes filtrado, el bundle también tiene líneas en otros meses
+// (su impacto se reparte entre períodos: P3 imputa cada línea al mes de su fecha).
+function multiMesBadge(b) {
+  if (!DEV_MES) return '';
+  const otros = mesesDeBundle(b).filter(m => m !== DEV_MES);
+  if (!otros.length) return '';
+  return ` <span class="vml-dev-mas" title="Este bundle también tiene líneas en: ${otros.join(', ')}">también ${otros.map(mmaa).join(', ')}</span>`;
+}
+
 function ventaLink(v) {
   return v && v.ml_order_id
     ? `<a class="vml-venta-id" href="https://www.mercadolibre.com.ar/ventas/${encodeURIComponent(v.ml_order_id)}/detalle" target="_blank" rel="noopener" title="Abrir la venta en Mercado Libre">${esc(v.ml_order_id)}</a>`
@@ -773,7 +787,7 @@ function bundleRowHTML(b) {
     : '—';
   const parcial = b.estado === 'parcial' ? `<span class="vml-rev">parcial</span> ` : '';
   return `<tr>
-    <td class="vml-mono">${esc(b.op_id)}</td>
+    <td class="vml-mono">${esc(b.op_id)}${multiMesBadge(b)}</td>
     <td>${ventaCell}</td>
     <td style="text-align:right">${netoCell(b.neto)}</td>
     <td>${parcial}${lineasHTML(b)}</td>
@@ -791,7 +805,7 @@ function bundleInfoRowHTML(b, conDesvincular) {
     ? `<button class="btn btn-ghost vml-mini" data-accion="desvincular-bundle" data-op="${esc(b.op_id)}">Desvincular</button>`
     : '—';
   return `<tr class="vml-row-dev">
-    <td class="vml-mono">${esc(b.op_id)}</td>
+    <td class="vml-mono">${esc(b.op_id)}${multiMesBadge(b)}</td>
     <td>${ventaCell}</td>
     <td style="text-align:right">${netoCell(b.neto)}</td>
     <td>${lineasHTML(b)}</td>
@@ -828,11 +842,20 @@ function renderDevoluciones() {
     return;
   }
 
-  const pend = DEV_BUNDLES.filter(b => b.estado === 'pendiente');
-  const parc = DEV_BUNDLES.filter(b => b.estado === 'parcial');
-  const vinc = DEV_BUNDLES.filter(b => b.estado === 'vinculada');
-  const agg  = DEV_BUNDLES.filter(b => b.estado === 'agregado');
-  const rev  = DEV_BUNDLES.filter(b => b.estado === 'revision');
+  // Meses disponibles para el filtro, tomados de la fecha de cada línea del AS.
+  const meses = [...new Set(
+    DEV_BUNDLES.flatMap(b => b.lineas.map(l => (l.fecha || '').slice(0, 7))).filter(Boolean)
+  )].sort();
+  if (DEV_MES && !meses.includes(DEV_MES)) DEV_MES = '';
+
+  const enMes = b => !DEV_MES || b.lineas.some(l => (l.fecha || '').slice(0, 7) === DEV_MES);
+  const F = DEV_BUNDLES.filter(enMes);
+
+  const pend = F.filter(b => b.estado === 'pendiente');
+  const parc = F.filter(b => b.estado === 'parcial');
+  const vinc = F.filter(b => b.estado === 'vinculada');
+  const agg  = F.filter(b => b.estado === 'agregado');
+  const rev  = F.filter(b => b.estado === 'revision');
   const accionables = [...pend, ...parc];
 
   const banner = `<div class="vml-dev-banner">
@@ -842,6 +865,17 @@ function renderDevoluciones() {
     a la venta; si el neto es negativo, marca la venta como devuelta. No toca <code>por_cobrar</code>.
   </div>`;
 
+  // Filtro por mes (fecha de la línea del AS). Un bundle aparece si tiene al menos
+  // una línea en el mes elegido; si además toca otro mes, se marca con un badge.
+  const opts = ['<option value="">Todos los meses</option>']
+    .concat(meses.map(m => `<option value="${m}"${m === DEV_MES ? ' selected' : ''}>${esc(mesLargo(m))}</option>`))
+    .join('');
+  const barra = `<div class="vml-bar" style="margin:12px 0">
+    <span class="vml-de">Mes del movimiento (AS):</span>
+    <select class="input vml-dev-select" id="dev-mes" style="max-width:230px">${opts}</select>
+    ${DEV_MES ? `<span class="vml-sub" style="margin:0">Bundles con al menos una línea en ${esc(mesLargo(DEV_MES))}.</span>` : ''}
+  </div>`;
+
   const kpis = `<div class="kpi-grid" style="margin:14px 0">
     <div class="kpi"><div class="kpi-label">Para vincular</div><div class="kpi-value">${accionables.length}</div></div>
     <div class="kpi"><div class="kpi-label">Ya vinculadas</div><div class="kpi-value">${vinc.length}</div></div>
@@ -849,13 +883,13 @@ function renderDevoluciones() {
     <div class="kpi"><div class="kpi-label">Revisión</div><div class="kpi-value">${rev.length}</div></div>
   </div>`;
 
-  let html = `${tabBarHTML()}${banner}${kpis}`;
+  let html = `${tabBarHTML()}${banner}${barra}${kpis}`;
 
   if (accionables.length) {
     html += `<div class="card-title" style="margin-top:18px">Para vincular (${accionables.length})</div>`;
     html += tablaBundles(accionables, bundleRowHTML);
   } else {
-    html += `<div class="empty" style="margin-top:14px">¡Listo! No quedan devoluciones para vincular.</div>`;
+    html += `<div class="empty" style="margin-top:14px">¡Listo! No quedan devoluciones para vincular${DEV_MES ? ' en ' + esc(mesLargo(DEV_MES)) : ''}.</div>`;
   }
   if (vinc.length) {
     html += `<div class="card-title" style="margin-top:26px">Ya vinculadas (${vinc.length})</div>`;
@@ -875,6 +909,8 @@ function renderDevoluciones() {
   root.innerHTML = html;
   wireTabs(root);
   root.querySelectorAll('.vml-tabla-dev').forEach(t => t.addEventListener('click', onDevClick));
+  const selMes = document.getElementById('dev-mes');
+  if (selMes) selMes.addEventListener('change', () => { DEV_MES = selMes.value; render(); });
 }
 
 // Clics de las tablas de devoluciones (vincular / desvincular bundle).
