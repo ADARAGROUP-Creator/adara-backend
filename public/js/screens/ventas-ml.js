@@ -41,7 +41,11 @@ let DEVOLS = [];             // movimientos de devolución (normalizados)
 let DEV_FUENTE = '';         // 'movimientos' | 'movimientos_mp' | '' (de qué cajón se leyeron)
 let MOV_VINCULADOS = new Set(); // movimiento_id de devolución ya enganchados a una venta
 let DEV_LINK_BY_MOV = new Map(); // movimiento_id de devolución -> vínculo (para mostrar venta + deshacer)
-let DEV_TOL = 1.00;          // tolerancia $ para sugerir match por monto espejo
+let DEV_TOL = 1.00;          // tolerancia $ para sugerir match por monto espejo (legacy, sin uso en v2)
+
+// ── Devoluciones v2: bundles resueltos por op_id (endpoint /devoluciones/resolver) ──
+let DEV_BUNDLES = null;      // [{op_id, neto, capa, estado, venta, lineas[]}] | null = no cargado
+let DEV_RESUMEN = null;      // {total, pendiente, parcial, vinculada, agregado, revision}
 
 const TOL = 0.02;
 const r2 = n => Math.round((Number(n) || 0) * 100) / 100;
@@ -161,6 +165,7 @@ const ESTADO_LBL = {
 export async function loadVentasML() {
   const root = document.getElementById('app-screens');
   root.innerHTML = `<div class="loading">Cargando ventas de ML…</div>`;
+  DEV_BUNDLES = null;   // invalidar cache de bundles de devolución → se recarga al abrir la solapa
   try {
     VENTAS = await sbGet('ventas_ml', 'order=fecha.asc,hora_venta.asc');
     const cobros = await sbGet('movimientos', 'categoria=eq.cobro_venta&order=fecha.asc');
@@ -285,7 +290,9 @@ function paso(delta) {
 
 // Barra de solapas (Ventas / Devoluciones). Visible en ambas vistas.
 function tabBarHTML() {
-  const pend = DEVOLS.filter(d => !MOV_VINCULADOS.has(d.id)).length;
+  const pend = DEV_RESUMEN
+    ? (DEV_RESUMEN.pendiente + DEV_RESUMEN.parcial)
+    : DEVOLS.filter(d => !MOV_VINCULADOS.has(d.id)).length;
   return `<div class="vml-tabs">
     <button class="vml-tab ${TAB === 'ventas' ? 'active' : ''}" data-tab="ventas">Ventas</button>
     <button class="vml-tab ${TAB === 'devoluciones' ? 'active' : ''}" data-tab="devoluciones">Devoluciones${pend ? ` <span class="vml-tab-n">${pend}</span>` : ''}</button>
@@ -713,310 +720,213 @@ async function sincronizar(desde, hasta, overlay) {
   }
 }
 
-// ── SOLAPA DEVOLUCIONES (v1: solo lectura + sugerencia) ─────────────────
+// ── SOLAPA DEVOLUCIONES (v2: bundles por op_id, vía /devoluciones/resolver) ──
+// Cada "bundle" es el conjunto de líneas del Account Statement que comparten un
+// op_id (id de liquidación). El backend resuelve a qué venta pertenece cada
+// bundle por op_id (capas: mp_payment_id → retenciones → agregado → revisión) y
+// acá pintamos + vinculamos TODAS las líneas del bundle a la venta de una sola
+// vez. Match por op_id, NUNCA por monto. vinculos.monto = abs(monto) (>0).
+// Ver ADARA-CANCELACIONES-DEVOLUCIONES.md §"Match en capas".
 
-// Indexa las ventas por monto redondeado (por_cobrar e importe_bruto) para
-// buscar rápido la venta que "espeja" el importe de una devolución.
-function indexVentasPorMonto() {
-  const idx = new Map();
-  const push = (val, venta, campo) => {
-    const k = Math.round(Number(val) || 0);
-    if (!k) return;
-    if (!idx.has(k)) idx.set(k, []);
-    idx.get(k).push({ venta, campo });
-  };
-  for (const v of VENTAS) {
-    push(v.por_cobrar, v, 'por_cobrar');
-    push(v.importe_bruto, v, 'bruto');
-  }
-  return idx;
-}
-
-const tieneReclamo = v => !!(v.claim_id || v.devuelta || v.ml_status === 'cancelled' || v.claim_status);
-
-// ── Match DIRECTO por número ────────────────────────────────────────────
-// Hipótesis a comprobar: el movimiento de devolución trae, en su detalle o su
-// referencia, un número que identifica la venta original (el mismo id con el que
-// se cruzan los cobros: mp_payment_id / mp_payment_ids / ml_order_id). Indexamos
-// esos ids de todas las ventas y buscamos cualquier número largo del movimiento
-// que matchee. Si esto pega, no hace falta cruzar por monto.
-function indexVentasPorId() {
-  const idx = new Map();
-  const add = (tok, venta) => {
-    const t = String(tok || '').trim();
-    if (t.length < 8) return;            // ids de MP son números largos
-    if (!idx.has(t)) idx.set(t, []);
-    if (!idx.get(t).some(x => x.id === venta.id)) idx.get(t).push(venta);
-  };
-  for (const v of VENTAS) {
-    if (v.mp_payment_id) add(v.mp_payment_id, v);
-    if (v.mp_payment_ids) String(v.mp_payment_ids).split(',').forEach(x => add(x, v));
-    if (v.ml_order_id) add(v.ml_order_id, v);
-  }
-  return idx;
-}
-
-// Saca los números largos (≥8 dígitos) del detalle + la referencia del movimiento.
-function tokensDe(d) {
-  const txt = `${d.descripcion || ''} ${d.referencia || ''}`;
-  return [...new Set((txt.match(/\d{8,}/g) || []))];
-}
-
-// Devuelve las ventas que matchean por número (cualquier token del movimiento
-// que coincida con un id de una venta).
-function matchDirecto(d, idIdx) {
-  const vistos = new Set();
-  const out = [];
-  for (const tok of tokensDe(d)) {
-    for (const v of (idIdx.get(tok) || [])) {
-      if (vistos.has(v.id)) continue;
-      vistos.add(v.id);
-      out.push({ venta: v, token: tok });
-    }
-  }
-  return out;
-}
-
-// Devuelve las ventas candidatas para un importe (monto espejo), ordenadas:
-// primero las que tienen reclamo detectado, después por diferencia más chica.
-function candidatosVenta(montoAbs, idx) {
-  const A = montoAbs;
-  const vistos = new Set();
-  const out = [];
-  for (const k of [Math.round(A) - 1, Math.round(A), Math.round(A) + 1]) {
-    for (const { venta, campo } of (idx.get(k) || [])) {
-      const ref = campo === 'bruto' ? venta.importe_bruto : venta.por_cobrar;
-      const diff = Math.abs((Number(ref) || 0) - A);
-      if (diff > DEV_TOL) continue;
-      if (vistos.has(venta.id)) continue;
-      vistos.add(venta.id);
-      out.push({ venta, campo, diff, reclamo: tieneReclamo(venta) });
-    }
-  }
-  out.sort((a, b) => (b.reclamo - a.reclamo) || (a.diff - b.diff));
-  return out;
-}
-
-function renderDevoluciones() {
-  const root = document.getElementById('app-screens');
-  const idx = indexVentasPorMonto();
-  const idIdx = indexVentasPorId();
-
-  // Solo las que faltan enganchar (las ya enganchadas se cuentan aparte).
-  const pendientes = DEVOLS.filter(d => !MOV_VINCULADOS.has(d.id));
-  const yaEng = DEVOLS.length - pendientes.length;
-
-  const filas = pendientes.map(d => {
-    const directos = matchDirecto(d, idIdx);   // ventas que matchean por número
-    const cands = candidatosVenta(Math.abs(d.monto), idx);
-    return { d, directos, cands };
-  });
-
-  const conId = filas.filter(f => f.directos.length > 0).length;
-  const con1 = filas.filter(f => !f.directos.length && f.cands.length === 1).length;
-  const conN = filas.filter(f => !f.directos.length && f.cands.length > 1).length;
-  const sin0 = filas.filter(f => !f.directos.length && f.cands.length === 0).length;
-
-  const fuenteLbl = DEV_FUENTE === 'movimientos_mp'
-    ? `<span class="vml-dev-warn">leídas del extracto MP (cajón viejo)</span>`
-    : DEV_FUENTE === 'movimientos' ? `` : `<span class="vml-dev-warn">no encontré movimientos de devolución en la base</span>`;
-
-  const banner = `<div class="vml-dev-banner">
-    Cada fila es <b>plata de una devolución o cancelación</b> que cayó en el extracto y todavía
-    <b>no está pegada a su venta</b>. Si el detalle del extracto trae un número que identifica una venta,
-    lo engancho <b>directo por ese número</b> (🔗 verde, alta confianza); si no, te propongo la venta cuyo
-    importe <b>espeja</b> el de la devolución. Por ahora esto <b>solo muestra y sugiere</b>: todavía no engancha nada. ${fuenteLbl}
-  </div>`;
-
-  if (!DEVOLS.length) {
-    root.innerHTML = `${tabBarHTML()}${banner}
-      <div class="empty" style="margin-top:14px">No hay movimientos de devolución/cancelación cargados todavía.</div>`;
-    wireTabs(root);
-    return;
-  }
-
-  const kpis = `<div class="kpi-grid" style="margin:14px 0">
-    <div class="kpi"><div class="kpi-label">Sin enganchar</div><div class="kpi-value">${pendientes.length}</div></div>
-    <div class="kpi"><div class="kpi-label">🔗 Con N° de una venta</div><div class="kpi-value">${conId}</div></div>
-    <div class="kpi"><div class="kpi-label">Solo por monto: 1 sugerida</div><div class="kpi-value">${con1}</div></div>
-    <div class="kpi"><div class="kpi-label">Solo por monto: varias</div><div class="kpi-value">${conN}</div></div>
-    <div class="kpi"><div class="kpi-label">Sin pista</div><div class="kpi-value">${sin0}</div></div>
-  </div>`;
-
-  const tabla = !pendientes.length
-    ? `<div class="empty" style="margin-top:14px">¡Listo! No quedan devoluciones sin enganchar.</div>`
-    : `<div class="table-wrap" style="margin-top:14px"><table class="t" id="vml-tabla-dev">
-        <thead><tr>
-          <th style="width:56px">Fecha</th>
-          <th style="width:120px">Tipo</th>
-          <th>Detalle del extracto</th>
-          <th style="width:120px;text-align:right">Monto</th>
-          <th style="width:300px">Venta (🔗 por número / por monto espejo)</th>
-          <th style="width:160px">Acción</th>
-        </tr></thead>
-        <tbody>${filas.map(filaDevolucionHTML).join('')}</tbody>
-      </table></div>`;
-
-  // Sección de las que ya están enganchadas (con botón de deshacer).
-  const enganchadas = DEVOLS.filter(d => MOV_VINCULADOS.has(d.id));
-  const engHTML = !enganchadas.length ? '' : `
-    <div class="card-title" style="margin-top:26px">Ya enganchadas (${enganchadas.length})</div>
-    <div class="table-wrap" style="margin-top:10px"><table class="t" id="vml-tabla-dev-eng">
-      <thead><tr>
-        <th style="width:56px">Fecha</th>
-        <th style="width:120px">Tipo</th>
-        <th>Detalle del extracto</th>
-        <th style="width:120px;text-align:right">Monto</th>
-        <th style="width:300px">Venta enganchada</th>
-        <th style="width:160px">Acción</th>
-      </tr></thead>
-      <tbody>${enganchadas.map(filaEnganchadaHTML).join('')}</tbody>
-    </table></div>`;
-
-  root.innerHTML = `${tabBarHTML()}${banner}${kpis}${tabla}${engHTML}`;
-  wireTabs(root);
-  const tDev = document.getElementById('vml-tabla-dev');
-  if (tDev) tDev.addEventListener('click', onDevClick);
-  const tEng = document.getElementById('vml-tabla-dev-eng');
-  if (tEng) tEng.addEventListener('click', onDevClick);
-}
-
-// Devuelve las ventas "objetivo" para enganchar: primero las de match directo
-// por número (alta confianza); si no hay, las candidatas por monto.
-function objetivosDe(directos, cands) {
-  if (directos.length) return directos.map(x => x.venta);
-  return cands.map(c => c.venta);
-}
-
-// Celda de acción: 1 objetivo → botón directo; varios → desplegable + botón.
-function accionDevHTML(d, objetivos) {
-  if (!objetivos.length) return `<span class="vml-dev-empty">—</span>`;
-  const monto = r2(Math.abs(Number(d.monto) || 0));
-  if (objetivos.length === 1) {
-    return `<button class="btn btn-primary vml-mini" data-accion="enganchar" data-mov="${d.id}" data-venta="${objetivos[0].id}" data-monto="${monto}">Enganchar</button>`;
-  }
-  const opts = objetivos.map(v => `<option value="${v.id}">${esc(v.ml_order_id || ('#' + v.id))} · ${esc((v.titulo || '').slice(0, 28))}</option>`).join('');
-  return `<div class="vml-dev-pick">
-    <select class="input vml-dev-select" id="dev-sel-${d.id}">${opts}</select>
-    <button class="btn btn-primary vml-mini" data-accion="enganchar-sel" data-mov="${d.id}" data-monto="${monto}">Enganchar</button>
-  </div>`;
+async function cargarBundlesDevol() {
+  const r = await fetch('/devoluciones/resolver');
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || !data.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+  DEV_BUNDLES = data.bundles || [];
+  DEV_RESUMEN = data.resumen || {};
 }
 
 function ventaLink(v) {
-  return v.ml_order_id
+  return v && v.ml_order_id
     ? `<a class="vml-venta-id" href="https://www.mercadolibre.com.ar/ventas/${encodeURIComponent(v.ml_order_id)}/detalle" target="_blank" rel="noopener" title="Abrir la venta en Mercado Libre">${esc(v.ml_order_id)}</a>`
     : '—';
 }
 
-function filaDevolucionHTML({ d, directos, cands }) {
-  const debito = d.monto < 0;
-  const montoCls = debito ? 'vml-neg' : 'vml-pos';
-  const montoLbl = debito ? '− pagás' : '+ te devuelven';
-
-  let sug;
-  if (directos.length) {
-    // Match directo por número: alta confianza.
-    const top = directos[0];
-    const v = top.venta;
-    const extra = directos.length > 1
-      ? `<span class="vml-dev-mas" title="${esc(directos.slice(1).map(x => x.venta.ml_order_id).filter(Boolean).join(', '))}">+${directos.length - 1} más</span>` : '';
-    sug = `<div class="vml-dev-sug">
-      <span class="vml-dev-id" title="El número ${esc(top.token)} del extracto coincide con esta venta">🔗 por número</span> ${ventaLink(v)} ${extra}
-      <div class="vml-dev-prod">${esc((v.titulo || '').slice(0, 60))} · ${money(v.por_cobrar)}</div>
+// Lista compacta de las líneas de un bundle (fecha · detalle · monto con signo).
+function lineasHTML(b) {
+  return `<div class="vml-dev-lineas">` + b.lineas.map(l => {
+    const cls = l.monto < 0 ? 'vml-neg' : (l.monto > 0 ? 'vml-pos' : 'vml-cero');
+    const chk = l.ya_vinculada ? '<span class="vml-dev-id" title="Ya vinculada">✓</span> ' : '';
+    return `<div class="vml-dev-linea">
+      <span class="vml-det-fecha">${esc(ddmm(l.fecha))}</span>
+      <span class="vml-dev-ldesc">${chk}${esc(l.descripcion || '—')}</span>
+      <span class="vml-mono ${cls}">${l.monto < 0 ? '−' : ''}${money(l.monto)}</span>
     </div>`;
-  } else if (cands.length) {
-    const top = cands[0];
-    const v = top.venta;
-    const claim = top.reclamo ? `<span class="vml-dev-claim" title="Esta venta tiene un reclamo/devolución detectado">↩ reclamo</span>` : '';
-    const aprox = top.diff > TOL ? `<span class="vml-dev-aprox" title="Difiere $${top.diff.toFixed(2)} del importe">≈</span>` : '';
-    const masN = cands.length > 1 ? `<span class="vml-dev-mas" title="${esc(cands.slice(1).map(c => c.venta.ml_order_id).filter(Boolean).join(', '))}">+${cands.length - 1} más</span>` : '';
-    sug = `<div class="vml-dev-sug">
-      ${aprox}${ventaLink(v)} ${claim}
-      <div class="vml-dev-prod">${esc((v.titulo || '').slice(0, 60))} · ${money(top.campo === 'bruto' ? v.importe_bruto : v.por_cobrar)} ${masN}</div>
-    </div>`;
-  } else {
-    sug = `<span class="vml-dev-empty">— sin pista (ni número ni monto) —</span>`;
-  }
-
-  const objetivos = objetivosDe(directos, cands);
-  return `<tr>
-    <td class="vml-mono">${esc(ddmm(d.fecha))}</td>
-    <td>${esc(DEV_CAT_LBL[d.categoria] || d.categoria)}</td>
-    <td>${esc(d.descripcion || '—')}</td>
-    <td style="text-align:right" class="vml-mono ${montoCls}">${money(d.monto)}<div class="vml-dev-mlbl">${montoLbl}</div></td>
-    <td>${sug}</td>
-    <td>${accionDevHTML(d, objetivos)}</td>
-  </tr>`;
+  }).join('') + `</div>`;
 }
 
-// Fila de una devolución ya enganchada: muestra la venta vinculada + deshacer.
-function filaEnganchadaHTML(d) {
-  const debito = d.monto < 0;
-  const montoCls = debito ? 'vml-neg' : 'vml-pos';
-  const link = DEV_LINK_BY_MOV.get(d.id);
-  const v = link ? VENTAS.find(x => String(x.id) === String(link.op_id)) : null;
+// Celda del neto del bundle, con etiqueta de impacto de caja.
+function netoCell(neto) {
+  if (neto < 0) return `<span class="vml-mono vml-neg">−${money(neto)}</span><div class="vml-dev-mlbl">pérdida real</div>`;
+  if (neto > 0) return `<span class="vml-mono vml-pos">${money(neto)}</span><div class="vml-dev-mlbl">a favor</div>`;
+  return `<span class="vml-mono vml-cero">${money(0)}</span><div class="vml-dev-mlbl">neutro</div>`;
+}
+
+// Fila de un bundle accionable (pendiente / parcial).
+function bundleRowHTML(b) {
+  const v = b.venta;
   const ventaCell = v
-    ? `<div class="vml-dev-sug">${ventaLink(v)}<div class="vml-dev-prod">${esc((v.titulo || '').slice(0, 60))} · ${money(v.por_cobrar)}</div></div>`
-    : `<span class="vml-dev-empty">venta #${esc(link ? link.op_id : '?')}</span>`;
-  const accion = link
-    ? `<button class="btn btn-ghost vml-mini" data-accion="desenganchar" data-vinc="${link.id}">Desenganchar</button>`
+    ? `<div class="vml-dev-sug">${ventaLink(v)}<div class="vml-dev-prod">cobro ${money(v.por_cobrar)}${v.devuelta ? ' · <span class="vml-dev-claim">marcada devuelta</span>' : ''}</div></div>`
+    : `<span class="vml-dev-empty">—</span>`;
+  const accion = v
+    ? `<button class="btn btn-primary vml-mini" data-accion="vincular-bundle" data-op="${esc(b.op_id)}" data-venta="${v.id}">Vincular bundle</button>`
     : '—';
-  return `<tr class="vml-row-dev">
-    <td class="vml-mono">${esc(ddmm(d.fecha))}</td>
-    <td>${esc(DEV_CAT_LBL[d.categoria] || d.categoria)}</td>
-    <td>${esc(d.descripcion || '—')}</td>
-    <td style="text-align:right" class="vml-mono ${montoCls}">${money(d.monto)}</td>
+  const parcial = b.estado === 'parcial' ? `<span class="vml-rev">parcial</span> ` : '';
+  return `<tr>
+    <td class="vml-mono">${esc(b.op_id)}</td>
     <td>${ventaCell}</td>
+    <td style="text-align:right">${netoCell(b.neto)}</td>
+    <td>${parcial}${lineasHTML(b)}</td>
     <td>${accion}</td>
   </tr>`;
 }
 
-// Manejador de clics de las tablas de devoluciones (enganchar / desenganchar).
+// Fila de bundle informativo (ya vinculada / cargo ML / revisión).
+function bundleInfoRowHTML(b, conDesvincular) {
+  const v = b.venta;
+  const ventaCell = v
+    ? `<div class="vml-dev-sug">${ventaLink(v)}<div class="vml-dev-prod">cobro ${money(v.por_cobrar)}</div></div>`
+    : `<span class="vml-dev-empty">—</span>`;
+  const accion = conDesvincular
+    ? `<button class="btn btn-ghost vml-mini" data-accion="desvincular-bundle" data-op="${esc(b.op_id)}">Desvincular</button>`
+    : '—';
+  return `<tr class="vml-row-dev">
+    <td class="vml-mono">${esc(b.op_id)}</td>
+    <td>${ventaCell}</td>
+    <td style="text-align:right">${netoCell(b.neto)}</td>
+    <td>${lineasHTML(b)}</td>
+    <td>${accion}</td>
+  </tr>`;
+}
+
+function tablaBundles(rows, fn) {
+  return `<div class="table-wrap" style="margin-top:10px"><table class="t vml-tabla-dev">
+    <thead><tr>
+      <th style="width:130px">Liquidación (op_id)</th>
+      <th style="width:240px">Venta</th>
+      <th style="width:130px;text-align:right">Neto del bundle</th>
+      <th>Líneas del Account Statement</th>
+      <th style="width:150px">Acción</th>
+    </tr></thead>
+    <tbody>${rows.map(fn).join('')}</tbody>
+  </table></div>`;
+}
+
+function renderDevoluciones() {
+  const root = document.getElementById('app-screens');
+
+  // Carga perezosa: la primera vez que se abre la solapa (o tras recargar) se
+  // pide el resolver al backend y se vuelve a pintar.
+  if (DEV_BUNDLES === null) {
+    root.innerHTML = `${tabBarHTML()}<div class="empty" style="margin-top:14px">Cargando devoluciones…</div>`;
+    wireTabs(root);
+    cargarBundlesDevol().then(render).catch(e => {
+      const r2el = document.getElementById('app-screens');
+      r2el.innerHTML = `${tabBarHTML()}<div class="error" style="margin-top:14px">No se pudieron cargar las devoluciones: ${esc(e.message)}</div>`;
+      wireTabs(r2el);
+    });
+    return;
+  }
+
+  const pend = DEV_BUNDLES.filter(b => b.estado === 'pendiente');
+  const parc = DEV_BUNDLES.filter(b => b.estado === 'parcial');
+  const vinc = DEV_BUNDLES.filter(b => b.estado === 'vinculada');
+  const agg  = DEV_BUNDLES.filter(b => b.estado === 'agregado');
+  const rev  = DEV_BUNDLES.filter(b => b.estado === 'revision');
+  const accionables = [...pend, ...parc];
+
+  const banner = `<div class="vml-dev-banner">
+    Cada fila es una <b>devolución del Account Statement</b> agrupada por su <b>liquidación (op_id)</b>.
+    El sistema la engancha a su venta <b>por op_id</b> (no por monto): directo por <code>mp_payment_id</code> o
+    puenteando por <code>retenciones</code>. <b>Vincular bundle</b> pega <b>todas las líneas</b> (neto + envío + impuestos)
+    a la venta; si el neto es negativo, marca la venta como devuelta. No toca <code>por_cobrar</code>.
+  </div>`;
+
+  const kpis = `<div class="kpi-grid" style="margin:14px 0">
+    <div class="kpi"><div class="kpi-label">Para vincular</div><div class="kpi-value">${accionables.length}</div></div>
+    <div class="kpi"><div class="kpi-label">Ya vinculadas</div><div class="kpi-value">${vinc.length}</div></div>
+    <div class="kpi"><div class="kpi-label">Cargos ML (no venta)</div><div class="kpi-value">${agg.length}</div></div>
+    <div class="kpi"><div class="kpi-label">Revisión</div><div class="kpi-value">${rev.length}</div></div>
+  </div>`;
+
+  let html = `${tabBarHTML()}${banner}${kpis}`;
+
+  if (accionables.length) {
+    html += `<div class="card-title" style="margin-top:18px">Para vincular (${accionables.length})</div>`;
+    html += tablaBundles(accionables, bundleRowHTML);
+  } else {
+    html += `<div class="empty" style="margin-top:14px">¡Listo! No quedan devoluciones para vincular.</div>`;
+  }
+  if (vinc.length) {
+    html += `<div class="card-title" style="margin-top:26px">Ya vinculadas (${vinc.length})</div>`;
+    html += tablaBundles(vinc, b => bundleInfoRowHTML(b, true));
+  }
+  if (agg.length) {
+    html += `<div class="card-title" style="margin-top:26px">Cargos ML — no son devolución de venta (${agg.length})</div>`;
+    html += `<div class="vml-sub">Facturas vencidas, reintegros batcheados y otros agregados de ML. Se apartan; no se imputan a una venta.</div>`;
+    html += tablaBundles(agg, b => bundleInfoRowHTML(b, false));
+  }
+  if (rev.length) {
+    html += `<div class="card-title" style="margin-top:26px">Revisión (${rev.length})</div>`;
+    html += `<div class="vml-sub">No se pudo resolver la venta (típicamente ventas anteriores al 31/12/2025). Impacto de caja casi siempre nulo.</div>`;
+    html += tablaBundles(rev, b => bundleInfoRowHTML(b, false));
+  }
+
+  root.innerHTML = html;
+  wireTabs(root);
+  root.querySelectorAll('.vml-tabla-dev').forEach(t => t.addEventListener('click', onDevClick));
+}
+
+// Clics de las tablas de devoluciones (vincular / desvincular bundle).
 function onDevClick(e) {
   const btn = e.target.closest('[data-accion]');
   if (!btn) return;
   const a = btn.dataset.accion;
-  if (a === 'enganchar') {
-    engancharDev(btn.dataset.mov, btn.dataset.venta, btn.dataset.monto);
-  } else if (a === 'enganchar-sel') {
-    const sel = document.getElementById('dev-sel-' + btn.dataset.mov);
-    if (!sel || !sel.value) { window.toast('Elegí una venta', 'error'); return; }
-    engancharDev(btn.dataset.mov, sel.value, btn.dataset.monto);
-  } else if (a === 'desenganchar') {
-    desengancharDev(btn.dataset.vinc);
-  }
+  if (a === 'vincular-bundle') vincularBundle(btn.dataset.op, btn.dataset.venta, btn);
+  else if (a === 'desvincular-bundle') desvincularBundle(btn.dataset.op);
 }
 
-// Crea el vínculo devolución → venta (op_tipo='venta_ml', monto positivo).
-async function engancharDev(movId, ventaId, monto) {
-  const m = r2(Math.abs(Number(monto) || 0));
-  if (!(m > 0)) { window.toast('La devolución tiene monto 0, no se puede enganchar', 'error'); return; }
-  window.toast('Enganchando…');
+// Vincula TODAS las líneas del bundle a la venta (endpoint /devoluciones/vincular).
+// El backend recalcula montos desde movimientos y marca devuelta si neto < 0.
+async function vincularBundle(opId, ventaId, btn) {
+  if (btn) btn.disabled = true;
+  window.toast('Vinculando bundle…');
   try {
-    const r = await fetch('/vincular', {
+    const r = await fetch('/devoluciones/vincular', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ movimiento_id: Number(movId), op_tipo: 'venta_ml', op_id: Number(ventaId), monto: m })
+      body: JSON.stringify({ op_id: String(opId), venta_id: Number(ventaId) })
     });
     const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
-    window.toast('Devolución enganchada a la venta');
+    if (!r.ok || !data.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+    window.toast(`Bundle vinculado: ${data.vinculados} líneas${data.marcada_devuelta ? ' · venta marcada devuelta' : ''}`);
+    DEV_BUNDLES = null;          // invalidar cache → recargar resolver
     await loadVentasML();
   } catch (e) {
-    window.toast('Error al enganchar: ' + e.message, 'error');
+    if (btn) btn.disabled = false;
+    window.toast('Error al vincular: ' + e.message, 'error');
   }
 }
 
-// Deshace el enganche de una devolución (borra el vínculo).
-async function desengancharDev(vincId) {
-  if (!confirm('¿Desenganchar esta devolución de su venta?')) return;
+// Deshace el bundle: borra el vínculo de cada línea (usa DEV_LINK_BY_MOV, que
+// loadVentasML llena con los vínculos de devolución). No revierte el flag
+// `devuelta` de la venta (acción manual si hiciera falta).
+async function desvincularBundle(opId) {
+  const b = (DEV_BUNDLES || []).find(x => String(x.op_id) === String(opId));
+  if (!b) return;
+  if (!confirm(`¿Desvincular las ${b.lineas.length} líneas de esta liquidación de su venta?`)) return;
+  window.toast('Desvinculando…');
   try {
-    const r = await fetch('/vincular/' + vincId, { method: 'DELETE' });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
-    window.toast('Devolución desenganchada');
+    for (const l of b.lineas) {
+      const link = DEV_LINK_BY_MOV.get(l.id);
+      if (!link) continue;
+      const r = await fetch('/vincular/' + link.id, { method: 'DELETE' });
+      if (!r.ok) throw new Error('No se pudo borrar el vínculo ' + link.id);
+    }
+    window.toast('Bundle desvinculado');
+    DEV_BUNDLES = null;
     await loadVentasML();
   } catch (e) {
-    window.toast('Error al desenganchar: ' + e.message, 'error');
+    window.toast('Error al desvincular: ' + e.message, 'error');
   }
 }
 
@@ -1033,6 +943,9 @@ function inyectarEstilo() {
     .vml-dev-mlbl{font-size:11px;color:#A8A29E;font-weight:400}
     .vml-dev-sug{line-height:1.4}
     .vml-dev-prod{font-size:12px;color:#78716C;margin-top:2px}
+    .vml-dev-lineas{display:flex;flex-direction:column;gap:2px}
+    .vml-dev-linea{display:grid;grid-template-columns:42px 1fr auto;gap:10px;align-items:baseline;font-size:12px}
+    .vml-dev-ldesc{color:#57534E;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .vml-dev-claim{font-size:11px;color:#92500A;background:#FAF1E1;border-radius:6px;padding:1px 7px;margin-left:4px}
     .vml-dev-id{font-size:11px;color:#0F6E56;background:#E1F5EE;border-radius:6px;padding:1px 7px;font-weight:600}
     .vml-dev-pick{display:flex;gap:6px;align-items:center}
