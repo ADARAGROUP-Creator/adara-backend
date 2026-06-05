@@ -21,7 +21,14 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 app.use(cors());
 app.use(express.json({ limit: '20mb' }));
-app.use(express.static('public'));   // sirve el frontend desde /public
+// Frontend desde /public. 'no-cache' = el navegador puede guardar el archivo
+// pero SIEMPRE revalida con el server antes de usarlo (ETag): si no cambió → 304
+// instantáneo; si cambió → baja la versión nueva sola. Evita servir JS/HTML viejos.
+app.use(express.static('public', {
+  etag: true,
+  lastModified: true,
+  setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache')
+}));
 
 // ─── Variables de entorno (se cargan desde Railway) ─────────────────
 const {
