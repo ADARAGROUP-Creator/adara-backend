@@ -6,6 +6,7 @@ import { loadVentasML } from './screens/ventas-ml.js?v=dev5';
 import { loadGastos } from './screens/gastos.js';
 import { loadConciliacion } from './screens/conciliacion.js';
 import { loadCompras } from './screens/compras.js';
+import { loadPSI } from './screens/psi.js';
 
 const screens = {
   home: { fn: loadHome, title: 'Home', sub: 'Resumen del estado actual' },
@@ -14,7 +15,8 @@ const screens = {
   ventas_ml: { fn: loadVentasML, title: 'Ventas ML', sub: 'Ventas de Mercado Libre y su cobro' },
   conciliacion: { fn: loadConciliacion, title: 'Conciliación', sub: 'Vincular movimientos con operaciones' },
   gastos: { fn: loadGastos, title: 'Gastos', sub: 'Gastos operativos' },
-  compras: { fn: loadCompras, title: 'Compras', sub: 'Facturas de mercadería y cuenta corriente' }
+  compras: { fn: loadCompras, title: 'Compras', sub: 'Facturas de mercadería y cuenta corriente' },
+  psi: { fn: loadPSI, title: 'PSI Recompra', sub: 'Planificación de recompra por SKU' }
 };
 
 async function route() {
