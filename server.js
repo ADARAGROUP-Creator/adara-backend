@@ -3324,6 +3324,182 @@ app.delete('/vincular/:id', async (req, res) => {
   }
 });
 
+// ── Devoluciones: resolución de bundles del Account Statement por op_id ───
+// Cada devolución del AS comparte un op_id (campo 2 de referencia_externa:
+// "fecha|op_id|monto|saldo") que es el ID de la LIQUIDACIÓN. Ese op_id NO es
+// necesariamente el mp_payment_id de la venta: suele ser un source_id distinto.
+// Resolución en capas (validada 212/213 contra datos reales; ver
+// ADARA-CANCELACIONES-DEVOLUCIONES.md §"Match en capas"):
+//   Capa 1: op_id == ventas_ml.mp_payment_id (o dentro de mp_payment_ids)
+//   Capa 2: op_id == retenciones.mp_source_id → COALESCE(retenciones.venta_id,
+//           ventas_ml por ml_order_id = retenciones.order_id)
+//   Capa 3: op_id < 12 dígitos → agregado ML (facturas vencidas, reintegros
+//           batcheados) → cola "Cargos ML" (no es devolución de venta)
+//   Capa 4: resto → cola "Revisión" (residual, típicamente venta 2025 pre-snapshot)
+// Match SIEMPRE por op_id, NUNCA por monto. vinculos.monto = abs(monto) (>0).
+const _r2    = (n) => Math.round(Number(n) * 100) / 100;
+const _chunk = (arr, n) => { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o; };
+const _opId  = (ref) => String(ref || '').split('|')[1] || '';
+
+app.get('/devoluciones/resolver', async (_req, res) => {
+  try {
+    // 1. Traer TODAS las líneas categoría 'devolucion' (paginado: cap silencioso de 1000)
+    let movs = [], off = 0; const PAGE = 1000;
+    while (true) {
+      const r = await sbGet('movimientos',
+        `categoria=eq.devolucion&order=id.asc&limit=${PAGE}&offset=${off}` +
+        `&select=id,fecha,monto,descripcion,categoria,referencia_externa`);
+      movs = movs.concat(r);
+      if (r.length < PAGE) break;
+      off += PAGE;
+    }
+
+    // 2. Agrupar por op_id
+    const bundles = new Map();
+    for (const m of movs) {
+      const op = _opId(m.referencia_externa);
+      if (!op) continue;
+      if (!bundles.has(op)) bundles.set(op, []);
+      bundles.get(op).push(m);
+    }
+    const opIds = [...bundles.keys()];
+
+    // 3. Líneas ya vinculadas a una venta (op_tipo=venta_ml)
+    const vincSet = new Set();
+    for (const ch of _chunk(movs.map(m => m.id), 200)) {
+      if (!ch.length) continue;
+      const vs = await sbGet('vinculos',
+        `op_tipo=eq.venta_ml&movimiento_id=in.(${ch.join(',')})&select=movimiento_id`);
+      vs.forEach(v => vincSet.add(v.movimiento_id));
+    }
+
+    // 4. CAPA 1 — op_id == ventas_ml.mp_payment_id
+    const ventaByOp = new Map();
+    for (const ch of _chunk(opIds, 100)) {
+      if (!ch.length) continue;
+      const vs = await sbGet('ventas_ml',
+        `mp_payment_id=in.(${ch.join(',')})` +
+        `&select=id,ml_order_id,mp_payment_id,fecha,por_cobrar,devuelta`);
+      vs.forEach(v => ventaByOp.set(String(v.mp_payment_id), { v, capa: 1 }));
+    }
+
+    // 5. CAPA 2 — puente por retenciones (mp_source_id) → venta_id u order_id
+    const pend = opIds.filter(op => !ventaByOp.has(op));
+    const retByOp = new Map();
+    for (const ch of _chunk(pend, 100)) {
+      if (!ch.length) continue;
+      const rs = await sbGet('retenciones',
+        `mp_source_id=in.(${ch.join(',')})&select=mp_source_id,venta_id,order_id`);
+      rs.forEach(r => {
+        const cur = retByOp.get(r.mp_source_id) || { venta_id: null, order_id: null };
+        if (!cur.venta_id && r.venta_id) cur.venta_id = r.venta_id;
+        if (!cur.order_id && r.order_id) cur.order_id = r.order_id;
+        retByOp.set(r.mp_source_id, cur);
+      });
+    }
+    // 5a. resolver venta por venta_id directo
+    const vIds = [...new Set([...retByOp.values()].map(x => x.venta_id).filter(Boolean))];
+    const ventaById = new Map();
+    for (const ch of _chunk(vIds, 100)) {
+      if (!ch.length) continue;
+      const vs = await sbGet('ventas_ml',
+        `id=in.(${ch.join(',')})&select=id,ml_order_id,mp_payment_id,fecha,por_cobrar,devuelta`);
+      vs.forEach(v => ventaById.set(v.id, v));
+    }
+    // 5b. resolver venta por order_id (cuando retenciones.venta_id es null)
+    const ords = [...new Set([...retByOp.values()].filter(x => !x.venta_id && x.order_id).map(x => String(x.order_id)))];
+    const ventaByOrder = new Map();
+    for (const ch of _chunk(ords, 100)) {
+      if (!ch.length) continue;
+      const vs = await sbGet('ventas_ml',
+        `ml_order_id=in.(${ch.join(',')})&select=id,ml_order_id,mp_payment_id,fecha,por_cobrar,devuelta`);
+      vs.forEach(v => ventaByOrder.set(String(v.ml_order_id), v));
+    }
+    for (const op of pend) {
+      const r = retByOp.get(op);
+      if (!r) continue;
+      let v = null;
+      if (r.venta_id && ventaById.has(r.venta_id)) v = ventaById.get(r.venta_id);
+      else if (r.order_id && ventaByOrder.has(String(r.order_id))) v = ventaByOrder.get(String(r.order_id));
+      if (v) ventaByOp.set(op, { v, capa: 2 });
+    }
+
+    // 6. Armar bundles clasificados
+    const out = [];
+    for (const [op, lineas] of bundles) {
+      const neto    = _r2(lineas.reduce((s, l) => s + Number(l.monto), 0));
+      const algVinc = lineas.some(l => vincSet.has(l.id));
+      const todVinc = lineas.every(l => vincSet.has(l.id));
+      const hit     = ventaByOp.get(op) || null;
+      let estado, capa;
+      if (hit)                 { capa = hit.capa; estado = todVinc ? 'vinculada' : (algVinc ? 'parcial' : 'pendiente'); }
+      else if (op.length < 12) { capa = 3; estado = 'agregado'; }
+      else                     { capa = 4; estado = 'revision'; }
+      out.push({
+        op_id: op, neto, capa, estado,
+        venta: hit ? {
+          id: hit.v.id, ml_order_id: hit.v.ml_order_id, mp_payment_id: hit.v.mp_payment_id,
+          fecha: hit.v.fecha, por_cobrar: hit.v.por_cobrar, devuelta: hit.v.devuelta
+        } : null,
+        lineas: lineas
+          .slice()
+          .sort((a, b) => String(a.fecha).localeCompare(String(b.fecha)))
+          .map(l => ({ id: l.id, fecha: l.fecha, monto: Number(l.monto), descripcion: l.descripcion, ya_vinculada: vincSet.has(l.id) }))
+      });
+    }
+    const ord = { pendiente: 0, parcial: 1, vinculada: 2, agregado: 3, revision: 4 };
+    out.sort((a, b) => (ord[a.estado] - ord[b.estado]) || (a.op_id < b.op_id ? -1 : 1));
+
+    const cnt = (e) => out.filter(b => b.estado === e).length;
+    res.json({
+      ok: true,
+      resumen: {
+        total: out.length, pendiente: cnt('pendiente'), parcial: cnt('parcial'),
+        vinculada: cnt('vinculada'), agregado: cnt('agregado'), revision: cnt('revision')
+      },
+      bundles: out
+    });
+  } catch (e) {
+    console.error('devoluciones/resolver:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Vincula TODAS las líneas de devolución de un bundle (op_id) a su venta.
+// Recibe { op_id, venta_id }. Recalcula montos desde movimientos (fuente de
+// verdad, precisión al centavo), inserta vínculos op_tipo='venta_ml' con
+// monto = abs(monto) vía upsert idempotente (reintentar no duplica), y marca la
+// venta devuelta SOLO si el neto del bundle < 0 (pérdida real de plata; neto 0 =
+// retención + re-crédito que se cancelan, no hubo devolución efectiva).
+app.post('/devoluciones/vincular', async (req, res) => {
+  try {
+    const { op_id, venta_id } = req.body || {};
+    if (!op_id || !venta_id) return res.status(400).json({ error: 'Faltan op_id o venta_id' });
+
+    const movs = await sbGet('movimientos',
+      `categoria=eq.devolucion&referencia_externa=like.*${op_id}*` +
+      `&select=id,monto,referencia_externa&limit=1000`);
+    const lineas = movs.filter(m => _opId(m.referencia_externa) === String(op_id));
+    if (!lineas.length) return res.status(404).json({ error: 'Sin líneas de devolución para ese op_id' });
+
+    const vinculos = lineas
+      .map(l => ({ movimiento_id: l.id, op_tipo: 'venta_ml', op_id: venta_id, monto: _r2(Math.abs(Number(l.monto))) }))
+      .filter(v => v.monto > 0);
+    if (vinculos.length) await sbUpsert('vinculos', vinculos, 'movimiento_id,op_tipo,op_id');
+
+    const neto = _r2(lineas.reduce((s, l) => s + Number(l.monto), 0));
+    let marcada = false;
+    if (neto < 0) {
+      await sbPatch('ventas_ml', `id=eq.${venta_id}`, { devuelta: true, monto_reembolso: Math.abs(neto) });
+      marcada = true;
+    }
+    res.json({ ok: true, vinculados: vinculos.length, neto, marcada_devuelta: marcada });
+  } catch (e) {
+    console.error('devoluciones/vincular:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Conciliación: transferencia interna entre cuentas propias (CB8) ──────
 // Empareja dos movimientos (salida en una cuenta, entrada en otra) con vínculos
 // cruzados op_tipo='transferencia' (op_id = el OTRO movimiento). Cada lado
