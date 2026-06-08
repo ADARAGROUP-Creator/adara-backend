@@ -8,6 +8,7 @@ import { loadConciliacion } from './screens/conciliacion.js';
 import { loadCompras } from './screens/compras.js';
 import { loadPSI } from './screens/psi.js';
 import { loadCosteo } from './screens/costeo.js';
+import { loadResultado } from './screens/resultado.js';
 
 const screens = {
   home: { fn: loadHome, title: 'Home', sub: 'Resumen del estado actual' },
@@ -18,7 +19,8 @@ const screens = {
   gastos: { fn: loadGastos, title: 'Gastos', sub: 'Gastos operativos' },
   compras: { fn: loadCompras, title: 'Compras', sub: 'Facturas de mercadería y cuenta corriente' },
   psi: { fn: loadPSI, title: 'PSI Recompra', sub: 'Planificación de recompra por SKU' },
-  costeo: { fn: loadCosteo, title: 'Costeo', sub: 'CMV, valorización y margen bruto' }
+  costeo: { fn: loadCosteo, title: 'Inventario', sub: 'Valor del stock y productos sin costo' },
+  resultado: { fn: loadResultado, title: 'Resultado', sub: 'Estado de resultado mensual por línea' }
 };
 
 async function route() {
