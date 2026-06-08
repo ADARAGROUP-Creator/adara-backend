@@ -7,6 +7,7 @@ import { loadGastos } from './screens/gastos.js';
 import { loadConciliacion } from './screens/conciliacion.js';
 import { loadCompras } from './screens/compras.js';
 import { loadPSI } from './screens/psi.js';
+import { loadCosteo } from './screens/costeo.js';
 
 const screens = {
   home: { fn: loadHome, title: 'Home', sub: 'Resumen del estado actual' },
@@ -16,7 +17,8 @@ const screens = {
   conciliacion: { fn: loadConciliacion, title: 'Conciliación', sub: 'Vincular movimientos con operaciones' },
   gastos: { fn: loadGastos, title: 'Gastos', sub: 'Gastos operativos' },
   compras: { fn: loadCompras, title: 'Compras', sub: 'Facturas de mercadería y cuenta corriente' },
-  psi: { fn: loadPSI, title: 'PSI Recompra', sub: 'Planificación de recompra por SKU' }
+  psi: { fn: loadPSI, title: 'PSI Recompra', sub: 'Planificación de recompra por SKU' },
+  costeo: { fn: loadCosteo, title: 'Costeo', sub: 'CMV, valorización y margen bruto' }
 };
 
 async function route() {
