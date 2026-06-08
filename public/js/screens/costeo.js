@@ -73,16 +73,68 @@ function render(val, cmv, margenItems, sinCosto) {
         La valorización y el CMV de esas familias quedan subestimados hasta cargar esos costos en SKUs.</div>`
     : '';
 
-  // Tabla valorización
-  const valBody = val.length
-    ? val.map(r => `<tr>
-        <td>${esc(r.familia)}</td>
-        <td>${esc(r.deposito ?? '—')}</td>
-        <td class="num">${fmtNum(r.unidades)}</td>
-        <td class="num">${fmtMoney(r.valorizado)}</td>
-        <td class="num">${num(r.unidades_sin_costo) > 0 ? fmtNum(r.unidades_sin_costo) : '—'}</td>
-      </tr>`).join('')
-    : `<tr><td colspan="5" class="empty">Sin stock.</td></tr>`;
+  // ── Tabla valorización ──────────────────────────────────────────────────
+  // Las familias con más de un depósito (hoy sólo electrónica) se muestran como
+  // una fila madre desplegable; al hacer clic se abren los depósitos hijos.
+  // Las familias con un único depósito quedan como fila plana.
+  const DEPO_NOMBRE = {
+    DEP:  'Depósito',
+    DJ:   'Dep José Cramer',
+    MENV: 'Mercado Envíos - Colecta',
+    MFUL: 'Mercado Libre Full',
+  };
+  const depoNombre = c => DEPO_NOMBRE[c] || c || '—';
+  const udsCostoCell = n => num(n) > 0 ? fmtNum(n) : '—';
+
+  // Agrupar las filas de la vista por familia
+  const famMap = {};
+  for (const r of val) (famMap[r.familia || '—'] ||= []).push(r);
+
+  // Totales por familia + orden por valorizado desc (igual que antes)
+  const famOrden = Object.entries(famMap).map(([familia, rows]) => ({
+    familia, rows,
+    uds:  rows.reduce((s, r) => s + num(r.unidades), 0),
+    valz: rows.reduce((s, r) => s + num(r.valorizado), 0),
+    sc:   rows.reduce((s, r) => s + num(r.unidades_sin_costo), 0),
+  })).sort((a, b) => b.valz - a.valz);
+
+  let valBody = '';
+  if (!famOrden.length) {
+    valBody = `<tr><td colspan="5" class="empty">Sin stock.</td></tr>`;
+  } else {
+    for (const g of famOrden) {
+      if (g.rows.length > 1) {
+        const fam = esc(g.familia);
+        // Fila madre (desplegable)
+        valBody += `<tr class="val-parent" data-fam="${fam}" style="cursor:pointer">
+          <td><span class="chev" style="display:inline-block;width:1em;color:#888">▸</span>${esc(g.familia)}</td>
+          <td style="color:#888">${g.rows.length} depósitos</td>
+          <td class="num">${fmtNum(g.uds)}</td>
+          <td class="num">${fmtMoney(g.valz)}</td>
+          <td class="num">${udsCostoCell(g.sc)}</td>
+        </tr>`;
+        // Hijos (ocultos hasta desplegar), ordenados por valorizado desc
+        for (const r of g.rows.slice().sort((a, b) => num(b.valorizado) - num(a.valorizado))) {
+          valBody += `<tr class="val-child" data-fam="${fam}" style="display:none">
+            <td></td>
+            <td style="padding-left:1.6em">${esc(depoNombre(r.deposito))}</td>
+            <td class="num">${fmtNum(r.unidades)}</td>
+            <td class="num">${fmtMoney(r.valorizado)}</td>
+            <td class="num">${udsCostoCell(r.unidades_sin_costo)}</td>
+          </tr>`;
+        }
+      } else {
+        const r = g.rows[0];
+        valBody += `<tr>
+          <td>${esc(g.familia)}</td>
+          <td>${esc(depoNombre(r.deposito))}</td>
+          <td class="num">${fmtNum(r.unidades)}</td>
+          <td class="num">${fmtMoney(r.valorizado)}</td>
+          <td class="num">${udsCostoCell(r.unidades_sin_costo)}</td>
+        </tr>`;
+      }
+    }
+  }
 
   // Tabla CMV mensual
   const cmvBody = cmv.length
@@ -181,4 +233,16 @@ function render(val, cmv, margenItems, sinCosto) {
   `;
 
   document.getElementById('cost-reload').addEventListener('click', loadCosteo);
+
+  // Despliegue/colapso de la valorización por familia
+  root.querySelectorAll('.val-parent').forEach(tr => {
+    tr.addEventListener('click', () => {
+      const fam = tr.getAttribute('data-fam');
+      const abrir = tr.classList.toggle('open');
+      root.querySelectorAll(`.val-child[data-fam="${fam}"]`)
+        .forEach(c => { c.style.display = abrir ? '' : 'none'; });
+      const chev = tr.querySelector('.chev');
+      if (chev) chev.textContent = abrir ? '▾' : '▸';
+    });
+  });
 }
