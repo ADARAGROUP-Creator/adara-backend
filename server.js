@@ -69,6 +69,8 @@ const sbUpsert = (t, body, onConflict) => {
   return sb('POST', t, body, q);
 };
 const sbPatch  = (t, q, b) => sb('PATCH', t, b, q);
+// Llamada a funciones RPC (Postgres) vía PostgREST: POST /rest/v1/rpc/<fn> con los params en el body.
+const sbRpc    = (fn, params) => sb('POST', `rpc/${fn}`, params);
 
 // ─── Token Mercado Libre (se persiste en Supabase) ──────────────────
 let ML = { access: null, refresh: null, expires: 0 };
@@ -850,7 +852,32 @@ app.post('/ml/sync', async (req, res) => {
     // Ingesta de retenciones IIBB en segundo plano (no bloquea; idempotente; throttle 6h)
     kickRetenciones();
 
-    res.json({ ok: true, ...result });
+    // ── Costeo (capa CMV): proyectar ventas ML → circuito costeado y consumir FIFO ──
+    // Tras el sync, las ventas nuevas de `ventas_ml` se proyectan a `ventas`/`venta_items`
+    // (fn_proyectar_ml, idempotente por (canal,referencia_externa)) y consumen lotes por
+    // FIFO (fn_consumir_fifo, idempotente por unidades ya consumidas). Orden obligatorio:
+    // proyectar → consumir (el FIFO necesita los venta_items). El FIFO solo consume ventas
+    // con fecha >= fecha_alta del lote (seed), así que las ventas previas al seed quedan sin
+    // CMV (CF3/CF4). No bloquea el sync: si el costeo falla, se loguea y se sigue.
+    // Ver ADARA-COSTEO-FIFO.md.
+    let costeo = null;
+    try {
+      const efDesde = desde || new Date(Date.now() - (parseInt(dias) || 7) * 86400000).toISOString().split('T')[0];
+      const efHasta = hasta || new Date().toISOString().split('T')[0];
+      const proyectadas = await sbRpc('fn_proyectar_ml',  { p_desde: efDesde, p_hasta: efHasta });
+      const fifo        = await sbRpc('fn_consumir_fifo', { p_desde: efDesde, p_hasta: efHasta });
+      costeo = {
+        desde: efDesde, hasta: efHasta,
+        ventas_proyectadas: proyectadas,
+        fifo: Array.isArray(fifo) ? fifo[0] : fifo
+      };
+      console.log(`  → Costeo ${efDesde}…${efHasta}: ${proyectadas} ventas proyectadas; FIFO ${JSON.stringify(costeo.fifo)}`);
+    } catch (e) {
+      console.warn('  → Costeo (proyección/FIFO) falló (no bloquea el sync):', e.message);
+      costeo = { error: e.message };
+    }
+
+    res.json({ ok: true, ...result, costeo });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
