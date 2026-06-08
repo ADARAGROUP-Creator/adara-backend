@@ -1,35 +1,28 @@
 import { sbGet } from '../core/sb.js';
 
-// ── Pantalla: Costeo — CMV, Valorización y Margen ──────────────────────────
-// Explota las 4 vistas del circuito de costeo FIFO (8/6/2026):
+// ── Pantalla: Inventario — Valorización de stock (hash #costeo) ─────────────
+// Foto del stock valuado a costo + productos sin costo cargado. Lee:
 //  - v_valorizacion_stock : inventario a costo por familia × depósito.
-//  - v_cmv_mensual        : COGS devengado por período × familia (consumo + reverso).
-//  - v_margen_ventas      : margen bruto por ítem (ingreso_neto − cmv), flag `costeada`.
-//  - v_skus_sin_costo     : SKUs con stock y costo $0 (drill-down del KPI).
-//
-// Notas de lectura (ver ADARA-COSTEO-FIFO.md / ADARA-PNL.md):
-//  - El FIFO costea de 8/6 en adelante: el CMV/margen histórico NO está (capa 6).
-//  - El margen es BRUTO (ingreso neto s/IVA − CMV). NO descuenta comisión ML, IIBB ni envío.
-//  - `unidades_sin_costo` marca el stock con costo $0 todavía sin cargar.
+//  - v_skus_sin_costo     : SKUs con stock y costo $0 (subestiman valorización/CMV).
+// El CMV mensual y el margen viven ahora en la pantalla Resultado.
 //
 // La pantalla inyecta su propio <style> scopeado con prefijo `.cost`
-// (las clases `.num`/`.psi-aviso` que usaba la versión anterior no existen en base.css).
+// (las clases `.num`/`.psi-aviso` que usaba la versión vieja no existen en base.css).
 
 function num(v) { return Number(v) || 0; }
 function fmtNum(n, dec = 0) {
   return num(n).toLocaleString('es-AR', { minimumFractionDigits: dec, maximumFractionDigits: dec });
 }
 function fmtMoney(n) { return '$ ' + fmtNum(n, 2); }
-function fmtPct(n) { return fmtNum(n, 1) + '%'; }
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
 
 // Tipo de cambio USD→ARS. HARDCODE temporal — a futuro se trae del BCRA.
 // Cambiar este único valor hasta tener la integración con el Banco Central.
 const TC_USD = 1465;
 function fmtUsd(ars) { return 'US$ ' + fmtNum(num(ars) / TC_USD, 2); }
-function esc(s) {
-  return String(s ?? '').replace(/[&<>"']/g, c =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
 
 // ── Nombres legibles ───────────────────────────────────────────────────────
 const FAM_NOMBRE = {
@@ -59,23 +52,19 @@ function depositosNombre(str) {
 
 const dash = '<span class="dash">—</span>';
 const udsCell = n => num(n) > 0 ? fmtNum(n) : dash;
-const moneyCell = n => num(n) !== 0 ? fmtMoney(n) : dash;
 
 // ── Carga ──────────────────────────────────────────────────────────────────
 export async function loadCosteo() {
   const root = document.getElementById('app-screens');
-  root.innerHTML = `<div class="loading">Cargando costeo…</div>`;
-
+  root.innerHTML = `<div class="loading">Cargando inventario…</div>`;
   try {
-    const [val, cmv, margenItems, sinCosto] = await Promise.all([
+    const [val, sinCosto] = await Promise.all([
       sbGet('v_valorizacion_stock', 'select=*&order=valorizado.desc.nullslast'),
-      sbGet('v_cmv_mensual', 'select=*&order=periodo.asc,familia.asc'),
-      sbGet('v_margen_ventas', 'select=periodo,familia,ingreso_neto,cmv,margen_bruto&costeada=eq.true'),
       sbGet('v_skus_sin_costo', 'select=*&order=unidades.desc')
     ]);
-    render(val, cmv, margenItems, sinCosto);
+    render(val, sinCosto);
   } catch (e) {
-    root.innerHTML = `<div class="error"><strong>Error al cargar Costeo.</strong><br>${esc(e.message)}</div>`;
+    root.innerHTML = `<div class="error"><strong>Error al cargar Inventario.</strong><br>${esc(e.message)}</div>`;
   }
 }
 
@@ -83,7 +72,6 @@ export async function loadCosteo() {
 const STYLE = `
 <style>
 .cost .cost-h{margin:28px 0 10px;font-size:15px;font-weight:600;color:var(--text)}
-.cost .cost-h:first-child{margin-top:4px}
 
 .cost .cost-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin:14px 0 6px}
 .cost .cost-kpi{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:16px 18px;min-width:0}
@@ -105,7 +93,6 @@ const STYLE = `
 .cost .muted{color:var(--text-muted)}
 .cost .dash{color:var(--text-soft)}
 .cost .code{font-family:'JetBrains Mono','SF Mono',Menlo,monospace;font-size:13px;font-weight:500}
-.cost .per{font-variant-numeric:tabular-nums;color:var(--text-muted)}
 
 .cost tr.grp{cursor:pointer}
 .cost tr.grp td{font-weight:600}
@@ -125,33 +112,15 @@ const STYLE = `
 </style>`;
 
 // ── Render ───────────────────────────────────────────────────────────────
-function render(val, cmv, margenItems, sinCosto) {
+function render(val, sinCosto) {
   const root = document.getElementById('app-screens');
 
-  // KPIs
   const valorizadoTotal = val.reduce((s, r) => s + num(r.valorizado), 0);
   const udsSinCosto = val.reduce((s, r) => s + num(r.unidades_sin_costo), 0);
 
-  // Margen agregado por período × familia (sobre ítems costeados)
-  const mg = {};
-  for (const r of margenItems) {
-    const k = (r.periodo || '—') + '|' + (r.familia || '—');
-    if (!mg[k]) mg[k] = { periodo: r.periodo || '—', familia: r.familia || '—', ingreso: 0, cmv: 0, margen: 0 };
-    mg[k].ingreso += num(r.ingreso_neto);
-    mg[k].cmv += num(r.cmv);
-    mg[k].margen += num(r.margen_bruto);
-  }
-  const margenRows = Object.values(mg).sort((a, b) =>
-    (a.periodo).localeCompare(b.periodo) || (a.familia).localeCompare(b.familia));
-
-  const ingresoCost = margenRows.reduce((s, r) => s + r.ingreso, 0);
-  const cmvCost = margenRows.reduce((s, r) => s + r.cmv, 0);
-  const margenCost = margenRows.reduce((s, r) => s + r.margen, 0);
-  const pctMargen = ingresoCost > 0 ? (margenCost / ingresoCost * 100) : 0;
-
   const aviso = udsSinCosto > 0
     ? `<div class="cost-aviso"><span class="ic">⚠</span><div><b>${fmtNum(udsSinCosto)} unidades sin costo cargado.</b>
-        La valorización y el CMV de esas familias quedan subestimados hasta cargar esos costos en los SKUs.</div></div>`
+        La valorización queda subestimada hasta cargar esos costos en los SKUs.</div></div>`
     : '';
 
   // ── Valorización (familia agrupada, electrónica desplegable, + total) ─────
@@ -230,50 +199,6 @@ function render(val, cmv, margenItems, sinCosto) {
     scBody = `<tr><td colspan="5" class="empty">Todos los SKUs con stock tienen costo cargado ✓</td></tr>`;
   }
 
-  // ── CMV mensual ───────────────────────────────────────────────────────────
-  let cmvBody;
-  if (cmv.length) {
-    const t = cmv.reduce((a, r) => ({
-      un: a.un + num(r.unidades_netas), co: a.co + num(r.cmv_consumo),
-      re: a.re + num(r.cmv_reverso), ne: a.ne + num(r.cmv_neto),
-    }), { un: 0, co: 0, re: 0, ne: 0 });
-    cmvBody = cmv.map(r => `<tr>
-        <td class="per">${esc(r.periodo)}</td>
-        <td>${esc(famNombre(r.familia))}</td>
-        <td class="r">${fmtNum(r.unidades_netas)}</td>
-        <td class="r">${fmtMoney(r.cmv_consumo)}</td>
-        <td class="r">${moneyCell(r.cmv_reverso)}</td>
-        <td class="r"><strong>${fmtMoney(r.cmv_neto)}</strong></td>
-      </tr>`).join('')
-      + `<tr class="tot"><td class="lbl" colspan="2">Total</td>
-          <td class="r">${fmtNum(t.un)}</td>
-          <td class="r">${fmtMoney(t.co)}</td>
-          <td class="r">${moneyCell(t.re)}</td>
-          <td class="r">${fmtMoney(t.ne)}</td></tr>`;
-  } else {
-    cmvBody = `<tr><td colspan="6" class="empty">Sin CMV devengado todavía.</td></tr>`;
-  }
-
-  // ── Margen bruto ──────────────────────────────────────────────────────────
-  let mgBody;
-  if (margenRows.length) {
-    mgBody = margenRows.map(r => `<tr>
-        <td class="per">${esc(r.periodo)}</td>
-        <td>${esc(famNombre(r.familia))}</td>
-        <td class="r">${fmtMoney(r.ingreso)}</td>
-        <td class="r">${fmtMoney(r.cmv)}</td>
-        <td class="r"><strong>${fmtMoney(r.margen)}</strong></td>
-        <td class="r">${r.ingreso > 0 ? fmtPct(r.margen / r.ingreso * 100) : dash}</td>
-      </tr>`).join('')
-      + `<tr class="tot"><td class="lbl" colspan="2">Total</td>
-          <td class="r">${fmtMoney(ingresoCost)}</td>
-          <td class="r">${fmtMoney(cmvCost)}</td>
-          <td class="r">${fmtMoney(margenCost)}</td>
-          <td class="r">${ingresoCost > 0 ? fmtPct(pctMargen) : dash}</td></tr>`;
-  } else {
-    mgBody = `<tr><td colspan="6" class="empty">Todavía no hay ventas costeadas (FIFO arranca 8/6).</td></tr>`;
-  }
-
   // ── Ensamblado ────────────────────────────────────────────────────────────
   root.innerHTML = `${STYLE}
   <div class="cost">
@@ -286,10 +211,6 @@ function render(val, cmv, margenItems, sinCosto) {
     <div class="cost-kpis">
       <div class="cost-kpi acc"><div class="l">Valorización stock</div><div class="v">${fmtMoney(valorizadoTotal)}</div><div class="s">${fmtUsd(valorizadoTotal)} · TC $${fmtNum(TC_USD)}</div></div>
       <div class="cost-kpi"><div class="l">Uds sin costo</div><div class="v">${fmtNum(udsSinCosto)}</div></div>
-      <div class="cost-kpi"><div class="l">Ingreso costeado</div><div class="v">${fmtMoney(ingresoCost)}</div></div>
-      <div class="cost-kpi"><div class="l">CMV costeado</div><div class="v">${fmtMoney(cmvCost)}</div></div>
-      <div class="cost-kpi"><div class="l">Margen bruto</div><div class="v">${fmtMoney(margenCost)}</div></div>
-      <div class="cost-kpi"><div class="l">% Margen</div><div class="v">${fmtPct(pctMargen)}</div></div>
     </div>
 
     <h3 class="cost-h">Valorización de stock</h3>
@@ -309,36 +230,15 @@ function render(val, cmv, margenItems, sinCosto) {
       <tbody>${scBody}</tbody>
     </table></div>
 
-    <h3 class="cost-h">CMV mensual (devengado)</h3>
-    <div class="tbl"><table>
-      <thead><tr>
-        <th>Período</th><th>Familia</th>
-        <th class="r">Uds netas</th><th class="r">CMV consumo</th>
-        <th class="r">CMV reverso</th><th class="r">CMV neto</th>
-      </tr></thead>
-      <tbody>${cmvBody}</tbody>
-    </table></div>
-
-    <h3 class="cost-h">Margen bruto (sólo ventas costeadas)</h3>
-    <div class="tbl"><table>
-      <thead><tr>
-        <th>Período</th><th>Familia</th>
-        <th class="r">Ingreso neto</th><th class="r">CMV</th>
-        <th class="r">Margen bruto</th><th class="r">%</th>
-      </tr></thead>
-      <tbody>${mgBody}</tbody>
-    </table></div>
-
     <div class="cost-note">
-      Margen <b>bruto</b>: ingreso neto s/IVA − CMV. No descuenta comisión ML, IIBB ni envío
-      (eso es contribución/margen neto, pendiente del P&amp;L). Las ventas anteriores al 8/6 todavía
-      no tienen CMV (se incorporan con el costeo histórico de Tango).
+      <b>Valorización a costo.</b> Es cuánto vale tu stock a hoy, valuado al costo de los lotes (no al precio de venta).
+      Los SKUs sin costo cargado figuran en $0 y por eso subestiman el total. El CMV mensual y el margen se
+      muestran en la pantalla <b>Resultado</b>.
     </div>
   </div>`;
 
   document.getElementById('cost-reload').addEventListener('click', loadCosteo);
 
-  // Despliegue/colapso de la valorización por familia
   root.querySelectorAll('.cost tr.grp').forEach(tr => {
     tr.addEventListener('click', () => {
       const fam = tr.getAttribute('data-fam');
