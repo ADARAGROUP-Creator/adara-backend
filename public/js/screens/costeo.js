@@ -21,6 +21,11 @@ function fmtNum(n, dec = 0) {
 }
 function fmtMoney(n) { return '$ ' + fmtNum(n, 2); }
 function fmtPct(n) { return fmtNum(n, 1) + '%'; }
+
+// Tipo de cambio USD→ARS. HARDCODE temporal — a futuro se trae del BCRA.
+// Cambiar este único valor hasta tener la integración con el Banco Central.
+const TC_USD = 1465;
+function fmtUsd(ars) { return 'US$ ' + fmtNum(num(ars) / TC_USD, 2); }
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -85,6 +90,7 @@ const STYLE = `
 .cost .cost-kpi .l{font-size:11.5px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px}
 .cost .cost-kpi .v{font-weight:700;font-size:22px;line-height:1.15;color:var(--text);letter-spacing:-0.02em;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .cost .cost-kpi.acc .v{color:var(--acc)}
+.cost .cost-kpi .s{font-size:12px;color:var(--text-muted);font-weight:500;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
 .cost .cost-aviso{display:flex;gap:9px;align-items:flex-start;background:var(--acc-bg);border:1px solid #F3D6A3;color:var(--acc-dark);border-radius:var(--r);padding:12px 14px;font-size:13.5px;line-height:1.5;margin:0 0 4px}
 .cost .cost-aviso .ic{flex-shrink:0;font-size:15px;line-height:1.3}
@@ -164,7 +170,7 @@ function render(val, cmv, margenItems, sinCosto) {
 
   let valBody = '';
   if (!famOrden.length) {
-    valBody = `<tr><td colspan="5" class="empty">Sin stock.</td></tr>`;
+    valBody = `<tr><td colspan="6" class="empty">Sin stock.</td></tr>`;
   } else {
     for (const g of famOrden) {
       if (g.rows.length > 1) {
@@ -174,6 +180,7 @@ function render(val, cmv, margenItems, sinCosto) {
           <td class="muted">${g.rows.length} depósitos</td>
           <td class="r">${fmtNum(g.uds)}</td>
           <td class="r">${fmtMoney(g.valz)}</td>
+          <td class="r">${fmtUsd(g.valz)}</td>
           <td class="r">${udsCell(g.sc)}</td>
         </tr>`;
         for (const r of g.rows.slice().sort((a, b) => num(b.valorizado) - num(a.valorizado))) {
@@ -182,6 +189,7 @@ function render(val, cmv, margenItems, sinCosto) {
             <td class="dep">${esc(depoNombre(r.deposito))}</td>
             <td class="r">${fmtNum(r.unidades)}</td>
             <td class="r">${fmtMoney(r.valorizado)}</td>
+            <td class="r">${fmtUsd(r.valorizado)}</td>
             <td class="r">${udsCell(r.unidades_sin_costo)}</td>
           </tr>`;
         }
@@ -192,6 +200,7 @@ function render(val, cmv, margenItems, sinCosto) {
           <td>${esc(depoNombre(r.deposito))}</td>
           <td class="r">${fmtNum(r.unidades)}</td>
           <td class="r">${fmtMoney(r.valorizado)}</td>
+          <td class="r">${fmtUsd(r.valorizado)}</td>
           <td class="r">${udsCell(r.unidades_sin_costo)}</td>
         </tr>`;
       }
@@ -200,6 +209,7 @@ function render(val, cmv, margenItems, sinCosto) {
       <td class="lbl" colspan="2">Total</td>
       <td class="r">${fmtNum(totUds)}</td>
       <td class="r">${fmtMoney(totValz)}</td>
+      <td class="r">${fmtUsd(totValz)}</td>
       <td class="r">${udsCell(totSc)}</td>
     </tr>`;
   }
@@ -274,7 +284,7 @@ function render(val, cmv, margenItems, sinCosto) {
     ${aviso}
 
     <div class="cost-kpis">
-      <div class="cost-kpi acc"><div class="l">Valorización stock</div><div class="v">${fmtMoney(valorizadoTotal)}</div></div>
+      <div class="cost-kpi acc"><div class="l">Valorización stock</div><div class="v">${fmtMoney(valorizadoTotal)}</div><div class="s">${fmtUsd(valorizadoTotal)} · TC $${fmtNum(TC_USD)}</div></div>
       <div class="cost-kpi"><div class="l">Uds sin costo</div><div class="v">${fmtNum(udsSinCosto)}</div></div>
       <div class="cost-kpi"><div class="l">Ingreso costeado</div><div class="v">${fmtMoney(ingresoCost)}</div></div>
       <div class="cost-kpi"><div class="l">CMV costeado</div><div class="v">${fmtMoney(cmvCost)}</div></div>
@@ -286,7 +296,7 @@ function render(val, cmv, margenItems, sinCosto) {
     <div class="tbl"><table>
       <thead><tr>
         <th>Familia</th><th>Depósito</th>
-        <th class="r">Unidades</th><th class="r">Valorizado</th><th class="r">Uds s/costo</th>
+        <th class="r">Unidades</th><th class="r">Valorizado</th><th class="r">Valorizado USD</th><th class="r">Uds s/costo</th>
       </tr></thead>
       <tbody>${valBody}</tbody>
     </table></div>
