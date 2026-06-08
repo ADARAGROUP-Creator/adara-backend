@@ -1068,8 +1068,9 @@ app.get('/ml/devoluciones', async (req, res) => {
 
 // ── Recepción de producto devuelto / cancelado ───────────────────────
 // Registra condición del producto al llegar al depósito.
-// condicion = 'ok'           → +1 stock en catalogo_skus + aprobada = true
-// condicion = 'no_disponible' → sin stock, nota obligatoria, aprobada = true
+// condicion = 'ok'           → reverso FIFO: devuelve unidades al lote original
+//                              (consumo_lote.reverso_devolucion) + revierte CMV + aprobada=true
+// condicion = 'no_disponible' → sin reverso → la unidad es pérdida (P3), nota obligatoria
 // En ambos casos: inserta en stock_devoluciones + actualiza ventas_ml
 app.post('/ml/recepcion', async (req, res) => {
   try {
@@ -1079,7 +1080,7 @@ app.post('/ml/recepcion', async (req, res) => {
     if (condicion === 'no_disponible' && !nota?.trim()) return res.status(400).json({ error: 'Nota obligatoria para producto no disponible' });
 
     // Traer venta
-    const ventas = await sbGet('ventas_ml', `id=eq.${venta_id}&select=id,sku,titulo,periodo,claim_status,recepcion_condicion&limit=1`);
+    const ventas = await sbGet('ventas_ml', `id=eq.${venta_id}&select=id,sku,titulo,periodo,claim_status,recepcion_condicion,ml_order_id&limit=1`);
     if (!ventas?.length) return res.status(404).json({ error: 'Venta no encontrada' });
     const venta = ventas[0];
 
@@ -1106,22 +1107,29 @@ app.post('/ml/recepcion', async (req, res) => {
       periodo: venta.periodo || null,
     }]);
 
-    // 3. Si ok → sumar +1 stock en catalogo_skus
-    let stockActualizado = false;
-    if (condicion === 'ok' && venta.sku) {
+    // 3. Si ok → revertir el consumo FIFO: devuelve las unidades al lote original
+    //    (consumo_lote.reverso_devolucion) con el costo snapshot, y revierte el CMV.
+    //    Reemplaza el viejo +1 a `catalogo_skus` (modelo v21 muerto). Solo afecta
+    //    ventas que ya consumieron stock (fecha >= seed); idempotente por neto.
+    //    Si 'no_disponible' no hay reverso → la unidad es pérdida (P3).
+    //    El reverso se fecha en `hoy` (= recepcion_fecha); la plata se imputa
+    //    aparte al mes del movimiento MP (O10). Ver ADARA-COSTEO-FIFO.md Fase 3.
+    let reversoStock = null, stockActualizado = false;
+    if (condicion === 'ok' && venta.ml_order_id) {
       try {
-        const skus = await sbGet('catalogo_skus', `sku=eq.${encodeURIComponent(venta.sku)}&select=id,stock&limit=1`);
-        if (skus?.length) {
-          const nuevoStock = (skus[0].stock || 0) + 1;
-          await sbPatch('catalogo_skus', `id=eq.${skus[0].id}`, { stock: nuevoStock });
-          stockActualizado = true;
+        const rev = await sbRpc('fn_revertir_devolucion', { p_ml_order_id: venta.ml_order_id, p_fecha: hoy });
+        reversoStock = Array.isArray(rev) ? rev[0] : rev;
+        stockActualizado = (reversoStock?.reversos_creados || 0) > 0;
+        if (stockActualizado) {
+          console.log(`  → Reverso FIFO devolución order ${venta.ml_order_id}: +${reversoStock.unidades_devueltas}u al lote original`);
         }
       } catch (e) {
-        console.warn('Stock update error:', e.message);
+        console.warn('  → Reverso FIFO falló (no bloquea la recepción):', e.message);
+        reversoStock = { error: e.message };
       }
     }
 
-    res.json({ ok: true, claim_status: nuevoClaimStatus, stock_actualizado: stockActualizado });
+    res.json({ ok: true, claim_status: nuevoClaimStatus, stock_actualizado: stockActualizado, reverso_stock: reversoStock });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
