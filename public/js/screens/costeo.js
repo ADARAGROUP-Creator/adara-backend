@@ -30,20 +30,21 @@ export async function loadCosteo() {
   root.innerHTML = `<div class="loading">Cargando costeo…</div>`;
 
   try {
-    const [val, cmv, margenItems] = await Promise.all([
+    const [val, cmv, margenItems, sinCosto] = await Promise.all([
       sbGet('v_valorizacion_stock', 'select=*&order=valorizado.desc.nullslast'),
       sbGet('v_cmv_mensual', 'select=*&order=periodo.asc,familia.asc'),
       // sólo ítems costeados (margen real); evita arrastrar las ~14k ventas históricas sin CMV
-      sbGet('v_margen_ventas', 'select=periodo,familia,ingreso_neto,cmv,margen_bruto&costeada=eq.true')
+      sbGet('v_margen_ventas', 'select=periodo,familia,ingreso_neto,cmv,margen_bruto&costeada=eq.true'),
+      sbGet('v_skus_sin_costo', 'select=*&order=unidades.desc')
     ]);
-    render(val, cmv, margenItems);
+    render(val, cmv, margenItems, sinCosto);
   } catch (e) {
     root.innerHTML = `<div class="error"><strong>Error al cargar Costeo.</strong><br>${esc(e.message)}</div>`;
   }
 }
 
 // ── Render ───────────────────────────────────────────────────────────────
-function render(val, cmv, margenItems) {
+function render(val, cmv, margenItems, sinCosto) {
   const root = document.getElementById('app-screens');
 
   // KPIs
@@ -95,6 +96,17 @@ function render(val, cmv, margenItems) {
       </tr>`).join('')
     : `<tr><td colspan="6" class="empty">Sin CMV devengado todavía.</td></tr>`;
 
+  // Tabla SKUs sin costo (drill-down del KPI "uds sin costo")
+  const scBody = (sinCosto && sinCosto.length)
+    ? sinCosto.map(r => `<tr>
+        <td>${esc(r.codigo)}</td>
+        <td>${esc(r.descripcion)}</td>
+        <td>${esc(r.familia)}</td>
+        <td>${esc(r.depositos ?? '—')}</td>
+        <td class="num">${fmtNum(r.unidades)}</td>
+      </tr>`).join('')
+    : `<tr><td colspan="5" class="empty">Todos los SKUs con stock tienen costo cargado. ✓</td></tr>`;
+
   // Tabla margen
   const mgBody = margenRows.length
     ? margenRows.map(r => `<tr>
@@ -131,6 +143,14 @@ function render(val, cmv, margenItems) {
         <th class="num">Unidades</th><th class="num">Valorizado</th><th class="num">Uds s/costo</th>
       </tr></thead>
       <tbody>${valBody}</tbody>
+    </table></div>
+
+    <h3 style="margin:22px 0 8px 0;font-size:15px;font-weight:600">SKUs sin costo cargado${(sinCosto && sinCosto.length) ? ` (${sinCosto.length})` : ''}</h3>
+    <div class="table-wrap"><table class="t">
+      <thead><tr>
+        <th>Código</th><th>Producto</th><th>Familia</th><th>Depósito(s)</th><th class="num">Unidades</th>
+      </tr></thead>
+      <tbody>${scBody}</tbody>
     </table></div>
 
     <h3 style="margin:22px 0 8px 0;font-size:15px;font-weight:600">CMV mensual (devengado)</h3>
