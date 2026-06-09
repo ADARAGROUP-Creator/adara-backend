@@ -3661,16 +3661,33 @@ app.post('/compras', async (req, res) => {
       }
     }
 
+    // Moneda de la factura. USD requiere TC; el costo del lote se congela en ARS al TC del día.
+    const moneda = compra.moneda === 'USD' ? 'USD' : 'ARS';
+    const tc = round2(compra.tc_blue);
+    if (moneda === 'USD' && !(tc > 0)) {
+      return res.status(400).json({ error: 'Compra en USD: falta el tipo de cambio (tc_blue)' });
+    }
+    // Lleva un monto de la moneda de la factura a ARS (para el costo del lote, que vive en ARS).
+    const aARS = m => moneda === 'USD' ? round2(round2(m) * tc) : round2(m);
+
     const prods = (Array.isArray(items) ? items : [])
       .filter(x => x && x.sku_id && Number(x.cantidad) > 0 && Number(x.costo_unitario) >= 0)
       .map(x => ({ sku_id: +x.sku_id, cantidad: Number(x.cantidad), costo_unitario: round2(x.costo_unitario) }));
     if (!prods.length) return res.status(400).json({ error: 'Cargá al menos un producto con cantidad y costo' });
 
-    const FISCAL_MAP = { iva: 'iva', iibb: 'iibb_percepcion', ganancias: 'ganancias_percepcion' };
+    // Componentes fiscales: IVA (automático) + N percepciones (IIBB/Ganancias) por jurisdicción.
+    // Se guardan en la moneda de la factura; v_compras_ap los lleva a ARS con tc_blue.
     const fisc = [];
-    for (const [k, tipo] of Object.entries(FISCAL_MAP)) {
-      const m = round2(fiscales && fiscales[k]);
-      if (m > 0) fisc.push({ tipo, monto: m });
+    const ivaMonto = round2(fiscales && fiscales.iva);
+    if (ivaMonto > 0) fisc.push({ tipo: 'iva', monto: ivaMonto, descripcion: null });
+    const PERC_MAP = { iibb: 'iibb_percepcion', ganancias: 'ganancias_percepcion' };
+    const perceps = Array.isArray(fiscales && fiscales.percepciones) ? fiscales.percepciones : [];
+    for (const p of perceps) {
+      const tipo = PERC_MAP[p && p.tipo];
+      const monto = round2(p && p.monto);
+      if (tipo && monto !== 0) {
+        fisc.push({ tipo, monto, descripcion: (p.jurisdiccion ? String(p.jurisdiccion).trim() : '') || null });
+      }
     }
 
     // nº de factura → notas (compras no tiene columna dedicada de comprobante)
@@ -3684,8 +3701,8 @@ app.post('/compras', async (req, res) => {
       proveedor_id: compra.proveedor_id || null,
       linea_id: compra.linea_id,
       tipo: 'local',
-      moneda: 'ARS',
-      tc_blue: null,
+      moneda,
+      tc_blue: moneda === 'USD' ? tc : null,
       fecha: compra.fecha,
       estado: 'activa',
       notas
@@ -3694,21 +3711,21 @@ app.post('/compras', async (req, res) => {
     if (!c || !c.id) throw new Error('No se obtuvo el id de la compra');
     compraId = c.id;
 
-    // 2) Componentes de producto + lotes (costo unitario neto en ARS)
+    // 2) Componentes de producto (en la moneda de la factura) + lotes (costo unitario en ARS, congelado al TC)
     await sbUpsert('compra_componentes', prods.map(p => ({
       compra_id: compraId, tipo: 'producto', sku_id: p.sku_id,
-      cantidad: p.cantidad, moneda: 'ARS', monto: round2(p.costo_unitario * p.cantidad)
+      cantidad: p.cantidad, moneda, monto: round2(p.costo_unitario * p.cantidad)
     })));
     await sbUpsert('lotes', prods.map(p => ({
       sku_id: p.sku_id, compra_id: compraId,
       cantidad_inicial: p.cantidad, cantidad_actual: p.cantidad,
-      costo_unitario: p.costo_unitario, fecha_alta: compra.fecha
+      costo_unitario: aARS(p.costo_unitario), fecha_alta: compra.fecha
     })));
 
-    // 3) Componentes fiscales (crédito — no suman al costo del lote)
+    // 3) Componentes fiscales (crédito — no suman al costo del lote), en la moneda de la factura
     if (fisc.length) {
       await sbUpsert('compra_componentes', fisc.map(x => ({
-        compra_id: compraId, tipo: x.tipo, moneda: 'ARS', monto: x.monto
+        compra_id: compraId, tipo: x.tipo, moneda, monto: x.monto, descripcion: x.descripcion
       })));
     }
 
