@@ -104,7 +104,7 @@ function render() {
 // ── Pestaña Facturas ────────────────────────────────────────────────────
 function renderFacturas() {
   const body = document.getElementById('com-body');
-  const activas = COMPRAS.filter(c => c.estado_compra !== 'anulada');
+  const activas = COMPRAS.filter(c => c.estado_compra !== 'anulada' && c.tipo_compra !== 'inicial');
 
   const comprado = activas.reduce((s, c) => s + num(c.total_facturado_ars), 0);
   const pendiente = activas.reduce((s, c) => s + num(c.saldo_ap_ars), 0);
@@ -176,7 +176,7 @@ function filaCompra(c) {
     <td style="text-align:right" class="com-mono com-muted">${money(c.pagado_ars)}</td>
     <td style="text-align:right" class="com-mono">${money(c.saldo_ap_ars)}</td>
     <td><span class="com-badge com-badge-${est}">${est}</span></td>
-    <td style="text-align:right"><button class="com-anular" data-id="${c.compra_id}" title="Anular compra" style="font-size:12px;color:#B91C1C;background:none;border:0;cursor:pointer;font:inherit;padding:2px 4px">Anular</button></td>
+    <td style="text-align:right">${c.tipo_compra === 'inicial' ? '' : `<button class="com-anular" data-id="${c.compra_id}" title="Anular compra" style="font-size:12px;color:#B91C1C;background:none;border:0;cursor:pointer;font:inherit;padding:2px 4px">Anular</button>`}</td>
   </tr>`;
 }
 
@@ -224,7 +224,7 @@ function renderCC() {
     a.fact += fact; a.pag += pag; a.saldo += saldo;
   };
   for (const c of COMPRAS) {
-    if (c.estado_compra === 'anulada') continue;
+    if (c.estado_compra === 'anulada' || c.tipo_compra === 'inicial') continue;
     add(c.proveedor_id, num(c.total_facturado_ars), num(c.pagado_ars), num(c.saldo_ap_ars));
   }
   for (const g of GASTOS_AP) {
@@ -482,7 +482,7 @@ function openAlta() {
   const percBox = $('#c-perceps');
   const pintarPerceps = () => {
     percBox.innerHTML = PERCEPS.length ? PERCEPS.map((p, i) => `
-      <div class="com-item" data-i="${i}">
+      <div class="com-item com-perc-item" data-i="${i}">
         <select class="select com-pc-tipo">
           <option value="iibb" ${p.tipo === 'iibb' ? 'selected' : ''}>Percep. IIBB</option>
           <option value="ganancias" ${p.tipo === 'ganancias' ? 'selected' : ''}>Percep. Ganancias</option>
@@ -603,6 +603,14 @@ function inyectarEstilo() {
     .com-resumen{border-top:1px solid #E7E5E4;margin-top:12px;padding-top:12px}
     .com-res-r{display:flex;justify-content:space-between;font-size:14px;padding:3px 0}
     .com-res-strong{font-weight:700;font-size:15px;border-top:1px dashed #E7E5E4;margin-top:4px;padding-top:8px}
+    .com-perc-item{grid-template-columns:140px 1fr 120px 26px}
+    #com-body .table-wrap{border:1px solid #E7E5E4;border-radius:12px;overflow:hidden;background:#fff}
+    #com-body table.t{width:100%;border-collapse:collapse;font-size:14px}
+    #com-body table.t thead th{background:#FAFAF9;color:#78716C;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;padding:11px 14px;border-bottom:1px solid #E7E5E4;text-align:left;white-space:nowrap}
+    #com-body table.t tbody td{padding:13px 14px;border-bottom:1px solid #F5F5F4;vertical-align:middle;color:#1C1917}
+    #com-body table.t tbody tr:last-child td{border-bottom:0}
+    #com-body table.t tbody tr:hover td{background:#FAFAF9}
+    #com-body table.t .com-mono{white-space:nowrap}
   `;
   const style = document.createElement('style');
   style.id = 'com-style';
