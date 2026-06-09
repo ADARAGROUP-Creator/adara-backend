@@ -35,6 +35,15 @@ function fmtPeriodo(p) {
 let DATA = [];        // filas crudas de v_resultado_mensual
 let LINEAS = [];      // todas las líneas de negocio (para el selector, incluso sin datos)
 let LINEA_SEL = '__all__';
+let CANAL_SEL = '__all__';
+
+const CANAL_NOMBRE = {
+  ml: 'Mercado Libre',
+  tienda_nube: 'Tienda Nube',
+  whatsapp_efectivo: 'WhatsApp / Efectivo',
+  b2b_tango: 'B2B',
+};
+const canalNombre = c => CANAL_NOMBRE[c] || c || '—';
 
 // ── Carga ──────────────────────────────────────────────────────────────────
 export async function loadResultado() {
@@ -98,8 +107,13 @@ function render() {
   const lineas = (LINEAS.length ? LINEAS.map(l => l.nombre) : [...conDatos])
     .filter(Boolean);
 
-  // Filtrar por línea seleccionada y consolidar por período (suma de líneas)
-  const filt = LINEA_SEL === '__all__' ? DATA : DATA.filter(r => r.linea === LINEA_SEL);
+  // Canales presentes en los datos (para el selector de canal)
+  const canalesData = [...new Set(DATA.map(r => r.canal).filter(Boolean))].sort();
+
+  // Filtrar por línea y canal seleccionados, consolidar por período
+  const filt = DATA.filter(r =>
+    (LINEA_SEL === '__all__' || r.linea === LINEA_SEL) &&
+    (CANAL_SEL === '__all__' || r.canal === CANAL_SEL));
   const perMap = {};
   for (const r of filt) {
     const p = r.periodo;
@@ -138,14 +152,18 @@ function render() {
     ? `${fmtMoney(-cmv)} <span class="pend">(${fmtNum(costeadas)}/${fmtNum(ventas)})</span>`
     : `<span class="pend">pendiente</span>`;
 
-  const selector = lineas.length
-    ? `<div class="res-bar">
+  const selector = `<div class="res-bar">
         <label for="res-linea">Línea de negocio</label>
-        <select class="select" id="res-linea" style="max-width:300px">
+        <select class="select" id="res-linea" style="max-width:280px">
           <option value="__all__"${LINEA_SEL === '__all__' ? ' selected' : ''}>Todas las líneas</option>
           ${lineas.map(l => `<option value="${esc(l)}"${LINEA_SEL === l ? ' selected' : ''}>${esc(l)}${conDatos.has(l) ? '' : ' — sin ventas'}</option>`).join('')}
         </select>
-      </div>` : '';
+        <label for="res-canal" style="margin-left:8px">Canal</label>
+        <select class="select" id="res-canal" style="max-width:220px">
+          <option value="__all__"${CANAL_SEL === '__all__' ? ' selected' : ''}>Todos los canales</option>
+          ${canalesData.map(c => `<option value="${esc(c)}"${CANAL_SEL === c ? ' selected' : ''}>${esc(canalNombre(c))}</option>`).join('')}
+        </select>
+      </div>`;
 
   const body = filas.length
     ? filas.map(f => `<tr>
@@ -225,4 +243,6 @@ function render() {
   document.getElementById('res-reload').addEventListener('click', loadResultado);
   const sel = document.getElementById('res-linea');
   if (sel) sel.addEventListener('change', e => { LINEA_SEL = e.target.value; render(); });
+  const selC = document.getElementById('res-canal');
+  if (selC) selC.addEventListener('change', e => { CANAL_SEL = e.target.value; render(); });
 }
