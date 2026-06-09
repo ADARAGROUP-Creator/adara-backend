@@ -33,6 +33,7 @@ function fmtPeriodo(p) {
 }
 
 let DATA = [];        // filas crudas de v_resultado_mensual
+let LINEAS = [];      // todas las líneas de negocio (para el selector, incluso sin datos)
 let LINEA_SEL = '__all__';
 
 // ── Carga ──────────────────────────────────────────────────────────────────
@@ -40,7 +41,12 @@ export async function loadResultado() {
   const root = document.getElementById('app-screens');
   root.innerHTML = `<div class="loading">Cargando resultado…</div>`;
   try {
-    DATA = await sbGet('v_resultado_mensual', 'select=*&order=periodo.asc');
+    const [data, lineas] = await Promise.all([
+      sbGet('v_resultado_mensual', 'select=*&order=periodo.asc'),
+      sbGet('lineas_negocio', 'select=id,nombre&order=id.asc')
+    ]);
+    DATA = data;
+    LINEAS = lineas;
     render();
   } catch (e) {
     root.innerHTML = `<div class="error"><strong>Error al cargar Resultado.</strong><br>${esc(e.message)}</div>`;
@@ -86,8 +92,11 @@ const STYLE = `
 function render() {
   const root = document.getElementById('app-screens');
 
-  // Líneas disponibles (para el selector)
-  const lineas = [...new Set(DATA.map(r => r.linea).filter(Boolean))].sort();
+  // Líneas con datos cargados (para marcar las vacías en el selector)
+  const conDatos = new Set(DATA.map(r => r.linea).filter(Boolean));
+  // Catálogo completo de líneas (incluye las que todavía no tienen ventas)
+  const lineas = (LINEAS.length ? LINEAS.map(l => l.nombre) : [...conDatos])
+    .filter(Boolean);
 
   // Filtrar por línea seleccionada y consolidar por período (suma de líneas)
   const filt = LINEA_SEL === '__all__' ? DATA : DATA.filter(r => r.linea === LINEA_SEL);
@@ -132,9 +141,9 @@ function render() {
   const selector = lineas.length
     ? `<div class="res-bar">
         <label for="res-linea">Línea de negocio</label>
-        <select class="select" id="res-linea" style="max-width:260px">
+        <select class="select" id="res-linea" style="max-width:300px">
           <option value="__all__"${LINEA_SEL === '__all__' ? ' selected' : ''}>Todas las líneas</option>
-          ${lineas.map(l => `<option value="${esc(l)}"${LINEA_SEL === l ? ' selected' : ''}>${esc(l)}</option>`).join('')}
+          ${lineas.map(l => `<option value="${esc(l)}"${LINEA_SEL === l ? ' selected' : ''}>${esc(l)}${conDatos.has(l) ? '' : ' — sin ventas'}</option>`).join('')}
         </select>
       </div>` : '';
 
@@ -150,7 +159,11 @@ function render() {
         <td>${fmtPct(f.pct)}</td>
         <td>${cmvCell(f.cmv, f.costeadas, f.ventas)}</td>
       </tr>`).join('')
-    : `<tr><td colspan="9" class="empty">Todavía no hay ventas para mostrar.</td></tr>`;
+    : `<tr><td colspan="9" class="empty">${
+        LINEA_SEL === '__all__'
+          ? 'Todavía no hay ventas cargadas.'
+          : `«${esc(LINEA_SEL)}» todavía no tiene ventas cargadas. Las ventas que no son de Mercado Libre (Tienda Nube, B2B, sindicatos) entran con el sync de Tango.`
+      }</td></tr>`;
 
   const totRow = filas.length ? `<tr class="tot">
       <td>Total</td>
