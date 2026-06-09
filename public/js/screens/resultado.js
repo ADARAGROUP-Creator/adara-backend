@@ -122,13 +122,15 @@ function render() {
     const p = r.periodo;
     if (!perMap[p]) perMap[p] = {
       periodo: p, ventas: 0, costeadas: 0,
-      ingreso: 0, cmv: 0, comision: 0, envio: 0, financiero: 0, impuestos: 0
+      ingreso: 0, cmv: 0, cmv_real: 0, cmv_estimado: 0, comision: 0, envio: 0, financiero: 0, impuestos: 0
     };
     const a = perMap[p];
     a.ventas    += num(r.ventas);
     a.costeadas += num(r.ventas_costeadas);
     a.ingreso   += num(r.ingreso_neto);
     a.cmv       += num(r.cmv);
+    a.cmv_real  += num(r.cmv_real);
+    a.cmv_estimado += num(r.cmv_estimado);
     a.comision  += num(r.comision);
     a.envio     += num(r.envio);
     a.financiero+= num(r.costo_financiero);
@@ -157,17 +159,19 @@ function render() {
   // Totales
   const T = filas.reduce((a, f) => ({
     ventas: a.ventas + f.ventas, costeadas: a.costeadas + f.costeadas,
-    ingreso: a.ingreso + f.ingreso, cmv: a.cmv + f.cmv, comision: a.comision + f.comision,
+    ingreso: a.ingreso + f.ingreso, cmv: a.cmv + f.cmv, cmv_real: a.cmv_real + f.cmv_real, cmv_estimado: a.cmv_estimado + f.cmv_estimado, comision: a.comision + f.comision,
     envio: a.envio + f.envio, financiero: a.financiero + f.financiero,
     impuestos: a.impuestos + f.impuestos, contrib: a.contrib + f.contrib,
     gastos: a.gastos + f.gastos, resultado_op: a.resultado_op + f.resultado_op,
-  }), { ventas: 0, costeadas: 0, ingreso: 0, cmv: 0, comision: 0, envio: 0, financiero: 0, impuestos: 0, contrib: 0, gastos: 0, resultado_op: 0 });
+  }), { ventas: 0, costeadas: 0, ingreso: 0, cmv: 0, cmv_real: 0, cmv_estimado: 0, comision: 0, envio: 0, financiero: 0, impuestos: 0, contrib: 0, gastos: 0, resultado_op: 0 });
   const Tpct = T.ingreso > 0 ? T.contrib / T.ingreso * 100 : 0;
 
   const moneyNeg = n => `<span class="neg">${fmtMoney(n)}</span>`;
-  const cmvCell = (cmv, costeadas, ventas) => num(cmv) !== 0
-    ? `${fmtMoney(-cmv)} <span class="pend">(${fmtNum(costeadas)}/${fmtNum(ventas)})</span>`
-    : `<span class="pend">pendiente</span>`;
+  const cmvCell = (cmv, est) => num(cmv) === 0
+    ? `<span class="pend">pendiente</span>`
+    : num(est) > 0
+      ? `${fmtMoney(-cmv)} <span class="pend" title="CMV estimado a costo actual del SKU. Las ventas nuevas costean por lote (FIFO real).">est.</span>`
+      : fmtMoney(-cmv);
 
   const selector = `<div class="res-bar">
         <label for="res-linea">Línea de negocio</label>
@@ -192,7 +196,7 @@ function render() {
         <td>${moneyNeg(f.impuestos)}</td>
         <td class="contrib">${fmtMoney(f.contrib)}</td>
         <td>${fmtPct(f.pct)}</td>
-        <td>${cmvCell(f.cmv, f.costeadas, f.ventas)}</td>
+        <td>${cmvCell(f.cmv, f.cmv_estimado)}</td>
         <td>${f.gastos ? moneyNeg(-f.gastos) : '<span class="pend">—</span>'}</td>
         <td class="contrib">${fmtMoney(f.resultado_op)}</td>
       </tr>`).join('')
@@ -211,7 +215,7 @@ function render() {
       <td>${fmtMoney(T.impuestos)}</td>
       <td class="contrib">${fmtMoney(T.contrib)}</td>
       <td>${fmtPct(Tpct)}</td>
-      <td>${cmvCell(T.cmv, T.costeadas, T.ventas)}</td>
+      <td>${cmvCell(T.cmv, T.cmv_estimado)}</td>
       <td>${T.gastos ? moneyNeg(-T.gastos) : '<span class="pend">—</span>'}</td>
       <td class="contrib">${fmtMoney(T.resultado_op)}</td>
     </tr>` : '';
@@ -224,9 +228,9 @@ function render() {
 
     <div class="cost-aviso"><span class="ic">⚠</span><div>
       Este estado baja hasta el <b>resultado operativo</b>: a las ventas netas les resta las deducciones de
-      Mercado Libre (comisión, envío, financiero, IIBB) y los <b>gastos operativos</b> de la línea. Falta todavía
-      el <b>costo de la mercadería</b> (CMV en carga) y Ganancias, así que el resultado operativo está <b>sobreestimado</b>
-      hasta completar el costeo histórico.
+      Mercado Libre (comisión, envío, financiero, IIBB), el <b>CMV</b> y los <b>gastos operativos</b> de la línea.
+      El CMV de las ventas históricas está <b>estimado a costo actual</b> del SKU (marcado <i>est.</i>); las ventas
+      nuevas costean por <b>lote real (FIFO)</b>. Falta <b>Ganancias</b> para llegar al resultado neto.
     </div></div>
 
     ${selector}
@@ -235,7 +239,7 @@ function render() {
       <div class="res-kpi acc"><div class="l">Ventas netas</div><div class="v">${fmtMoney(T.ingreso)}</div></div>
       <div class="res-kpi"><div class="l">Margen contribución (antes CMV)</div><div class="v">${fmtMoney(T.contrib)}</div></div>
       <div class="res-kpi"><div class="l">% s/ventas (antes CMV)</div><div class="v">${fmtPct(Tpct)}</div></div>
-      <div class="res-kpi"><div class="l">Ventas costeadas</div><div class="v">${fmtNum(T.costeadas)} / ${fmtNum(T.ventas)}</div></div>
+      <div class="res-kpi"><div class="l">CMV (estimado)</div><div class="v">${fmtMoney(T.cmv)}</div></div>
       <div class="res-kpi"><div class="l">Gastos operativos</div><div class="v">${fmtMoney(T.gastos)}</div></div>
       <div class="res-kpi acc"><div class="l">Resultado operativo</div><div class="v">${fmtMoney(T.resultado_op)}</div></div>
     </div>
@@ -260,11 +264,12 @@ function render() {
     <div class="cost-note">
       <b>Cómo leer esta tabla.</b> Cada fila es un mes (criterio devengado, montos sin IVA). De las ventas netas
       se restan las deducciones de Mercado Libre (→ <b>contribución</b>), después el <b>CMV</b> y los <b>gastos</b>
-      operativos, para llegar al <b>resultado operativo</b>. La columna CMV muestra entre paréntesis cuántas ventas
-      tienen costo cargado; mientras diga <i>pendiente</i> o cubra pocas ventas, el costo casi no se resta y el
-      resultado operativo queda alto (se completa con el costeo histórico de Tango). Los <b>gastos son por línea</b>
-      (no por canal): con un canal puntual filtrado, el margen es de ese canal pero los gastos siguen siendo de la
-      línea completa. Falta Ganancias para llegar al resultado neto.
+      operativos, para llegar al <b>resultado operativo</b>. El CMV marcado <i>est.</i> está <b>estimado a costo
+      actual</b> del SKU (no al costo histórico exacto de la unidad vendida), porque las ventas previas al stock de
+      apertura no consumen lote; las ventas nuevas costean por <b>lote real (FIFO)</b>. Por la inflación, ese costo
+      a valor de hoy puede achicar un poco el margen de los meses viejos. Los <b>gastos son por línea</b> (no por
+      canal): con un canal puntual filtrado, el margen es de ese canal pero los gastos siguen siendo de la línea
+      completa. Falta Ganancias para llegar al resultado neto.
     </div>
   </div>`;
 
