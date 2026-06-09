@@ -33,6 +33,7 @@ function fmtPeriodo(p) {
 }
 
 let DATA = [];        // filas crudas de v_resultado_mensual
+let GASTOS = [];      // filas de v_gastos_mensual (período × línea, neto ARS)
 let LINEAS = [];      // todas las líneas de negocio (para el selector, incluso sin datos)
 let LINEA_SEL = '__all__';
 let CANAL_SEL = '__all__';
@@ -50,12 +51,14 @@ export async function loadResultado() {
   const root = document.getElementById('app-screens');
   root.innerHTML = `<div class="loading">Cargando resultado…</div>`;
   try {
-    const [data, lineas] = await Promise.all([
+    const [data, lineas, gastos] = await Promise.all([
       sbGet('v_resultado_mensual', 'select=*&order=periodo.asc'),
-      sbGet('lineas_negocio', 'select=id,nombre&order=id.asc')
+      sbGet('lineas_negocio', 'select=id,nombre&order=id.asc'),
+      sbGet('v_gastos_mensual', 'select=*&order=periodo.asc')
     ]);
     DATA = data;
     LINEAS = lineas;
+    GASTOS = gastos;
     render();
   } catch (e) {
     root.innerHTML = `<div class="error"><strong>Error al cargar Resultado.</strong><br>${esc(e.message)}</div>`;
@@ -79,7 +82,7 @@ const STYLE = `
 .res .res-kpi.acc .v{color:var(--acc)}
 
 .res .tbl{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);overflow-x:auto}
-.res table{width:100%;border-collapse:collapse;font-size:14px;min-width:880px}
+.res table{width:100%;border-collapse:collapse;font-size:14px;min-width:1040px}
 .res thead th{text-align:right;padding:11px 14px;font-weight:600;font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;background:var(--surface-alt);border-bottom:1px solid var(--border);white-space:nowrap}
 .res thead th:first-child{text-align:left}
 .res tbody td{padding:11px 14px;border-top:1px solid var(--border);text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--text)}
@@ -138,13 +141,27 @@ function render() {
     f.pct = f.ingreso > 0 ? f.contrib / f.ingreso * 100 : 0;
   }
 
+  // Gastos operativos por período (son por LÍNEA, no por canal). Se filtran por la
+  // línea elegida; con un canal puntual el margen es de ese canal pero los gastos
+  // siguen siendo de la línea completa (ver nota al pie; multicanal real es TBD).
+  const gastoPer = {};
+  for (const g of GASTOS) {
+    if (LINEA_SEL !== '__all__' && g.linea !== LINEA_SEL) continue;
+    gastoPer[g.periodo] = (gastoPer[g.periodo] || 0) + num(g.gastos_neto_ars);
+  }
+  for (const f of filas) {
+    f.gastos = gastoPer[f.periodo] || 0;
+    f.resultado_op = f.contrib - f.cmv - f.gastos;  // cmv y gastos positivos: se restan
+  }
+
   // Totales
   const T = filas.reduce((a, f) => ({
     ventas: a.ventas + f.ventas, costeadas: a.costeadas + f.costeadas,
     ingreso: a.ingreso + f.ingreso, cmv: a.cmv + f.cmv, comision: a.comision + f.comision,
     envio: a.envio + f.envio, financiero: a.financiero + f.financiero,
     impuestos: a.impuestos + f.impuestos, contrib: a.contrib + f.contrib,
-  }), { ventas: 0, costeadas: 0, ingreso: 0, cmv: 0, comision: 0, envio: 0, financiero: 0, impuestos: 0, contrib: 0 });
+    gastos: a.gastos + f.gastos, resultado_op: a.resultado_op + f.resultado_op,
+  }), { ventas: 0, costeadas: 0, ingreso: 0, cmv: 0, comision: 0, envio: 0, financiero: 0, impuestos: 0, contrib: 0, gastos: 0, resultado_op: 0 });
   const Tpct = T.ingreso > 0 ? T.contrib / T.ingreso * 100 : 0;
 
   const moneyNeg = n => `<span class="neg">${fmtMoney(n)}</span>`;
@@ -176,8 +193,10 @@ function render() {
         <td class="contrib">${fmtMoney(f.contrib)}</td>
         <td>${fmtPct(f.pct)}</td>
         <td>${cmvCell(f.cmv, f.costeadas, f.ventas)}</td>
+        <td>${f.gastos ? moneyNeg(-f.gastos) : '<span class="pend">—</span>'}</td>
+        <td class="contrib">${fmtMoney(f.resultado_op)}</td>
       </tr>`).join('')
-    : `<tr><td colspan="9" class="empty">${
+    : `<tr><td colspan="11" class="empty">${
         LINEA_SEL === '__all__'
           ? 'Todavía no hay ventas cargadas.'
           : `«${esc(LINEA_SEL)}» todavía no tiene ventas cargadas. Las ventas que no son de Mercado Libre (Tienda Nube, B2B, sindicatos) entran con el sync de Tango.`
@@ -193,6 +212,8 @@ function render() {
       <td class="contrib">${fmtMoney(T.contrib)}</td>
       <td>${fmtPct(Tpct)}</td>
       <td>${cmvCell(T.cmv, T.costeadas, T.ventas)}</td>
+      <td>${T.gastos ? moneyNeg(-T.gastos) : '<span class="pend">—</span>'}</td>
+      <td class="contrib">${fmtMoney(T.resultado_op)}</td>
     </tr>` : '';
 
   root.innerHTML = `${STYLE}
@@ -202,9 +223,10 @@ function render() {
     </div>
 
     <div class="cost-aviso"><span class="ic">⚠</span><div>
-      Este estado de resultado llega hasta el <b>margen de contribución antes de CMV</b>: descuenta lo que cobra
-      Mercado Libre (comisión, envío, financiero, IIBB) pero <b>todavía no el costo de la mercadería</b> (en carga)
-      ni los gastos de estructura. El % no es tu margen real.
+      Este estado baja hasta el <b>resultado operativo</b>: a las ventas netas les resta las deducciones de
+      Mercado Libre (comisión, envío, financiero, IIBB) y los <b>gastos operativos</b> de la línea. Falta todavía
+      el <b>costo de la mercadería</b> (CMV en carga) y Ganancias, así que el resultado operativo está <b>sobreestimado</b>
+      hasta completar el costeo histórico.
     </div></div>
 
     ${selector}
@@ -214,6 +236,8 @@ function render() {
       <div class="res-kpi"><div class="l">Margen contribución (antes CMV)</div><div class="v">${fmtMoney(T.contrib)}</div></div>
       <div class="res-kpi"><div class="l">% s/ventas (antes CMV)</div><div class="v">${fmtPct(Tpct)}</div></div>
       <div class="res-kpi"><div class="l">Ventas costeadas</div><div class="v">${fmtNum(T.costeadas)} / ${fmtNum(T.ventas)}</div></div>
+      <div class="res-kpi"><div class="l">Gastos operativos</div><div class="v">${fmtMoney(T.gastos)}</div></div>
+      <div class="res-kpi acc"><div class="l">Resultado operativo</div><div class="v">${fmtMoney(T.resultado_op)}</div></div>
     </div>
 
     <div class="tbl"><table>
@@ -227,16 +251,20 @@ function render() {
         <th>Contribución</th>
         <th>%</th>
         <th>CMV</th>
+        <th>Gastos</th>
+        <th>Resultado op.</th>
       </tr></thead>
       <tbody>${body}${totRow}</tbody>
     </table></div>
 
     <div class="cost-note">
       <b>Cómo leer esta tabla.</b> Cada fila es un mes (criterio devengado, montos sin IVA). De las ventas netas
-      se restan las deducciones de Mercado Libre para llegar al <b>margen de contribución</b>. La columna <b>CMV</b>
-      (costo de la mercadería vendida) muestra entre paréntesis cuántas ventas tienen costo cargado; mientras diga
-      <i>pendiente</i> o cubra pocas ventas, el costo todavía no está restado del resultado (se completa con el costeo
-      histórico de Tango). Faltan además los gastos de estructura y Ganancias para llegar al resultado neto.
+      se restan las deducciones de Mercado Libre (→ <b>contribución</b>), después el <b>CMV</b> y los <b>gastos</b>
+      operativos, para llegar al <b>resultado operativo</b>. La columna CMV muestra entre paréntesis cuántas ventas
+      tienen costo cargado; mientras diga <i>pendiente</i> o cubra pocas ventas, el costo casi no se resta y el
+      resultado operativo queda alto (se completa con el costeo histórico de Tango). Los <b>gastos son por línea</b>
+      (no por canal): con un canal puntual filtrado, el margen es de ese canal pero los gastos siguen siendo de la
+      línea completa. Falta Ganancias para llegar al resultado neto.
     </div>
   </div>`;
 
