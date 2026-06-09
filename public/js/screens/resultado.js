@@ -140,7 +140,6 @@ function render() {
   // Margen de contribución ANTES de CMV (deducciones vienen con signo negativo)
   for (const f of filas) {
     f.contrib = f.ingreso + f.comision + f.envio + f.financiero + f.impuestos;
-    f.pct = f.ingreso > 0 ? f.contrib / f.ingreso * 100 : 0;
   }
 
   // Gastos operativos por período (son por LÍNEA, no por canal). Se filtran por la
@@ -154,6 +153,7 @@ function render() {
   for (const f of filas) {
     f.gastos = gastoPer[f.periodo] || 0;
     f.resultado_op = f.contrib - f.cmv - f.gastos;  // cmv y gastos positivos: se restan
+    f.pct = f.ingreso > 0 ? f.resultado_op / f.ingreso * 100 : 0;  // margen operativo real (s/ventas)
   }
 
   // Totales
@@ -164,7 +164,7 @@ function render() {
     impuestos: a.impuestos + f.impuestos, contrib: a.contrib + f.contrib,
     gastos: a.gastos + f.gastos, resultado_op: a.resultado_op + f.resultado_op,
   }), { ventas: 0, costeadas: 0, ingreso: 0, cmv: 0, cmv_real: 0, cmv_estimado: 0, comision: 0, envio: 0, financiero: 0, impuestos: 0, contrib: 0, gastos: 0, resultado_op: 0 });
-  const Tpct = T.ingreso > 0 ? T.contrib / T.ingreso * 100 : 0;
+  const Tpct = T.ingreso > 0 ? T.resultado_op / T.ingreso * 100 : 0;
 
   const moneyNeg = n => `<span class="neg">${fmtMoney(n)}</span>`;
   const cmvCell = (cmv, est) => num(cmv) === 0
@@ -195,10 +195,10 @@ function render() {
         <td>${moneyNeg(f.financiero)}</td>
         <td>${moneyNeg(f.impuestos)}</td>
         <td class="contrib">${fmtMoney(f.contrib)}</td>
-        <td>${fmtPct(f.pct)}</td>
         <td>${cmvCell(f.cmv, f.cmv_estimado)}</td>
         <td>${f.gastos ? moneyNeg(-f.gastos) : '<span class="pend">—</span>'}</td>
         <td class="contrib">${fmtMoney(f.resultado_op)}</td>
+        <td>${fmtPct(f.pct)}</td>
       </tr>`).join('')
     : `<tr><td colspan="11" class="empty">${
         LINEA_SEL === '__all__'
@@ -214,10 +214,10 @@ function render() {
       <td>${fmtMoney(T.financiero)}</td>
       <td>${fmtMoney(T.impuestos)}</td>
       <td class="contrib">${fmtMoney(T.contrib)}</td>
-      <td>${fmtPct(Tpct)}</td>
       <td>${cmvCell(T.cmv, T.cmv_estimado)}</td>
       <td>${T.gastos ? moneyNeg(-T.gastos) : '<span class="pend">—</span>'}</td>
       <td class="contrib">${fmtMoney(T.resultado_op)}</td>
+      <td>${fmtPct(Tpct)}</td>
     </tr>` : '';
 
   root.innerHTML = `${STYLE}
@@ -238,7 +238,7 @@ function render() {
     <div class="res-kpis">
       <div class="res-kpi acc"><div class="l">Ventas netas</div><div class="v">${fmtMoney(T.ingreso)}</div></div>
       <div class="res-kpi"><div class="l">Margen contribución (antes CMV)</div><div class="v">${fmtMoney(T.contrib)}</div></div>
-      <div class="res-kpi"><div class="l">% s/ventas (antes CMV)</div><div class="v">${fmtPct(Tpct)}</div></div>
+      <div class="res-kpi"><div class="l">Margen operativo</div><div class="v">${fmtPct(Tpct)}</div></div>
       <div class="res-kpi"><div class="l">CMV (estimado)</div><div class="v">${fmtMoney(T.cmv)}</div></div>
       <div class="res-kpi"><div class="l">Gastos operativos</div><div class="v">${fmtMoney(T.gastos)}</div></div>
       <div class="res-kpi acc"><div class="l">Resultado operativo</div><div class="v">${fmtMoney(T.resultado_op)}</div></div>
@@ -253,10 +253,10 @@ function render() {
         <th>Financiero</th>
         <th>Retenc./IIBB</th>
         <th>Contribución</th>
-        <th>%</th>
         <th>CMV</th>
         <th>Gastos</th>
         <th>Resultado op.</th>
+        <th>Margen %</th>
       </tr></thead>
       <tbody>${body}${totRow}</tbody>
     </table></div>
