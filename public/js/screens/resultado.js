@@ -37,6 +37,8 @@ let GASTOS = [];      // filas de v_gastos_mensual (período × línea, neto ARS
 let LINEAS = [];      // todas las líneas de negocio (para el selector, incluso sin datos)
 let LINEA_SEL = '__all__';
 let CANAL_SEL = '__all__';
+let CONTROL = {};     // v_control_mensual indexado por periodo (drill-down)
+let EXPANDED = null;  // periodo desplegado
 
 const CANAL_NOMBRE = {
   ml: 'Mercado Libre',
@@ -51,14 +53,17 @@ export async function loadResultado() {
   const root = document.getElementById('app-screens');
   root.innerHTML = `<div class="loading">Cargando resultado…</div>`;
   try {
-    const [data, lineas, gastos] = await Promise.all([
+    const [data, lineas, gastos, control] = await Promise.all([
       sbGet('v_resultado_mensual', 'select=*&order=periodo.asc'),
       sbGet('lineas_negocio', 'select=id,nombre&order=id.asc'),
-      sbGet('v_gastos_mensual', 'select=*&order=periodo.asc')
+      sbGet('v_gastos_mensual', 'select=*&order=periodo.asc'),
+      sbGet('v_control_mensual', 'select=*&order=periodo.asc')
     ]);
     DATA = data;
     LINEAS = lineas;
     GASTOS = gastos;
+    CONTROL = {};
+    (control || []).forEach(r => { CONTROL[r.periodo] = r; });
     render();
   } catch (e) {
     root.innerHTML = `<div class="error"><strong>Error al cargar Resultado.</strong><br>${esc(e.message)}</div>`;
@@ -98,6 +103,18 @@ const STYLE = `
 .res .cost-note{margin-top:16px;background:var(--surface-alt);border:1px solid var(--border);border-radius:var(--r);padding:12px 14px;font-size:13px;line-height:1.6;color:var(--text-muted)}
 .res .cost-note b{color:var(--text);font-weight:600}
 .res .empty{padding:34px;text-align:center;color:var(--text-muted)}
+.res .res-row{cursor:pointer}
+.res .res-row:hover td{background:#FAFAF9}
+.res .res-row.open td{background:#FFF7ED}
+.res .res-panel > td{background:#FAFAF9;padding:14px}
+.res .rp-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
+.res .rp-card{background:#fff;border:1px solid var(--border,#E7E5E4);border-radius:10px;padding:12px 14px}
+.res .rp-h{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;color:var(--text-muted,#78716C);margin-bottom:8px}
+.res .rp-row{display:flex;justify-content:space-between;gap:10px;font-size:13px;padding:3px 0}
+.res .rp-row > span{color:var(--text-muted,#78716C)}
+.res .rp-row > b{font-variant-numeric:tabular-nums;white-space:nowrap}
+.res .rp-strong{border-top:1px solid #F5F5F4;margin-top:4px;padding-top:6px;font-weight:700}
+.res .rp-sub{font-size:11px;color:var(--text-muted,#78716C);margin-top:1px;line-height:1.35}
 </style>`;
 
 // ── Render ───────────────────────────────────────────────────────────────
@@ -187,8 +204,8 @@ function render() {
       </div>`;
 
   const body = filas.length
-    ? filas.map(f => `<tr>
-        <td>${esc(fmtPeriodo(f.periodo))}</td>
+    ? filas.map(f => `<tr class="res-row${EXPANDED === f.periodo ? ' open' : ''}" data-periodo="${esc(f.periodo)}">
+        <td>${EXPANDED === f.periodo ? '▾' : '▸'} ${esc(fmtPeriodo(f.periodo))}</td>
         <td>${fmtMoney(f.ingreso)}</td>
         <td>${moneyNeg(f.comision)}</td>
         <td>${moneyNeg(f.envio)}</td>
@@ -199,7 +216,7 @@ function render() {
         <td>${f.gastos ? moneyNeg(-f.gastos) : '<span class="pend">—</span>'}</td>
         <td class="contrib">${fmtMoney(f.resultado_op)}</td>
         <td>${fmtPct(f.pct)}</td>
-      </tr>`).join('')
+      </tr>${EXPANDED === f.periodo ? panelRow(f) : ''}`).join('')
     : `<tr><td colspan="11" class="empty">${
         LINEA_SEL === '__all__'
           ? 'Todavía no hay ventas cargadas.'
@@ -278,4 +295,47 @@ function render() {
   if (sel) sel.addEventListener('change', e => { LINEA_SEL = e.target.value; render(); });
   const selC = document.getElementById('res-canal');
   if (selC) selC.addEventListener('change', e => { CANAL_SEL = e.target.value; render(); });
+  root.querySelectorAll('.res-row').forEach(tr => tr.addEventListener('click', () => {
+    const p = tr.dataset.periodo;
+    EXPANDED = (EXPANDED === p) ? null : p;
+    render();
+  }));
+}
+
+// Panel de control desplegable por mes: reconcilia con ML, cascada a resultado, IVA y cobranza.
+function panelRow(f) {
+  const c = CONTROL[f.periodo] || {};
+  const ded = num(f.comision) + num(f.envio) + num(f.financiero) + num(f.impuestos);
+  const ivaCred = num(c.iva_cred_compras) + num(c.iva_cred_gastos);
+  return `<tr class="res-panel"><td colspan="11"><div class="rp-wrap">
+    <div class="rp-card">
+      <div class="rp-h">Cuadre con Mercado Libre</div>
+      <div class="rp-row"><span>Órdenes</span><b>${fmtNum(c.ordenes_ml)}</b></div>
+      <div class="rp-sub">válidas ${fmtNum(c.ordenes_validas)} · canceladas/excluidas ${fmtNum(c.ordenes_excluidas)}</div>
+      <div class="rp-row"><span>Unidades</span><b>${fmtNum(c.unidades_ml)}</b></div>
+      <div class="rp-row rp-strong"><span>Bruto facturado (c/IVA)</span><b>${fmtMoney(c.bruto_ml)}</b></div>
+      <div class="rp-sub">= "ventas brutas" de ML · válidas ${fmtMoney(c.bruto_validas)} · excluido ${fmtMoney(c.bruto_excluido)}</div>
+    </div>
+    <div class="rp-card">
+      <div class="rp-h">Cascada a resultado</div>
+      <div class="rp-row"><span>Neto (sin IVA)</span><b>${fmtMoney(c.neto)}</b></div>
+      <div class="rp-row"><span>− Deducciones ML</span><b>${fmtMoney(ded)}</b></div>
+      <div class="rp-row"><span>Contribución</span><b>${fmtMoney(f.contrib)}</b></div>
+      <div class="rp-row"><span>− CMV ${num(f.cmv_estimado) > 0 ? '(est.)' : ''}</span><b>${fmtMoney(-num(f.cmv))}</b></div>
+      <div class="rp-row"><span>− Gastos</span><b>${f.gastos ? fmtMoney(-num(f.gastos)) : '—'}</b></div>
+      <div class="rp-row rp-strong"><span>Resultado op.</span><b>${fmtMoney(f.resultado_op)} · ${fmtPct(f.pct)}</b></div>
+    </div>
+    <div class="rp-card">
+      <div class="rp-h">IVA del mes</div>
+      <div class="rp-row"><span>IVA débito (ventas)</span><b>${fmtMoney(c.iva_debito)}</b></div>
+      <div class="rp-row"><span>IVA crédito (compras/gastos)</span><b>${fmtMoney(ivaCred)}</b></div>
+      <div class="rp-row rp-strong"><span>IVA a pagar</span><b>${fmtMoney(c.iva_a_pagar)}</b></div>
+      <div class="rp-sub">crédito incompleto hasta cargar todas las compras</div>
+    </div>
+    <div class="rp-card">
+      <div class="rp-h">Cobranza</div>
+      <div class="rp-row rp-strong"><span>Por cobrar (neto)</span><b>${fmtMoney(c.por_cobrar)}</b></div>
+      <div class="rp-sub">= "por cobrar" de Ventas ML</div>
+    </div>
+  </div></td></tr>`;
 }
