@@ -216,9 +216,11 @@ function filaCC(f) {
 
 // ── Alta de compra local ──────────────────────────────────────────────────
 let ITEMS = [];
+let PERCEPS = [];   // percepciones de la factura: { tipo:'iibb'|'ganancias', jurisdiccion, monto }
 
 function openAlta() {
   ITEMS = [{ sku_id: '', cantidad: '', costo: '', iva: 0.21 }];
+  PERCEPS = [];
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.innerHTML = `
@@ -249,6 +251,15 @@ function openAlta() {
         <div class="field"><label>Línea de negocio</label><select class="select" id="c-linea"><option value="">Elegí línea…</option>${LINEAS.map(l => `<option value="${l.id}">${esc(LINEA_LABEL[l.id])}</option>`).join('')}</select></div>
       </div>
 
+      <div class="com-row3">
+        <div class="field"><label>Moneda</label>
+          <select class="select" id="c-moneda"><option value="ARS">ARS</option><option value="USD">USD</option></select>
+        </div>
+        <div class="field" id="c-tc-wrap" style="display:none"><label>TC (USD→ARS)</label>
+          <input class="input" id="c-tc" inputmode="decimal" placeholder="0,00"></div>
+        <div class="field"></div>
+      </div>
+
       <div class="com-block">
         <div class="com-block-h"><span>Productos (mercadería)</span><button class="btn btn-ghost com-mini" id="c-add-item" type="button">+ Agregar</button></div>
         <div id="c-items"></div>
@@ -256,11 +267,9 @@ function openAlta() {
 
       <div class="com-block">
         <div class="com-block-h"><span>Impuestos de la factura (crédito fiscal — no son costo)</span></div>
-        <div class="com-row3">
-          <div class="field"><label>IVA (automático)</label><input class="input" id="c-iva-disp" readonly value="$ 0,00"></div>
-          <div class="field"><label>Percepción IIBB</label><input class="input com-fisc" id="c-iibb" inputmode="decimal" placeholder="0,00"></div>
-          <div class="field"><label>Percepción Ganancias</label><input class="input com-fisc" id="c-gan" inputmode="decimal" placeholder="0,00"></div>
-        </div>
+        <div class="field" style="max-width:240px"><label>IVA (automático)</label><input class="input" id="c-iva-disp" readonly value="$ 0,00"></div>
+        <div class="com-block-h" style="margin-top:10px"><span>Percepciones (una por jurisdicción)</span><button class="btn btn-ghost com-mini" id="c-add-perc" type="button">+ percepción</button></div>
+        <div id="c-perceps"></div>
       </div>
 
       <div class="com-resumen" id="c-resumen"></div>
@@ -379,28 +388,88 @@ function openAlta() {
   });
   $('#c-add-item').addEventListener('click', () => { leerItems(); ITEMS.push({ sku_id: '', cantidad: '', costo: '', iva: 0.21 }); pintarItems(); });
 
+  // Moneda / TC
+  const monedaSel = $('#c-moneda');
+  const tcInp = $('#c-tc');
+  const monActual = () => monedaSel.value === 'USD' ? 'USD' : 'ARS';
+  const simb = () => monActual() === 'USD' ? 'US$ ' : '$ ';
+  const mon = n => simb() + num(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
   const ivaTotal = () => ITEMS.reduce((s, it) => s + num(it.cantidad) * num(it.costo) * num(it.iva), 0);
+  const percepTotal = () => PERCEPS.reduce((s, p) => s + num(p.monto), 0);
+
   const pintarResumen = () => {
     const neto = ITEMS.reduce((s, it) => s + num(it.cantidad) * num(it.costo), 0);
     const iva = ivaTotal();
-    const iibb = num($('#c-iibb').value), gan = num($('#c-gan').value);
-    const total = neto + iva + iibb + gan;
-    const disp = $('#c-iva-disp'); if (disp) disp.value = money(iva);
+    const perc = percepTotal();
+    const total = neto + iva + perc;
+    const disp = $('#c-iva-disp'); if (disp) disp.value = mon(iva);
+    const tc = num(tcInp.value);
+    const equivArs = (monActual() === 'USD' && tc > 0)
+      ? `<div class="com-res-r com-muted"><span>Equivalente en ARS (TC ${num(tc).toLocaleString('es-AR')})</span><span class="com-mono">$ ${(total * tc).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span></div>`
+      : '';
     $('#c-resumen').innerHTML = `
-      <div class="com-res-r"><span>Productos (neto, va al costo)</span><span class="com-mono">${money(neto)}</span></div>
-      <div class="com-res-r com-muted"><span>+ IVA (auto) · IIBB · Ganancias (crédito)</span><span class="com-mono">${money(iva + iibb + gan)}</span></div>
-      <div class="com-res-r com-res-strong"><span>Total factura (lo que le debés)</span><span class="com-mono">${money(total)}</span></div>`;
+      <div class="com-res-r"><span>Productos (neto, va al costo)</span><span class="com-mono">${mon(neto)}</span></div>
+      <div class="com-res-r com-muted"><span>+ IVA (auto) + percepciones (crédito)</span><span class="com-mono">${mon(iva + perc)}</span></div>
+      <div class="com-res-r com-res-strong"><span>Total factura (lo que le debés)</span><span class="com-mono">${mon(total)}</span></div>
+      ${equivArs}`;
   };
-  overlay.querySelectorAll('.com-fisc').forEach(el => el.addEventListener('input', pintarResumen));
+
+  const aplicarMoneda = () => {
+    $('#c-tc-wrap').style.display = monActual() === 'USD' ? '' : 'none';
+    pintarResumen();
+  };
+  monedaSel.addEventListener('change', aplicarMoneda);
+  tcInp.addEventListener('input', pintarResumen);
+
+  // Repeater de percepciones (una por jurisdicción → una fila en compra_componentes)
+  const percBox = $('#c-perceps');
+  const pintarPerceps = () => {
+    percBox.innerHTML = PERCEPS.length ? PERCEPS.map((p, i) => `
+      <div class="com-item" data-i="${i}">
+        <select class="select com-pc-tipo">
+          <option value="iibb" ${p.tipo === 'iibb' ? 'selected' : ''}>Percep. IIBB</option>
+          <option value="ganancias" ${p.tipo === 'ganancias' ? 'selected' : ''}>Percep. Ganancias</option>
+        </select>
+        <input class="input com-pc-jur" placeholder="Jurisdicción (ej: IIBB CABA)" value="${esc(p.jurisdiccion)}">
+        <input class="input com-pc-monto" inputmode="decimal" placeholder="Monto" value="${esc(p.monto)}">
+        <button class="com-it-del" type="button" title="Quitar">✕</button>
+      </div>`).join('')
+      : `<div class="com-muted" style="padding:4px 0;font-size:13px">Sin percepciones. Agregá una por cada jurisdicción.</div>`;
+    pintarResumen();
+  };
+  const leerPerceps = () => {
+    percBox.querySelectorAll('.com-item').forEach(row => {
+      const i = +row.dataset.i;
+      PERCEPS[i].tipo = row.querySelector('.com-pc-tipo').value;
+      PERCEPS[i].jurisdiccion = row.querySelector('.com-pc-jur').value;
+      PERCEPS[i].monto = row.querySelector('.com-pc-monto').value;
+    });
+  };
+  percBox.addEventListener('input', e => {
+    if (e.target.matches('.com-pc-jur, .com-pc-monto')) { leerPerceps(); pintarResumen(); }
+  });
+  percBox.addEventListener('change', e => {
+    if (e.target.matches('.com-pc-tipo')) leerPerceps();
+  });
+  percBox.addEventListener('click', e => {
+    if (e.target.matches('.com-it-del')) { leerPerceps(); PERCEPS.splice(+e.target.closest('.com-item').dataset.i, 1); pintarPerceps(); }
+  });
+  $('#c-add-perc').addEventListener('click', () => { leerPerceps(); PERCEPS.push({ tipo: 'iibb', jurisdiccion: '', monto: '' }); pintarPerceps(); });
+
+  aplicarMoneda();
+  pintarPerceps();
   pintarItems();
 
   // Guardar
   $('#c-guardar').addEventListener('click', async () => {
     leerItems();
+    leerPerceps();
     const fecha = $('#c-fecha').value;
     const linea_id = $('#c-linea').value;
     if (!fecha) { window.toast('Falta la fecha', 'error'); return; }
     if (!linea_id) { window.toast('Elegí la línea de negocio', 'error'); return; }
+    if (monedaSel.value === 'USD' && !(num(tcInp.value) > 0)) { window.toast('Compra en USD: cargá el TC', 'error'); return; }
     const items = ITEMS
       .filter(it => it.sku_id && num(it.cantidad) > 0 && num(it.costo) >= 0)
       .map(it => ({ sku_id: +it.sku_id, cantidad: num(it.cantidad), costo_unitario: num(it.costo) }));
@@ -418,10 +487,17 @@ function openAlta() {
         proveedor_id: provId,
         linea_id: +linea_id,
         fecha,
+        moneda: monedaSel.value === 'USD' ? 'USD' : 'ARS',
+        tc_blue: monedaSel.value === 'USD' ? num(tcInp.value) : null,
         nro_factura: $('#c-factura').value.trim() || null
       },
       items,
-      fiscales: { iva: ivaTotal(), iibb: num($('#c-iibb').value), ganancias: num($('#c-gan').value) }
+      fiscales: {
+        iva: ivaTotal(),
+        percepciones: PERCEPS
+          .map(p => ({ tipo: p.tipo, jurisdiccion: (p.jurisdiccion || '').trim(), monto: num(p.monto) }))
+          .filter(p => p.monto !== 0)
+      }
     };
 
     const btn = $('#c-guardar'); btn.disabled = true;
