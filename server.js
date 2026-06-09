@@ -3690,11 +3690,9 @@ app.post('/compras', async (req, res) => {
       }
     }
 
-    // nº de factura → notas (compras no tiene columna dedicada de comprobante)
-    const notas = [
-      compra.nro_factura ? `Factura ${String(compra.nro_factura).trim()}` : null,
-      compra.notas ? String(compra.notas).trim() : null
-    ].filter(Boolean).join(' · ') || null;
+    // N° de factura → columna dedicada. Puede quedar NULL (factura diferida: se asigna luego).
+    const nroFactura = compra.nro_factura ? String(compra.nro_factura).trim() : null;
+    const notas = compra.notas ? String(compra.notas).trim() : null;
 
     // 1) Cabecera
     const insCompra = await sbUpsert('compras', {
@@ -3705,6 +3703,7 @@ app.post('/compras', async (req, res) => {
       tc_blue: moneda === 'USD' ? tc : null,
       fecha: compra.fecha,
       estado: 'activa',
+      nro_factura: nroFactura,
       notas
     });
     const c = Array.isArray(insCompra) ? insCompra[0] : insCompra;
@@ -3928,6 +3927,28 @@ app.post('/compras/:id/anular', async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error('POST /compras/:id/anular:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Asignar / actualizar el N° de factura de una compra (factura diferida).
+// Edición acotada: solo toca nro_factura, no recalcula lotes/costos/IVA.
+app.post('/compras/:id/factura', async (req, res) => {
+  try {
+    const id = +req.params.id;
+    if (!id) return res.status(400).json({ error: 'Falta el id de la compra' });
+    const nro = req.body && req.body.nro_factura ? String(req.body.nro_factura).trim() : '';
+    if (!nro) return res.status(400).json({ error: 'Falta el número de factura' });
+
+    const rows = await sbGet('compras', `id=eq.${id}&select=id,estado`);
+    const compra = rows && rows[0];
+    if (!compra) return res.status(404).json({ error: 'Compra no encontrada' });
+    if (compra.estado === 'anulada') return res.status(409).json({ error: 'La compra está anulada' });
+
+    await sbPatch('compras', `id=eq.${id}`, { nro_factura: nro });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('POST /compras/:id/factura:', e);
     res.status(500).json({ error: e.message });
   }
 });
