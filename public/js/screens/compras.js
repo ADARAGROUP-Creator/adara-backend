@@ -24,6 +24,37 @@ const money = n => '$ ' + num(n).toLocaleString('es-AR', { minimumFractionDigits
 const ddmm = f => `${(f || '').slice(8, 10)}/${(f || '').slice(5, 7)}`;
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+// Jurisdicciones de Convenio Multilateral. El value (snake_case) es el MISMO que
+// usan las retenciones de IIBB de ventas (tabla retenciones / v_retenciones_iibb),
+// para que percepciones de compra y retenciones de venta crucen por provincia.
+const JURISDICCIONES = [
+  ['', '— Sin jurisdicción / Nacional'],
+  ['buenos_aires', 'Buenos Aires'],
+  ['caba', 'CABA'],
+  ['catamarca', 'Catamarca'],
+  ['chaco', 'Chaco'],
+  ['chubut', 'Chubut'],
+  ['cordoba', 'Córdoba'],
+  ['corrientes', 'Corrientes'],
+  ['entre_rios', 'Entre Ríos'],
+  ['formosa', 'Formosa'],
+  ['jujuy', 'Jujuy'],
+  ['la_pampa', 'La Pampa'],
+  ['la_rioja', 'La Rioja'],
+  ['mendoza', 'Mendoza'],
+  ['misiones', 'Misiones'],
+  ['neuquen', 'Neuquén'],
+  ['rio_negro', 'Río Negro'],
+  ['salta', 'Salta'],
+  ['san_juan', 'San Juan'],
+  ['san_luis', 'San Luis'],
+  ['santa_cruz', 'Santa Cruz'],
+  ['santa_fe', 'Santa Fe'],
+  ['santiago_del_estero', 'Santiago del Estero'],
+  ['tierra_del_fuego', 'Tierra del Fuego'],
+  ['tucuman', 'Tucumán'],
+];
+
 export async function loadCompras() {
   const root = document.getElementById('app-screens');
   root.innerHTML = `<div class="loading">Cargando compras…</div>`;
@@ -456,7 +487,7 @@ function openAlta() {
           <option value="iibb" ${p.tipo === 'iibb' ? 'selected' : ''}>Percep. IIBB</option>
           <option value="ganancias" ${p.tipo === 'ganancias' ? 'selected' : ''}>Percep. Ganancias</option>
         </select>
-        <input class="input com-pc-jur" placeholder="Jurisdicción (ej: IIBB CABA)" value="${esc(p.jurisdiccion)}">
+        <select class="select com-pc-jur">${JURISDICCIONES.map(([v, l]) => `<option value="${v}" ${p.jurisdiccion === v ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
         <input class="input com-pc-monto" inputmode="decimal" placeholder="Monto" value="${esc(p.monto)}">
         <button class="com-it-del" type="button" title="Quitar">✕</button>
       </div>`).join('')
@@ -472,10 +503,10 @@ function openAlta() {
     });
   };
   percBox.addEventListener('input', e => {
-    if (e.target.matches('.com-pc-jur, .com-pc-monto')) { leerPerceps(); pintarResumen(); }
+    if (e.target.matches('.com-pc-monto')) { leerPerceps(); pintarResumen(); }
   });
   percBox.addEventListener('change', e => {
-    if (e.target.matches('.com-pc-tipo')) leerPerceps();
+    if (e.target.matches('.com-pc-tipo, .com-pc-jur')) { leerPerceps(); pintarResumen(); }
   });
   percBox.addEventListener('click', e => {
     if (e.target.matches('.com-it-del')) { leerPerceps(); PERCEPS.splice(+e.target.closest('.com-item').dataset.i, 1); pintarPerceps(); }
