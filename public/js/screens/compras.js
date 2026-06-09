@@ -110,7 +110,7 @@ function renderFacturas() {
       ? `<div class="empty">No hay compras cargadas todavía.</div>`
       : `<div class="table-wrap"><table class="t">
           <thead><tr>
-            <th style="width:62px">Fecha</th><th>Proveedor</th><th style="width:150px">Línea</th>
+            <th style="width:62px">Fecha</th><th>Proveedor</th><th style="width:160px">Factura</th><th style="width:150px">Línea</th>
             <th style="width:140px;text-align:right">Total</th>
             <th style="width:140px;text-align:right">Pagado</th>
             <th style="width:140px;text-align:right">Saldo</th>
@@ -125,13 +125,21 @@ function renderFacturas() {
   document.getElementById('cf-q').addEventListener('input', e => { FILTRO.q = e.target.value; renderFacturas(); });
   document.getElementById('cf-nueva').addEventListener('click', openAlta);
   document.querySelectorAll('.com-anular').forEach(b => b.addEventListener('click', () => anularCompra(+b.dataset.id)));
+  document.querySelectorAll('.com-asignar-fac').forEach(b => b.addEventListener('click', () => asignarFactura(+b.dataset.id)));
 }
 
 function filaCompra(c) {
   const est = estadoPago(c);
+  const pendiente = c.tipo_compra === 'local' && c.estado_compra === 'activa' && !c.nro_factura;
+  const facturaCell = c.nro_factura
+    ? esc(c.nro_factura)
+    : (pendiente
+        ? `<span class="com-badge com-badge-pendiente">factura pendiente</span> <button class="com-asignar-fac" data-id="${c.compra_id}" title="Asignar N° de factura" style="font-size:12px;color:#2563EB;background:none;border:0;cursor:pointer;font:inherit;padding:2px 4px">asignar</button>`
+        : '<span class="com-muted">—</span>');
   return `<tr>
     <td>${ddmm(c.fecha)}</td>
     <td>${esc(provLabel(PROV_BY_ID[c.proveedor_id]))}</td>
+    <td>${facturaCell}</td>
     <td class="com-muted">${esc(LINEA_LABEL[c.linea_id] || '—')}</td>
     <td style="text-align:right" class="com-mono">${money(c.total_facturado_ars)}</td>
     <td style="text-align:right" class="com-mono com-muted">${money(c.pagado_ars)}</td>
@@ -139,6 +147,23 @@ function filaCompra(c) {
     <td><span class="com-badge com-badge-${est}">${est}</span></td>
     <td style="text-align:right"><button class="com-anular" data-id="${c.compra_id}" title="Anular compra" style="font-size:12px;color:#B91C1C;background:none;border:0;cursor:pointer;font:inherit;padding:2px 4px">Anular</button></td>
   </tr>`;
+}
+
+async function asignarFactura(id) {
+  const nro = prompt('N° de factura del proveedor (ej: A 0001-00001234):');
+  if (nro == null) return;
+  if (!nro.trim()) { window.toast('Poné el número de factura', 'error'); return; }
+  try {
+    const r = await fetch('/compras/' + id + '/factura', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nro_factura: nro.trim() })
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || (r.status + ' ' + r.statusText));
+    window.toast('Factura asignada');
+    await recargar();
+    renderFacturas();
+  } catch (e) { window.toast('Error: ' + e.message, 'error'); }
 }
 
 async function anularCompra(id) {
