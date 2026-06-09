@@ -51,13 +51,30 @@ const COMPROBANTES = [
 ];
 const COMP_CORTO = { factura_a: 'Fra A', factura_b: 'Fra B', factura_c: 'Fra C', ticket: 'Ticket', sin_factura: 'Sin fra' };
 
-const FORMAS_PAGO = [
-  ['efectivo', 'Efectivo'],
-  ['transferencia', 'Transferencia'],
-  ['mp', 'Mercado Pago'],
-  ['tarjeta', 'Tarjeta'],
-  ['debito_automatico', 'Débito automático'],
+// Selector único de "Pago": combina forma_pago + cuenta_origen en una sola
+// elección (antes eran dos selects que el usuario tenía que llenar redundante).
+// Por dentro sigue guardando forma_pago + cuenta_origen_intencion derivados, así
+// que NO cambia ni la tabla ni el matching (ambos son "intención", la verdad del
+// pago vive en vinculos + movimientos.cuenta_id).
+// Notas:
+// - Tarjeta: cuenta vacía. El gasto se concilia vía el desglose del resumen
+//   (aparece un único débito agregado en Supervielle, no el cargo individual).
+// - USDT/Trust Wallet: forma_pago='transferencia' (el CHECK de gastos.forma_pago
+//   no admite 'usdt'); la cuenta trust_wallet es la que lo distingue como cripto.
+//   Trust Wallet está creada como caja USD (decisión: simple > tipo cripto propio).
+// [value, label, forma_pago, cuenta_origen, moneda sugerida]
+const PAGO_OPCIONES = [
+  ['efectivo_caja_ars',  'Efectivo — Caja ARS',             'efectivo',          'caja_ars',        'ARS'],
+  ['efectivo_caja_usd',  'Efectivo — Caja USD',             'efectivo',          'caja_usd',        'USD'],
+  ['transferencia_svl',  'Transferencia — Supervielle',     'transferencia',     'supervielle_ars', 'ARS'],
+  ['debito_svl',         'Débito automático — Supervielle', 'debito_automatico', 'supervielle_ars', 'ARS'],
+  ['mp',                 'Mercado Pago',                    'mp',                'mp_ars',          'ARS'],
+  ['tarjeta',            'Tarjeta',                         'tarjeta',           '',                'ARS'],
+  ['usdt_trust',         'USDT — Trust Wallet',             'transferencia',     'trust_wallet',    'USD'],
 ];
+const PAGO_MAP = Object.fromEntries(
+  PAGO_OPCIONES.map(([v, , fp, co, mon]) => [v, { forma_pago: fp, cuenta_origen: co || null, moneda: mon }])
+);
 
 const FISCAL_TIPOS = [
   ['ret_ganancias', 'Retención Ganancias'],
@@ -73,7 +90,7 @@ const FISCAL_TIPOS = [
 const RET_SET = new Set(['ret_ganancias', 'ret_iva', 'ret_iibb', 'ret_suss', 'otro_ret']);
 
 const LABEL_ESTADO = { usd_sin_tc: 'USD sin TC', pendiente: 'Pendiente', parcial: 'Parcial', pagado: 'Pagado' };
-const LABEL_CUENTA = { supervielle_ars: 'Supervielle ARS', mp_ars: 'MP ARS', caja_ars: 'Caja ARS', caja_usd: 'Caja USD' };
+const LABEL_CUENTA = { supervielle_ars: 'Supervielle ARS', mp_ars: 'MP ARS', caja_ars: 'Caja ARS', caja_usd: 'Caja USD', trust_wallet: 'Trust Wallet (USDT)' };
 
 const hoyISO = () => new Date().toISOString().slice(0, 10);
 
@@ -241,8 +258,7 @@ function openModalNuevo() {
   const optLinea = '<option value="">Elegí línea…</option>' + LINEAS.map(l => `<option value="${l.id}">${esc(LINEA_LABEL[l.id])}</option>`).join('');
   const optProv = '<option value="">— Sin proveedor —</option>' + PROVEEDORES.map(p => `<option value="${p.id}">${esc(provLabel(p))}</option>`).join('');
   const optComp = COMPROBANTES.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
-  const optForma = '<option value="">— Sin especificar —</option>' + FORMAS_PAGO.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
-  const optCuenta = '<option value="">— Sin especificar —</option>' + CUENTAS.map(c => `<option value="${c.codigo}">${LABEL_CUENTA[c.codigo] || c.codigo}</option>`).join('');
+  const optPago = '<option value="">— Sin especificar —</option>' + PAGO_OPCIONES.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
   const optFiscal = FISCAL_TIPOS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
 
   overlay.innerHTML = `
@@ -305,10 +321,7 @@ function openModalNuevo() {
 
       <div class="gas-resumen" id="g-resumen"></div>
 
-      <div class="gas-grid2">
-        <div class="field"><label>Forma de pago (opcional)</label><select class="select" id="g-forma">${optForma}</select></div>
-        <div class="field"><label>Cuenta origen (intención)</label><select class="select" id="g-cuenta">${optCuenta}</select></div>
-      </div>
+      <div class="field"><label>Pago</label><select class="select" id="g-pago">${optPago}</select></div>
 
       <div class="modal-actions">
         <button class="btn btn-ghost" id="g-cancel">Cancelar</button>
@@ -401,6 +414,14 @@ function openModalNuevo() {
   compSel.addEventListener('change', aplicarComprobante);
   monedaSel.addEventListener('change', aplicarMoneda);
 
+  // Al elegir el pago, auto-sugiere la moneda (USD para Caja USD / Trust Wallet).
+  // Queda editable por si hay un caso atípico (ej: gasto USD pagado en ARS).
+  const pagoEl = $('#g-pago');
+  pagoEl.addEventListener('change', () => {
+    const m = PAGO_MAP[pagoEl.value];
+    if (m && m.moneda) { monedaSel.value = m.moneda; aplicarMoneda(); }
+  });
+
   // Renglones fiscales (repeater)
   function addFiscRow() {
     const row = document.createElement('div');
@@ -456,8 +477,10 @@ function openModalNuevo() {
     const neto = parseFloat(netoInp.value);
     const iva = esA ? (parseFloat(ivaInp.value) || 0) : 0;
     const tcVal = $('#g-tc').value;
-    const forma_pago = $('#g-forma').value || null;
-    const cuenta_origen_intencion = $('#g-cuenta').value || null;
+    const pagoVal = $('#g-pago').value;
+    const pagoMap = PAGO_MAP[pagoVal] || {};
+    const forma_pago = pagoMap.forma_pago || null;
+    const cuenta_origen_intencion = pagoMap.cuenta_origen || null;
     const proveedor_id = $('#g-prov').value ? +$('#g-prov').value : null;
     const nro_comprobante = $('#g-nro').value.trim() || null;
     const fiscal = leerFiscal();
