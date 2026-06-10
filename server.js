@@ -3632,14 +3632,24 @@ app.post('/proveedores', async (req, res) => {
   try {
     const { nombre, cuit } = req.body || {};
     if (!nombre || !String(nombre).trim()) return res.status(400).json({ error: 'Falta el nombre del proveedor' });
+    const nombreClean = String(nombre).trim().replace(/\s+/g, ' ');
     const cuitNorm = String(cuit || '').replace(/\D/g, '');
-    if (cuitNorm.length !== 11) return res.status(400).json({ error: 'El CUIT es obligatorio (11 dígitos)' });
-    // No duplicar: si ya existe un proveedor con ese CUIT, lo devolvemos
-    const existentes = await sbGet('proveedores', `cuit=eq.${cuitNorm}`);
+    // El CUIT es OPCIONAL (proveedores informales / compras sin factura). Si se carga, debe ser válido.
+    if (cuitNorm.length && cuitNorm.length !== 11) {
+      return res.status(400).json({ error: 'Si cargás CUIT, debe tener 11 dígitos' });
+    }
+    // Dedup: con CUIT, por CUIT; sin CUIT, por nombre normalizado (solo entre los que tampoco tienen CUIT),
+    // para no duplicar el mismo proveedor informal. ilike sin comodines = match exacto case-insensitive.
+    let existentes;
+    if (cuitNorm.length === 11) {
+      existentes = await sbGet('proveedores', `cuit=eq.${cuitNorm}`);
+    } else {
+      existentes = await sbGet('proveedores', `cuit=is.null&nombre=ilike.${encodeURIComponent(nombreClean)}`);
+    }
     if (existentes && existentes[0]) return res.json(existentes[0]);
     const ins = await sbUpsert('proveedores', {
-      nombre: String(nombre).trim(),
-      cuit: cuitNorm,
+      nombre: nombreClean,
+      cuit: cuitNorm.length === 11 ? cuitNorm : null,
       activo: true
     });
     const p = Array.isArray(ins) ? ins[0] : ins;
