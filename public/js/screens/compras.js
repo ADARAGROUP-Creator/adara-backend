@@ -273,10 +273,12 @@ function filaCC(f) {
 // ── Alta de compra local ──────────────────────────────────────────────────
 let ITEMS = [];
 let PERCEPS = [];   // percepciones de la factura: { tipo:'iibb'|'ganancias', jurisdiccion, monto }
+let GASTOS = [];    // gastos prorrateables (flete/comisión/despacho a terceros): { concepto, monto }
 
 function openAlta() {
-  ITEMS = [{ sku_id: '', cantidad: '', costo: '', iva: 0.21 }];
+  ITEMS = [{ sku_id: '', cantidad: '', costo: '', iva: 0.21, extra: '' }];
   PERCEPS = [];
+  GASTOS = [];
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.innerHTML = `
@@ -326,6 +328,14 @@ function openAlta() {
         <div class="field" style="max-width:240px"><label>IVA (automático)</label><input class="input" id="c-iva-disp" readonly value="$ 0,00"></div>
         <div class="com-block-h" style="margin-top:10px"><span>Percepciones (una por jurisdicción)</span><button class="btn btn-ghost com-mini" id="c-add-perc" type="button">+ percepción</button></div>
         <div id="c-perceps"></div>
+      </div>
+
+      <div class="com-block">
+        <div class="com-block-h"><span>Gastos prorrateables (flete, comisión, despacho — van al costo, no a la cuenta del proveedor)</span><button class="btn btn-ghost com-mini" id="c-add-gasto" type="button">+ gasto</button></div>
+        <div class="field" style="max-width:240px"><label>Criterio de reparto</label>
+          <select class="select" id="c-criterio"><option value="costo">Por costo neto</option><option value="unidades">Por unidades</option></select>
+        </div>
+        <div id="c-gastos" style="margin-top:8px"></div>
       </div>
 
       <div class="com-resumen" id="c-resumen"></div>
@@ -397,6 +407,7 @@ function openAlta() {
         <select class="select com-it-sku"><option value="">SKU…</option>${SKUS.map(s => `<option value="${s.id}" ${String(it.sku_id) === String(s.id) ? 'selected' : ''}>${esc(skuLabel(s))}</option>`).join('')}</select>
         <input class="input com-it-cant" inputmode="decimal" placeholder="Cant." value="${esc(it.cantidad)}">
         <input class="input com-it-costo" inputmode="decimal" placeholder="Costo unit." value="${esc(it.costo)}">
+        <input class="input com-it-extra" inputmode="decimal" placeholder="Extra (flete/comis.)" value="${esc(it.extra || '')}">
         <select class="select com-it-iva">
           <option value="0.21" ${num(it.iva) === 0.21 ? 'selected' : ''}>IVA 21%</option>
           <option value="0.105" ${num(it.iva) === 0.105 ? 'selected' : ''}>IVA 10,5%</option>
@@ -414,14 +425,16 @@ function openAlta() {
       ITEMS[i].sku_id = row.querySelector('.com-it-sku').value;
       ITEMS[i].cantidad = row.querySelector('.com-it-cant').value;
       ITEMS[i].costo = row.querySelector('.com-it-costo').value;
+      ITEMS[i].extra = row.querySelector('.com-it-extra').value;
       ITEMS[i].iva = Number(row.querySelector('.com-it-iva').value);
     });
   };
   itemsBox.addEventListener('input', e => {
-    if (e.target.matches('.com-it-cant, .com-it-costo')) {
+    if (e.target.matches('.com-it-cant, .com-it-costo, .com-it-extra')) {
       const row = e.target.closest('.com-item'); const i = +row.dataset.i;
       ITEMS[i].cantidad = row.querySelector('.com-it-cant').value;
       ITEMS[i].costo = row.querySelector('.com-it-costo').value;
+      ITEMS[i].extra = row.querySelector('.com-it-extra').value;
       row.querySelector('.com-it-sub').textContent = money(num(ITEMS[i].cantidad) * num(ITEMS[i].costo));
       pintarResumen();
     }
@@ -443,7 +456,7 @@ function openAlta() {
   itemsBox.addEventListener('click', e => {
     if (e.target.matches('.com-it-del')) { leerItems(); ITEMS.splice(+e.target.closest('.com-item').dataset.i, 1); pintarItems(); }
   });
-  $('#c-add-item').addEventListener('click', () => { leerItems(); ITEMS.push({ sku_id: '', cantidad: '', costo: '', iva: 0.21 }); pintarItems(); });
+  $('#c-add-item').addEventListener('click', () => { leerItems(); ITEMS.push({ sku_id: '', cantidad: '', costo: '', iva: 0.21, extra: '' }); pintarItems(); });
 
   // Moneda / TC
   const monedaSel = $('#c-moneda');
@@ -454,21 +467,31 @@ function openAlta() {
 
   const ivaTotal = () => ITEMS.reduce((s, it) => s + num(it.cantidad) * num(it.costo) * num(it.iva), 0);
   const percepTotal = () => PERCEPS.reduce((s, p) => s + num(p.monto), 0);
+  const gastosTotal = () => GASTOS.reduce((s, g) => s + num(g.monto), 0);
+  const extrasTotal = () => ITEMS.reduce((s, it) => s + num(it.extra), 0);
 
   const pintarResumen = () => {
     const neto = ITEMS.reduce((s, it) => s + num(it.cantidad) * num(it.costo), 0);
     const iva = ivaTotal();
     const perc = percepTotal();
-    const total = neto + iva + perc;
+    const extras = extrasTotal();
+    const gastos = gastosTotal();
+    const costoMerc = neto + extras + gastos;       // entra al stock (costo del lote)
+    const totalFactura = neto + iva + perc;          // lo que le debés al proveedor del producto
     const disp = $('#c-iva-disp'); if (disp) disp.value = mon(iva);
     const tc = num(tcInp.value);
     const equivArs = (monActual() === 'USD' && tc > 0)
-      ? `<div class="com-res-r com-muted"><span>Equivalente en ARS (TC ${num(tc).toLocaleString('es-AR')})</span><span class="com-mono">$ ${(total * tc).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span></div>`
+      ? `<div class="com-res-r com-muted"><span>Total factura en ARS (TC ${num(tc).toLocaleString('es-AR')})</span><span class="com-mono">$ ${(totalFactura * tc).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span></div>`
+      : '';
+    const lineaExtras = (extras + gastos > 0)
+      ? `<div class="com-res-r com-muted"><span>+ extras por producto + gastos prorrateables (al costo)</span><span class="com-mono">${mon(extras + gastos)}</span></div>
+      <div class="com-res-r"><span>= Costo total de la mercadería (entra al stock)</span><span class="com-mono">${mon(costoMerc)}</span></div>`
       : '';
     $('#c-resumen').innerHTML = `
-      <div class="com-res-r"><span>Productos (neto, va al costo)</span><span class="com-mono">${mon(neto)}</span></div>
-      <div class="com-res-r com-muted"><span>+ IVA (auto) + percepciones (crédito)</span><span class="com-mono">${mon(iva + perc)}</span></div>
-      <div class="com-res-r com-res-strong"><span>Total factura (lo que le debés)</span><span class="com-mono">${mon(total)}</span></div>
+      <div class="com-res-r"><span>Productos (neto)</span><span class="com-mono">${mon(neto)}</span></div>
+      ${lineaExtras}
+      <div class="com-res-r com-muted"><span>+ IVA (auto) + percepciones (crédito fiscal)</span><span class="com-mono">${mon(iva + perc)}</span></div>
+      <div class="com-res-r com-res-strong"><span>Total factura — lo que le debés al proveedor</span><span class="com-mono">${mon(totalFactura)}</span></div>
       ${equivArs}`;
   };
 
@@ -514,14 +537,43 @@ function openAlta() {
   });
   $('#c-add-perc').addEventListener('click', () => { leerPerceps(); PERCEPS.push({ tipo: 'iibb', jurisdiccion: '', monto: '' }); pintarPerceps(); });
 
+  // Repeater de gastos prorrateables (flete/comisión/despacho a terceros → costo del lote)
+  const gastoBox = $('#c-gastos');
+  const pintarGastos = () => {
+    gastoBox.innerHTML = GASTOS.length ? GASTOS.map((g, i) => `
+      <div class="com-item com-gasto-item" data-i="${i}">
+        <input class="input com-ga-conc" placeholder="Concepto (flete, comisión…)" value="${esc(g.concepto || '')}">
+        <input class="input com-ga-monto" inputmode="decimal" placeholder="Monto" value="${esc(g.monto)}">
+        <button class="com-it-del" type="button" title="Quitar">✕</button>
+      </div>`).join('')
+      : `<div class="com-muted" style="padding:4px 0;font-size:13px">Sin gastos prorrateables. Agregá flete, comisión o despacho a repartir.</div>`;
+    pintarResumen();
+  };
+  const leerGastos = () => {
+    gastoBox.querySelectorAll('.com-item').forEach(row => {
+      const i = +row.dataset.i;
+      GASTOS[i].concepto = row.querySelector('.com-ga-conc').value;
+      GASTOS[i].monto = row.querySelector('.com-ga-monto').value;
+    });
+  };
+  gastoBox.addEventListener('input', e => {
+    if (e.target.matches('.com-ga-conc, .com-ga-monto')) { leerGastos(); pintarResumen(); }
+  });
+  gastoBox.addEventListener('click', e => {
+    if (e.target.matches('.com-it-del')) { leerGastos(); GASTOS.splice(+e.target.closest('.com-item').dataset.i, 1); pintarGastos(); }
+  });
+  $('#c-add-gasto').addEventListener('click', () => { leerGastos(); GASTOS.push({ concepto: '', monto: '' }); pintarGastos(); });
+
   aplicarMoneda();
   pintarPerceps();
+  pintarGastos();
   pintarItems();
 
   // Guardar
   $('#c-guardar').addEventListener('click', async () => {
     leerItems();
     leerPerceps();
+    leerGastos();
     const fecha = $('#c-fecha').value;
     const linea_id = $('#c-linea').value;
     if (!fecha) { window.toast('Falta la fecha', 'error'); return; }
@@ -529,7 +581,7 @@ function openAlta() {
     if (monedaSel.value === 'USD' && !(num(tcInp.value) > 0)) { window.toast('Compra en USD: cargá el TC', 'error'); return; }
     const items = ITEMS
       .filter(it => it.sku_id && num(it.cantidad) > 0 && num(it.costo) >= 0)
-      .map(it => ({ sku_id: +it.sku_id, cantidad: num(it.cantidad), costo_unitario: num(it.costo) }));
+      .map(it => ({ sku_id: +it.sku_id, cantidad: num(it.cantidad), costo_unitario: num(it.costo), extra_directo: num(it.extra) }));
     if (!items.length) { window.toast('Cargá al menos un producto con SKU, cantidad y costo', 'error'); return; }
 
     // Si quedó un proveedor a medio cargar en el alta rápida (CUIT o nombre) y no se creó, lo creamos ahora
@@ -554,6 +606,12 @@ function openAlta() {
         percepciones: PERCEPS
           .map(p => ({ tipo: p.tipo, jurisdiccion: (p.jurisdiccion || '').trim(), monto: num(p.monto) }))
           .filter(p => p.monto !== 0)
+      },
+      gastos: {
+        criterio: $('#c-criterio').value,
+        prorrateables: GASTOS
+          .map(g => ({ concepto: (g.concepto || '').trim(), monto: num(g.monto) }))
+          .filter(g => g.monto > 0)
       }
     };
 
@@ -597,7 +655,7 @@ function inyectarEstilo() {
     .com-row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
     .com-block{border:1px solid #E7E5E4;border-radius:10px;padding:12px;margin:12px 0}
     .com-block-h{display:flex;justify-content:space-between;align-items:center;font-size:13px;font-weight:600;color:#44403C;margin-bottom:8px}
-    .com-item{display:grid;grid-template-columns:1fr 70px 108px 108px 96px 26px;gap:8px;align-items:center;margin-bottom:8px}
+    .com-item{display:grid;grid-template-columns:1fr 58px 92px 92px 84px 80px 24px;gap:7px;align-items:center;margin-bottom:8px}
     .com-it-sub{text-align:right;font-size:13px;color:#57534E}
     .com-it-del{border:0;background:transparent;color:#A8A29E;cursor:pointer;font-size:14px}
     .com-it-del:hover{color:#B91C1C}
@@ -605,6 +663,7 @@ function inyectarEstilo() {
     .com-res-r{display:flex;justify-content:space-between;font-size:14px;padding:3px 0}
     .com-res-strong{font-weight:700;font-size:15px;border-top:1px dashed #E7E5E4;margin-top:4px;padding-top:8px}
     .com-perc-item{grid-template-columns:140px 1fr 120px 26px}
+    .com-gasto-item{grid-template-columns:1fr 120px 26px}
     #com-body .table-wrap{border:1px solid #E7E5E4;border-radius:12px;overflow:hidden;background:#fff}
     #com-body table.t{width:100%;border-collapse:collapse;font-size:14px}
     #com-body table.t thead th{background:#FAFAF9;color:#78716C;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;padding:11px 14px;border-bottom:1px solid #E7E5E4;text-align:left;white-space:nowrap}
