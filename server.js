@@ -3669,7 +3669,7 @@ app.post('/compras', async (req, res) => {
   const round2 = n => Math.round((Number(n) || 0) * 100) / 100;
   let compraId = null;
   try {
-    const { compra, items, fiscales } = req.body || {};
+    const { compra, items, fiscales, gastos } = req.body || {};
     if (!compra) return res.status(400).json({ error: 'Falta el objeto compra' });
     for (const f of ['fecha', 'linea_id']) {
       if (compra[f] === undefined || compra[f] === null || compra[f] === '') {
@@ -3688,8 +3688,34 @@ app.post('/compras', async (req, res) => {
 
     const prods = (Array.isArray(items) ? items : [])
       .filter(x => x && x.sku_id && Number(x.cantidad) > 0 && Number(x.costo_unitario) >= 0)
-      .map(x => ({ sku_id: +x.sku_id, cantidad: Number(x.cantidad), costo_unitario: round2(x.costo_unitario) }));
+      .map(x => ({ sku_id: +x.sku_id, cantidad: Number(x.cantidad), costo_unitario: round2(x.costo_unitario), extra: round2(x.extra_directo) }));
     if (!prods.length) return res.status(400).json({ error: 'Cargá al menos un producto con cantidad y costo' });
+
+    // Gastos que van al COSTO del lote pero NO son crédito fiscal ni deuda con el proveedor del
+    // producto (flete/comisión/despacho a terceros). Dos formas, que conviven:
+    //   - extra_directo por producto: suma sólo a ese lote (p.extra, total de la línea).
+    //   - prorrateables compartidos: se reparten entre todos por criterio (costo neto / unidades).
+    // Todo en la moneda de la factura; el lote se congela a ARS al TC. Ver ADARA-COMPRAS-IMPORTACIONES.md.
+    const gastosIn = (gastos && Array.isArray(gastos.prorrateables)) ? gastos.prorrateables : [];
+    const prorrateables = gastosIn
+      .map(g => ({ concepto: (g && g.concepto) ? String(g.concepto).trim() : null, monto: round2(g && g.monto) }))
+      .filter(g => g.monto > 0);
+    const criterio = (gastos && gastos.criterio === 'unidades') ? 'unidades' : 'costo';
+    const totalProrr = round2(prorrateables.reduce((acc, g) => acc + g.monto, 0));
+    const sumBase = prods.reduce((acc, p) => acc + p.costo_unitario * p.cantidad, 0);
+    const sumCant = prods.reduce((acc, p) => acc + p.cantidad, 0);
+    // Base del reparto: por costo neto (default) o por unidades. Si la base de costo es 0, cae a unidades.
+    const usarCosto = criterio === 'costo' && sumBase > 0;
+    const baseReparto = usarCosto ? sumBase : sumCant;
+    // Costo unitario FINAL de cada lote (moneda factura): base + extra/u + prorrateo/u, redondeado a ARS una sola vez.
+    const loteCosto = prods.map(p => {
+      const baseLinea = p.costo_unitario * p.cantidad;
+      const peso = baseReparto > 0 ? (usarCosto ? baseLinea : p.cantidad) / baseReparto : 0;
+      const totalLinea = baseLinea + p.extra + totalProrr * peso;   // moneda de la factura
+      const unitInvoice = totalLinea / p.cantidad;
+      const unitARS = moneda === 'USD' ? round2(unitInvoice * tc) : round2(unitInvoice);
+      return { sku_id: p.sku_id, cantidad: p.cantidad, unitARS };
+    });
 
     // Componentes fiscales: IVA (automático) + N percepciones (IIBB/Ganancias) por jurisdicción.
     // Se guardan en la moneda de la factura; v_compras_ap los lleva a ARS con tc_blue.
@@ -3731,10 +3757,10 @@ app.post('/compras', async (req, res) => {
       compra_id: compraId, tipo: 'producto', sku_id: p.sku_id,
       cantidad: p.cantidad, moneda, monto: round2(p.costo_unitario * p.cantidad)
     })));
-    await sbUpsert('lotes', prods.map(p => ({
+    await sbUpsert('lotes', loteCosto.map(p => ({
       sku_id: p.sku_id, compra_id: compraId,
       cantidad_inicial: p.cantidad, cantidad_actual: p.cantidad,
-      costo_unitario: aARS(p.costo_unitario), fecha_alta: compra.fecha
+      costo_unitario: p.unitARS, fecha_alta: compra.fecha
     })));
 
     // 3) Componentes fiscales (crédito — no suman al costo del lote), en la moneda de la factura
@@ -3743,6 +3769,17 @@ app.post('/compras', async (req, res) => {
         compra_id: compraId, tipo: x.tipo, moneda, monto: x.monto, descripcion: x.descripcion
       })));
     }
+
+    // 3b) Costos no-proveedor: van al COSTO del lote (ya están dentro de costo_unitario) pero NO a
+    //     la cuenta corriente del proveedor. Se guardan como rastro auditable. v_compras_ap los excluye.
+    const costoExtra = [];
+    for (const p of prods) {
+      if (p.extra > 0) costoExtra.push({ compra_id: compraId, tipo: 'extra_directo', clase: 'directo', sku_id: p.sku_id, moneda, monto: p.extra, descripcion: null });
+    }
+    for (const g of prorrateables) {
+      costoExtra.push({ compra_id: compraId, tipo: 'gasto_prorrateable', clase: criterio, moneda, monto: g.monto, descripcion: g.concepto });
+    }
+    if (costoExtra.length) await sbUpsert('compra_componentes', costoExtra);
 
     res.json({ ok: true, compra_id: compraId });
   } catch (e) {
