@@ -9,6 +9,7 @@ import { loadCompras } from './screens/compras.js';
 import { loadPSI } from './screens/psi.js';
 import { loadCosteo } from './screens/costeo.js';
 import { loadResultado } from './screens/resultado.js';
+import { loadPosicionFiscal } from './screens/posicion-fiscal.js';
 
 const screens = {
   home: { fn: loadHome, title: 'Home', sub: 'Resumen del estado actual' },
@@ -20,7 +21,8 @@ const screens = {
   compras: { fn: loadCompras, title: 'Compras', sub: 'Facturas de mercadería y cuenta corriente' },
   psi: { fn: loadPSI, title: 'PSI Recompra', sub: 'Planificación de recompra por SKU' },
   costeo: { fn: loadCosteo, title: 'Inventario', sub: 'Valor del stock y productos sin costo' },
-  resultado: { fn: loadResultado, title: 'Resultado', sub: 'Estado de resultado mensual por línea' }
+  resultado: { fn: loadResultado, title: 'Resultado', sub: 'Estado de resultado mensual por línea' },
+  posicion_fiscal: { fn: loadPosicionFiscal, title: 'Posición Fiscal', sub: 'IVA, IIBB y pagos a cuenta del período' }
 };
 
 async function route() {
