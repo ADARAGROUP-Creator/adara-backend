@@ -291,11 +291,11 @@ function openAlta() {
         </div>
         <div id="c-prov-new" style="display:none;flex-direction:column;gap:8px;margin-top:8px">
           <div style="display:flex;gap:8px;align-items:center">
-            <input class="input" id="c-prov-cuit" placeholder="CUIT (sin guiones)" style="width:200px">
+            <input class="input" id="c-prov-cuit" placeholder="CUIT (opcional, sin guiones)" style="width:200px">
             <span id="c-prov-status" style="font-size:12px;color:#78716C"></span>
           </div>
           <div style="display:flex;gap:8px;align-items:center">
-            <input class="input" id="c-prov-nombre" placeholder="Nombre (se completa con el CUIT)" style="flex:1">
+            <input class="input" id="c-prov-nombre" placeholder="Nombre (con o sin CUIT)" style="flex:1">
             <button class="btn btn-primary com-mini" id="c-prov-crear" type="button">Crear</button>
           </div>
         </div>
@@ -365,15 +365,16 @@ function openAlta() {
   }
   $('#c-prov-cuit').addEventListener('blur', buscarPadronProv);
 
-  // Crea (o reutiliza por CUIT) el proveedor a partir del alta rápida. Devuelve el proveedor o null.
-  async function crearProveedorDesdeCuit() {
+  // Crea (o reutiliza) el proveedor del alta rápida. Con CUIT: dedup por CUIT (+ ARCA). Sin CUIT: dedup por nombre. Devuelve el proveedor o null.
+  async function crearProveedorRapido() {
     const cuit = $('#c-prov-cuit').value.replace(/\D/g, '');
-    if (cuit.length !== 11) { window.toast('El CUIT es obligatorio (11 dígitos)', 'error'); return null; }
-    if (!$('#c-prov-nombre').value.trim()) await buscarPadronProv();
+    if (cuit && cuit.length !== 11) { window.toast('Si cargás CUIT, debe tener 11 dígitos', 'error'); return null; }
+    if (cuit.length === 11 && !$('#c-prov-nombre').value.trim()) await buscarPadronProv();
     const nombre = $('#c-prov-nombre').value.trim();
-    if (!nombre) { window.toast('No se pudo traer el nombre desde ARCA; revisá el CUIT o escribilo a mano', 'error'); return null; }
+    if (!nombre) { window.toast(cuit.length === 11 ? 'No se pudo traer el nombre desde ARCA; escribilo a mano' : 'Cargá el nombre del proveedor', 'error'); return null; }
     try {
-      const r = await fetch('/proveedores', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nombre, cuit }) });
+      const body = cuit.length === 11 ? { nombre, cuit } : { nombre };
+      const r = await fetch('/proveedores', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       const p = await r.json();
       if (!r.ok) throw new Error(p.error || r.statusText);
       if (!PROV_BY_ID[p.id]) { PROVEEDORES.push(p); PROV_BY_ID[p.id] = p; PROVEEDORES.sort((a, b) => provLabel(a).localeCompare(provLabel(b))); }
@@ -384,7 +385,7 @@ function openAlta() {
     } catch (e) { window.toast('Error: ' + e.message, 'error'); return null; }
   }
   $('#c-prov-crear').addEventListener('click', async () => {
-    const p = await crearProveedorDesdeCuit();
+    const p = await crearProveedorRapido();
     if (p) window.toast('Proveedor listo');
   });
 
@@ -531,10 +532,10 @@ function openAlta() {
       .map(it => ({ sku_id: +it.sku_id, cantidad: num(it.cantidad), costo_unitario: num(it.costo) }));
     if (!items.length) { window.toast('Cargá al menos un producto con SKU, cantidad y costo', 'error'); return; }
 
-    // Si quedó un CUIT cargado en el alta rápida y no se creó el proveedor, lo creamos ahora
+    // Si quedó un proveedor a medio cargar en el alta rápida (CUIT o nombre) y no se creó, lo creamos ahora
     let provId = $('#c-prov').value ? +$('#c-prov').value : null;
-    if (!provId && $('#c-prov-cuit').value.replace(/\D/g, '').length === 11) {
-      const np = await crearProveedorDesdeCuit();
+    if (!provId && ($('#c-prov-cuit').value.replace(/\D/g, '').length === 11 || $('#c-prov-nombre').value.trim())) {
+      const np = await crearProveedorRapido();
       if (np) provId = np.id;
     }
 
