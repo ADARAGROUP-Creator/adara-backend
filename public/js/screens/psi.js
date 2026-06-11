@@ -212,10 +212,10 @@ function render() {
 
     ${ROWS.length === 0
       ? `<div class="empty">No hay ventas en el rango seleccionado.</div>`
-      : `<div class="table-wrap"><table class="t psi-t">
+      : `<div class="table-wrap psi-wrap"><table class="t psi-t">
           <thead><tr>
             <th class="psi-sticky">SKU</th>
-            <th>Producto</th>
+            <th class="psi-sticky2">Producto</th>
             ${theadSem}
             <th class="psi-c">Prom/sem</th>
             <th class="psi-c">Stock</th>
@@ -255,7 +255,7 @@ function filaHTML(r) {
     : `<span class="psi-cod">${esc(r.cod)}</span>${!r.enCatalogo ? ' <span class="psi-tag-empty" title="No está en el catálogo skus">?</span>' : ''}`;
   return `<tr>
     <td class="psi-sticky">${codCell}</td>
-    <td class="psi-prod" title="${esc(r.producto)}">${esc(r.producto)}</td>
+    <td class="psi-prod psi-sticky2" title="${esc(r.producto)}">${esc(r.producto)}</td>
     ${sem}
     <td class="psi-c psi-mono">${fmtNum(r.promSem, 1)}</td>
     <td class="psi-c psi-mono">${r.stock > 0 ? fmtNum(r.stock) : '<span class="psi-muted">0</span>'}</td>
@@ -351,7 +351,9 @@ function inyectarEstilo() {
     .psi-wk{font-weight:500;color:#78716C;min-width:46px}
     .psi-mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums}
     .psi-muted{color:#A8A29E}
-    .psi-sticky{position:sticky;left:0;background:#fff;z-index:1}
+    .psi-wrap{overflow-x:auto;max-width:100%}
+    .psi-sticky{position:sticky;left:0;background:#fff;z-index:2;width:80px;min-width:80px}
+    .psi-sticky2{position:sticky;left:80px;background:#fff;z-index:2}
     .psi-cod{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:13px;color:#D97706;font-weight:600}
     .psi-prod{max-width:220px;overflow:hidden;text-overflow:ellipsis}
     .psi-recompra{color:#B91C1C;font-weight:700}
