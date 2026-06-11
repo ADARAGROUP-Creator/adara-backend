@@ -15,6 +15,7 @@ const fetch   = require('node-fetch');
 const multer  = require('multer');
 const XLSX    = require('xlsx');
 const forge   = require('node-forge');
+const crypto  = require('crypto');
 
 const app    = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -35,6 +36,7 @@ const {
   SUPABASE_URL,
   SUPABASE_KEY,
   SUPABASE_ANON_KEY,
+  SUPABASE_JWT_SECRET,
   ML_CLIENT_ID,
   ML_CLIENT_SECRET,
   ML_REDIRECT_URI,
@@ -44,6 +46,41 @@ const {
   TF_USER_ID,
   PORT = 3000
 } = process.env;
+
+// Candado de autenticacion: todo endpoint exige el token del usuario logueado (Supabase Auth,
+// HS256 con el JWT secret del proyecto). Publicos: estaticos (ya servidos), /health, /config y
+// el OAuth de ML. Si SUPABASE_JWT_SECRET no esta cargado, NO bloquea (transicion); el candado
+// real es RLS. Ver ADARA-AUTH.md.
+function b64urlToBuf(x) { return Buffer.from(String(x).replace(/-/g, '+').replace(/_/g, '/'), 'base64'); }
+function verifySupabaseJWT(token) {
+  if (!SUPABASE_JWT_SECRET) return null;
+  const parts = String(token).split('.');
+  if (parts.length !== 3) return null;
+  const [h, p, sig] = parts;
+  let header, payload;
+  try { header = JSON.parse(b64urlToBuf(h).toString('utf8')); payload = JSON.parse(b64urlToBuf(p).toString('utf8')); } catch { return null; }
+  if (header.alg !== 'HS256') return null;
+  const expected = crypto.createHmac('sha256', SUPABASE_JWT_SECRET).update(h + '.' + p).digest();
+  const got = b64urlToBuf(sig);
+  if (expected.length !== got.length || !crypto.timingSafeEqual(expected, got)) return null;
+  if (payload.exp && Date.now() / 1000 > payload.exp) return null;
+  return payload;
+}
+const AUTH_PUBLIC = [/^\/health/, /^\/config/, /^\/ml\/auth/, /^\/ml\/callback/];
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') return next();
+  if (AUTH_PUBLIC.some(re => re.test(req.path))) return next();
+  if (!SUPABASE_JWT_SECRET) {
+    if (!global.__warnedNoJwt) { console.warn('SUPABASE_JWT_SECRET sin configurar: candado del backend INACTIVO (cargala en Railway).'); global.__warnedNoJwt = true; }
+    return next();
+  }
+  const authH = req.headers.authorization || '';
+  const tok = authH.startsWith('Bearer ') ? authH.slice(7) : '';
+  const payload = tok && verifySupabaseJWT(tok);
+  if (!payload || payload.role !== 'authenticated') return res.status(401).json({ error: 'No autorizado' });
+  req.user = { id: payload.sub, email: payload.email };
+  next();
+});
 
 // ─── Helper Supabase ─────────────────────────────────────────────────
 const SB_H = {
