@@ -35,7 +35,7 @@ let STOCK_BY_COD = {};      // codigo -> unidades disponibles (Σ lotes.cantidad
 let DESC_BY_COD = {};       // codigo -> descripcion del catálogo skus
 let ROWS = [];              // filas calculadas (estado del módulo, para exportar)
 let SEMANAS = [];           // [{desde, hasta, label}]
-let PARAMS = { desde: '', hasta: '', diasObj: 30 };
+let PARAMS = { desde: '', hasta: '', diasObj: 30, ignorarQuiebres: true };
 
 const ALERTAS = ['negro', 'rojo', 'naranja', 'amarillo', 'verde'];
 const ALERT_ORD = { negro: 0, rojo: 1, naranja: 2, amarillo: 3, verde: 4 };
@@ -138,8 +138,14 @@ function calcular() {
     const enCatalogo = r.cod !== 'SIN_SKU' && (r.cod in DESC_BY_COD);
     const producto = (DESC_BY_COD[r.cod] || r.titulo || r.cod);
     const stock = num(STOCK_BY_COD[r.cod]);
-    const promSem = r.total / nSem;
-    const velDiaria = promSem / 7;
+    // Velocidad: por defecto ignora las semanas sin venta (asumidas quiebre de stock) y usa la
+    // MEDIANA de las semanas con venta, para que el quiebre no subestime la demanda ni el número
+    // dependa de cuántas semanas se tomen. Sin el toggle, promedio simple sobre todas las semanas.
+    // (Lo fino —velocidad sobre días con stock real— queda para cuando haya histórico de stock.)
+    const semConVenta = r.semanas.filter(x => x > 0);
+    const velSem = (PARAMS.ignorarQuiebres && semConVenta.length) ? mediana(semConVenta) : (r.total / nSem);
+    const promSem = velSem;
+    const velDiaria = velSem / 7;
     const diasStock = velDiaria > 0 ? Math.round(stock / velDiaria) : (stock > 0 ? 999 : 0);
     const necesario = Math.ceil(velDiaria * PARAMS.diasObj);
     const recompra = Math.max(0, necesario - stock);
@@ -186,6 +192,7 @@ function render() {
       <label class="psi-lbl">Cobertura objetivo
         <input class="input psi-dias" id="psi-dias" type="number" min="1" step="1" value="${PARAMS.diasObj}"> días
       </label>
+      <label class="psi-lbl psi-chk"><input type="checkbox" id="psi-quiebres" ${PARAMS.ignorarQuiebres ? 'checked' : ''}> Ignorar semanas sin venta (quiebres)</label>
       <button class="btn btn-primary" id="psi-calc">Recalcular</button>
       <span class="grow"></span>
       <button class="btn btn-ghost" id="psi-export">Exportar Excel</button>
@@ -224,6 +231,14 @@ function render() {
   ['psi-desde', 'psi-hasta', 'psi-dias'].forEach(id => {
     document.getElementById(id).addEventListener('keydown', e => { if (e.key === 'Enter') aplicarParams(); });
   });
+  document.getElementById('psi-quiebres')?.addEventListener('change', aplicarParams);
+}
+
+function mediana(arr) {
+  const a = [...arr].sort((x, y) => x - y);
+  const n = a.length;
+  if (!n) return 0;
+  return n % 2 ? a[(n - 1) / 2] : (a[n / 2 - 1] + a[n / 2]) / 2;
 }
 
 function filaHTML(r) {
@@ -256,6 +271,8 @@ function aplicarParams() {
   PARAMS.desde = desde;
   PARAMS.hasta = hasta;
   PARAMS.diasObj = (dias && dias > 0) ? dias : 30;
+  const chk = document.getElementById('psi-quiebres');
+  PARAMS.ignorarQuiebres = chk ? chk.checked : true;
   loadPSI();
 }
 
