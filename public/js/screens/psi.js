@@ -36,6 +36,7 @@ let DESC_BY_COD = {};       // codigo -> descripcion del catálogo skus
 let ROWS = [];              // filas calculadas (estado del módulo, para exportar)
 let SEMANAS = [];           // [{desde, hasta, label}]
 let PARAMS = { desde: '', hasta: '', diasObj: 30, ignorarQuiebres: true };
+let BUSQ = '';
 
 const ALERTAS = ['negro', 'rojo', 'naranja', 'amarillo', 'verde'];
 const ALERT_ORD = { negro: 0, rojo: 1, naranja: 2, amarillo: 3, verde: 4 };
@@ -195,6 +196,7 @@ function render() {
       <label class="psi-lbl psi-chk"><input type="checkbox" id="psi-quiebres" ${PARAMS.ignorarQuiebres ? 'checked' : ''}> Ignorar semanas sin venta (quiebres)</label>
       <button class="btn btn-primary" id="psi-calc">Recalcular</button>
       <span class="grow"></span>
+      <input class="input" id="psi-busq" type="search" placeholder="Buscar SKU o producto…" style="min-width:200px" value="${esc(BUSQ)}">
       <button class="btn btn-ghost" id="psi-export">Exportar Excel</button>
     </div>
 
@@ -221,7 +223,7 @@ function render() {
             <th class="psi-c">Recompra</th>
             <th class="psi-c">⚠</th>
           </tr></thead>
-          <tbody>${ROWS.map(filaHTML).join('')}</tbody>
+          <tbody id="psi-tbody">${filasFiltradas().map(filaHTML).join('')}</tbody>
         </table></div>`}
   `;
 
@@ -232,6 +234,7 @@ function render() {
     document.getElementById(id).addEventListener('keydown', e => { if (e.key === 'Enter') aplicarParams(); });
   });
   document.getElementById('psi-quiebres')?.addEventListener('change', aplicarParams);
+  document.getElementById('psi-busq')?.addEventListener('input', e => { BUSQ = e.target.value; pintarFilas(); });
 }
 
 function mediana(arr) {
@@ -260,6 +263,21 @@ function filaHTML(r) {
     ${recompraCell}
     <td class="psi-c" title="${ALERT_LABEL[r.alerta]}">${ALERT_DOT[r.alerta]}</td>
   </tr>`;
+}
+
+function filasFiltradas() {
+  const q = BUSQ.trim().toLowerCase();
+  if (!q) return ROWS;
+  return ROWS.filter(r => (r.cod || '').toLowerCase().includes(q) || (r.producto || '').toLowerCase().includes(q));
+}
+
+function pintarFilas() {
+  const tb = document.getElementById('psi-tbody');
+  if (!tb) return;
+  const f = filasFiltradas();
+  tb.innerHTML = f.length
+    ? f.map(filaHTML).join('')
+    : `<tr><td class="psi-muted" colspan="${SEMANAS.length + 7}" style="padding:14px">Sin resultados para “${esc(BUSQ)}”.</td></tr>`;
 }
 
 function aplicarParams() {
