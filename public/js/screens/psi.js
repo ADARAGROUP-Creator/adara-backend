@@ -355,7 +355,7 @@ function inyectarEstilo() {
     .psi-sticky{position:sticky;left:0;background:#fff;z-index:2;width:80px;min-width:80px}
     .psi-sticky2{position:sticky;left:80px;background:#fff;z-index:2}
     .psi-cod{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:13px;color:#D97706;font-weight:600}
-    .psi-prod{max-width:220px;overflow:hidden;text-overflow:ellipsis}
+    .psi-prod{min-width:260px}
     .psi-recompra{color:#B91C1C;font-weight:700}
     .psi-tag-empty{font-size:11px;color:#A8A29E;border:1px dashed #D6D3D1;padding:1px 6px;border-radius:6px}
     .psi-dias-verde{color:#15803D;font-weight:600}
