@@ -48,27 +48,49 @@ export async function initSB() {
 }
 
 // ── Token válido (refresca solo si está por vencer) ─────────────────
+// Robusto a múltiples pestañas: un único refresco simultáneo (single-flight), re-lee
+// localStorage por si otra pestaña ya refrescó (los refresh tokens de Supabase ROTAN, así
+// que dos pestañas refrescando a la vez se invalidan), y NO cierra sesión por errores
+// transitorios de red. Solo cierra ante un refresco realmente inválido.
+let _refreshing = null;
 async function getValidToken() {
+  loadSession();                                                  // otra pestaña pudo refrescar/cerrar
   if (!SESSION) return null;
-  if (Date.now() < SESSION.expires_at - 120000) return SESSION.access_token;   // > 2 min de margen
-  if (!SESSION.refresh_token) { authExpired(); return null; }
+  if (Date.now() < SESSION.expires_at - 60000) return SESSION.access_token;
+  if (!SESSION.refresh_token) return SESSION.access_token || null;
+  if (!_refreshing) _refreshing = doRefresh().finally(() => { _refreshing = null; });
+  return _refreshing;
+}
+
+async function doRefresh() {
+  const rt = SESSION.refresh_token;
   try {
     const r = await fetch(`${SB_URL}/auth/v1/token?grant_type=refresh_token`, {
       method: 'POST',
       headers: { 'apikey': SB_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refresh_token: SESSION.refresh_token })
+      body: JSON.stringify({ refresh_token: rt })
     });
-    if (!r.ok) { authExpired(); return null; }
+    if (!r.ok) {
+      loadSession();                                              // ¿otra pestaña ya refrescó OK?
+      if (SESSION && SESSION.refresh_token !== rt && Date.now() < SESSION.expires_at - 60000) return SESSION.access_token;
+      authExpired();                                              // refresco realmente inválido
+      return null;
+    }
     const data = await r.json();
     setSessionFromToken(data);
     return SESSION.access_token;
-  } catch { authExpired(); return null; }
+  } catch {
+    return SESSION ? SESSION.access_token : null;                 // error de red: NO cerrar sesión
+  }
 }
 
 function authExpired() {
   clearSession();
   window.dispatchEvent(new CustomEvent('adara-auth-expired'));
 }
+
+// Sincronizar sesión entre pestañas: si otra pestaña inicia/cierra/refresca, esta se entera.
+window.addEventListener('storage', (e) => { if (e.key === LS_KEY) loadSession(); });
 
 // ── Auth API (usada por la pantalla de login) ───────────────────────
 export function hasSession() { return !!(SESSION && SESSION.refresh_token); }
@@ -129,9 +151,9 @@ function patchFetch() {
       const tok = await getValidToken();
       if (tok) init = { ...init, headers: { ...(init.headers || {}), 'Authorization': 'Bearer ' + tok } };
     }
-    const res = await _fetch(input, init);
-    if (esBackend && res.status === 401) authExpired();
-    return res;
+    // Un 401 del backend NO cierra la sesión: el rechazo del backend (p. ej. SUPABASE_JWT_SECRET
+    // mal configurado) no debe desloguear del acceso a datos (Supabase valida su propio token).
+    return await _fetch(input, init);
   };
 }
 
