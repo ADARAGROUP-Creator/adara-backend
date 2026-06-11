@@ -11,13 +11,20 @@ const FAMILIAS = [
 let DATA = [];
 let FILTRO_FAM = 'all';   // 'all' | '' (sin clasificar) | nombre familia
 let BUSQ = '';
+let COSTOS = {};          // sku_id -> costo unitario actual (neto, ARS) desde v_costo_sku_actual
 
 export async function loadSkus() {
   const root = document.getElementById('app-screens');
   root.innerHTML = `<div class="loading">Cargando catálogo…</div>`;
 
   try {
-    DATA = await sbGet('skus', 'order=codigo.asc');
+    const [skus, costos] = await Promise.all([
+      sbGet('skus', 'order=codigo.asc'),
+      sbGet('v_costo_sku_actual', 'select=sku_id,costo_unit')
+    ]);
+    DATA = skus;
+    COSTOS = {};
+    for (const c of costos) COSTOS[c.sku_id] = c.costo_unit;
     render();
   } catch (e) {
     console.error('Load SKUs falló:', e);
@@ -56,6 +63,7 @@ function render() {
             <th class="col-desc">Descripción</th>
             <th class="col-fam">Familia</th>
             <th class="col-iva">IVA</th>
+            <th class="col-costo">Costo actual</th>
             <th class="col-act">Activo</th>
           </tr>
         </thead>
@@ -94,7 +102,7 @@ function rerenderTabla() {
     <table class="t">
       <thead><tr>
         <th class="col-code">Código</th><th class="col-desc">Descripción</th>
-        <th class="col-fam">Familia</th><th class="col-iva">IVA</th><th class="col-act">Activo</th>
+        <th class="col-fam">Familia</th><th class="col-iva">IVA</th><th class="col-costo">Costo actual</th><th class="col-act">Activo</th>
       </tr></thead>
       <tbody>${visibles.map(rowHTML).join('')}</tbody>
     </table>
@@ -178,11 +186,18 @@ function rowHTML(r) {
       <td class="col-iva">
         <input class="inline-input in-iva" data-id="${r.id}" value="${formatIva(r.alicuota_iva)}">
       </td>
+      <td class="col-costo">${fmtCosto(r.id)}</td>
       <td class="col-act">
         <label class="sw"><input type="checkbox" class="sw-activo" data-id="${r.id}" ${r.activo?'checked':''}><span class="slider"></span></label>
       </td>
     </tr>
   `;
+}
+
+function fmtCosto(id) {
+  const c = COSTOS[id];
+  if (c == null) return '—';
+  return '$ ' + Number(c).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function pill(val, label, num) {
