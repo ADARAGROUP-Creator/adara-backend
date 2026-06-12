@@ -6,6 +6,7 @@ import { loadSaldos } from './screens/saldos.js';
 import { loadVentasML } from './screens/ventas-ml.js?v=dev5';
 import { loadGastos } from './screens/gastos.js';
 import { loadConciliacion } from './screens/conciliacion.js';
+import { loadCuadre } from './screens/cuadre.js';
 import { loadCompras } from './screens/compras.js';
 import { loadPSI } from './screens/psi.js';
 import { loadCosteo } from './screens/costeo.js';
@@ -19,6 +20,7 @@ const screens = {
   saldos: { fn: loadSaldos, title: 'Saldos', sub: 'Saldo por cuenta y carga del saldo de arranque' },
   ventas_ml: { fn: loadVentasML, title: 'Ventas ML', sub: 'Ventas de Mercado Libre y su cobro' },
   conciliacion: { fn: loadConciliacion, title: 'Conciliación', sub: 'Vincular movimientos con operaciones' },
+  cuadre: { fn: loadCuadre, title: 'Cuadre', sub: 'Control de conciliación: semáforo por cuenta y cola priorizada' },
   gastos: { fn: loadGastos, title: 'Gastos', sub: 'Gastos operativos' },
   compras: { fn: loadCompras, title: 'Compras', sub: 'Facturas de mercadería y cuenta corriente' },
   psi: { fn: loadPSI, title: 'PSI Recompra', sub: 'Planificación de recompra por SKU' },
