@@ -378,7 +378,7 @@ app.get('/debug/claim/:orderId', async (req, res) => {
 
 // ── MERCADO LIBRE — OAuth ────────────────────────────────────────────
 app.get('/ml/auth', (_, res) => {
-  const url = `https://auth.mercadolibre.com.ar/authorization?response_type=code&client_id=${ML_CLIENT_ID}&redirect_uri=${encodeURIComponent(ML_REDIRECT_URI)}`;
+  const url = `https://auth.mercadolibre.com.ar/authorization?response_type=code&client_id=${ML_CLIENT_ID}&redirect_uri=${encodeURIComponent(ML_REDIRECT_URI)}&scope=${encodeURIComponent('offline_access read write')}`;
   res.redirect(url);
 });
 
@@ -1706,16 +1706,19 @@ app.post('/mp/conciliar-bonificaciones', async (req, res) => {
     if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
     const { desde, hasta } = req.body || {};
     const write = !!(req.body && req.body.write);
+    let reportId = (req.body && req.body.reportId) || null;
     if (!desde || !hasta) return res.status(400).json({ error: 'Faltan desde/hasta (YYYY-MM-DD)' });
 
-    // 1. Generar el settlement report del rango
-    const createRes = await mpApi('/v1/account/settlement_report', {
-      method: 'POST',
-      body: JSON.stringify({ begin_date: `${desde}T00:00:00Z`, end_date: `${hasta}T23:59:59Z` })
-    });
-    const createData = await createRes.json();
-    const reportId = createData.id;
-    if (!reportId) return res.status(400).json({ error: 'No se pudo crear el reporte', detail: createData });
+    // 1. Generar el settlement report del rango (salvo que se reanude uno ya creado con reportId)
+    if (!reportId) {
+      const createRes = await mpApi('/v1/account/settlement_report', {
+        method: 'POST',
+        body: JSON.stringify({ begin_date: `${desde}T00:00:00Z`, end_date: `${hasta}T23:59:59Z` })
+      });
+      const createData = await createRes.json();
+      reportId = createData.id;
+      if (!reportId) return res.status(400).json({ error: 'No se pudo crear el reporte', detail: createData });
+    }
 
     // 2. Esperar a que esté listo (polling hasta ~2 min)
     let fileUrl = null;
