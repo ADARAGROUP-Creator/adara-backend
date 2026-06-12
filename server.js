@@ -1733,61 +1733,13 @@ app.post('/mp/conciliar-bonificaciones', async (req, res) => {
       return res.json({ inspect: true, bonif_pendientes: bonifI.length, muestra: out });
     }
 
-    // 1. Generar el settlement report del rango (salvo que se reanude uno ya creado con reportId)
-    if (!reportId) {
-      const createRes = await mpApi('/v1/account/settlement_report', {
-        method: 'POST',
-        body: JSON.stringify({ begin_date: `${desde}T00:00:00Z`, end_date: `${hasta}T23:59:59Z` })
-      });
-      const createData = await createRes.json();
-      reportId = createData.id;
-      if (!reportId) return res.status(400).json({ error: 'No se pudo crear el reporte', detail: createData });
-    }
+    // ── FLUJO PRINCIPAL: bonificación → payment de MP → shipment → ventas_ml.shipment_id ──
+    // El settlement report no liga la bonificación a la venta (CASHBACK sin order/shipping).
+    // El payment crudo SÍ: point_of_interaction.transaction_data.reference_id (reference_type=shipment).
+    // Ese shipment cruza con ventas_ml.shipment_id (ya backfilleado).
+    // Parámetros: { desde, hasta, limit?, write? }. limit acota la muestra (para probar rápido).
 
-    // 2. Esperar a que el reporte esté 'processed' en el listado y tomar su file_name.
-    //    MP descarga por file_name (NO por id: el GET por id da 403; no existe download_url).
-    let fileName = null;
-    for (let i = 0; i < 24 && !fileName; i++) {
-      await new Promise(r => setTimeout(r, 5000));
-      try {
-        const listRes = await mpApi('/v1/account/settlement_report/list');
-        const list = await listRes.json();
-        const found = (Array.isArray(list) ? list : []).find(r => String(r.id) === String(reportId));
-        if (found?.status === 'processed' && found?.file_name) { fileName = found.file_name; break; }
-        if (found?.status === 'error') return res.status(400).json({ error: 'El reporte falló', detail: found });
-      } catch (e) { /* reintenta */ }
-    }
-    if (!fileName) return res.status(202).json({ error: 'Reporte aún no disponible, reintentá en unos minutos', reportId });
-
-    // 3. Bajar y parsear el CSV (por file_name)
-    const csvRes = await mpApi(`/v1/account/settlement_report/${encodeURIComponent(fileName)}`);
-    const csvText = await csvRes.text();
-    const lines = csvText.split('\n').filter(l => l.trim());
-    if (lines.length < 2) return res.status(400).json({ error: 'Reporte vacío' });
-    const sep = lines[0].includes(';') ? ';' : ',';
-    const parseLine = (line) => {
-      const out = []; let cur = '', q = false;
-      for (const ch of line) {
-        if (ch === '"') q = !q;
-        else if (ch === sep && !q) { out.push(cur); cur = ''; }
-        else cur += ch;
-      }
-      out.push(cur);
-      return out.map(v => String(v).replace(/"/g, '').trim());
-    };
-    const headers = parseLine(lines[0]);
-    const H = {}; headers.forEach((h, i) => H[h] = i);
-    if (H['SOURCE_ID'] == null || H['ORDER_ID'] == null) {
-      return res.status(400).json({ error: 'El reporte no trae SOURCE_ID u ORDER_ID', headers });
-    }
-    const orderBySource = {};
-    for (let i = 1; i < lines.length; i++) {
-      const vals = parseLine(lines[i]);
-      const s = vals[H['SOURCE_ID']], o = vals[H['ORDER_ID']];
-      if (s && o) orderBySource[s] = o;
-    }
-
-    // 4. Movimientos de bonificación pendientes del rango (sin vínculo)
+    // 1. Bonificaciones pendientes del rango (sin vínculo)
     const mpRow = await sbGet('cuentas', 'select=id&codigo=eq.mp_ars');
     const mpId = mpRow && mpRow[0] && mpRow[0].id;
     const vinc = await sbGet('vinculos', 'select=movimiento_id');
@@ -1795,61 +1747,49 @@ app.post('/mp/conciliar-bonificaciones', async (req, res) => {
     const movs = await sbGet('movimientos',
       `select=id,referencia_externa,monto&cuenta_id=eq.${mpId}` +
       `&categoria=eq.cobro_venta&descripcion=ilike.*Bonificaci*env*&fecha=gte.${desde}&fecha=lte.${hasta}`);
-    const bonif = (movs || []).filter(m => !conVinculo.has(m.id));
+    let bonif = (movs || []).filter(m => !conVinculo.has(m.id));
+    const limit = Number(req.body && req.body.limit) || 0;
+    if (limit > 0) bonif = bonif.slice(0, limit);
 
     const chunk = (arr, n) => { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o; };
 
-    // MODO DIAGNÓSTICO: { diag: true } → no cruza; analiza puntualmente las filas
-    // del reporte cuyo SOURCE_ID coincide con una bonificación pendiente.
-    if (req.body && req.body.diag) {
-      const iType = H['TRANSACTION_TYPE'], iSource = H['SOURCE_ID'], iOrder = H['ORDER_ID'], iShip = H['SHIPPING_ID'], iPack = H['PACK_ID'];
-      const bonifIds = new Set(bonif.map(m => (m.referencia_externa || '').split('|')[1]).filter(Boolean));
-      const tiposBonif = {};
-      let encontrados = 0, conOrder = 0, conShip = 0, conPack = 0;
-      const muestraBonif = [];
-      for (let i = 1; i < lines.length; i++) {
-        const vals = parseLine(lines[i]);
-        if (!bonifIds.has(vals[iSource])) continue;
-        encontrados++;
-        const t = vals[iType] || '(vacío)';
-        tiposBonif[t] = (tiposBonif[t] || 0) + 1;
-        if (iOrder != null && vals[iOrder]) conOrder++;
-        if (iShip  != null && vals[iShip])  conShip++;
-        if (iPack  != null && vals[iPack])  conPack++;
-        if (muestraBonif.length < 4) muestraBonif.push(Object.fromEntries(headers.map((h, idx) => [h, vals[idx]])));
-      }
-      return res.json({
-        diag: true,
-        reportId,
-        bonif_pendientes: bonif.length,
-        bonif_encontradas_en_report: encontrados,
-        bonif_con_order_id: conOrder,
-        bonif_con_shipping_id: conShip,
-        bonif_con_pack_id: conPack,
-        tipos_de_las_bonif: tiposBonif,
-        muestra_bonif: muestraBonif
-      });
+    // 2. Consultar el payment de cada bonificación → shipment (concurrencia 8)
+    const shipByMov = {};
+    let sinPayment = 0, sinShipment = 0;
+    for (const grp of chunk(bonif, 8)) {
+      await Promise.all(grp.map(async (m) => {
+        const src = (m.referencia_externa || '').split('|')[1];
+        if (!src) { sinPayment++; return; }
+        try {
+          const r = await mpApi(`/v1/payments/${src}`);
+          const p = await r.json();
+          const td = p && p.point_of_interaction && p.point_of_interaction.transaction_data;
+          if (td && td.reference_type === 'shipment' && td.reference_id) shipByMov[m.id] = String(td.reference_id);
+          else sinShipment++;
+        } catch (e) { sinPayment++; }
+      }));
     }
 
-    // 5. Resolver venta por ORDER_ID
-    const orderIds = [...new Set(bonif.map(m => orderBySource[(m.referencia_externa || '').split('|')[1]]).filter(Boolean))];
-    const ventaByOrder = {};
-    for (const grp of chunk(orderIds, 150)) {
-      const rows = await sbGet('ventas_ml', `select=id,ml_order_id&ml_order_id=in.(${grp.join(',')})`).catch(() => []);
-      for (const v of (rows || [])) ventaByOrder[String(v.ml_order_id)] = v.id;
+    // 3. Resolver venta por shipment_id
+    const ships = [...new Set(Object.values(shipByMov))];
+    const ventaByShip = {};
+    for (const grp of chunk(ships, 150)) {
+      const rows = await sbGet('ventas_ml', `select=id,shipment_id&shipment_id=in.(${grp.join(',')})`).catch(() => []);
+      for (const v of (rows || [])) ventaByShip[String(v.shipment_id)] = v.id;
     }
 
+    // 4. Armar vínculos
     const aVincular = [];
-    let sinFilaReport = 0, sinVenta = 0;
+    let conShipmentSinVenta = 0;
     for (const m of bonif) {
-      const src = (m.referencia_externa || '').split('|')[1];
-      const ord = orderBySource[src];
-      if (!ord) { sinFilaReport++; continue; }
-      const ventaId = ventaByOrder[String(ord)];
-      if (!ventaId) { sinVenta++; continue; }
+      const ship = shipByMov[m.id];
+      if (!ship) continue; // ya contado en sinPayment / sinShipment
+      const ventaId = ventaByShip[ship];
+      if (!ventaId) { conShipmentSinVenta++; continue; }
       aVincular.push({ movimiento_id: m.id, op_tipo: 'venta_ml', op_id: String(ventaId), monto: Math.abs(Number(m.monto) || 0) });
     }
 
+    // 5. Escribir (write) o solo reportar (dry)
     let escritos = 0;
     if (write && aVincular.length) {
       for (const grp of chunk(aVincular, 200)) {
@@ -1860,10 +1800,11 @@ app.post('/mp/conciliar-bonificaciones', async (req, res) => {
 
     res.json({
       ok: true, dry: !write,
-      bonif_pendientes: bonif.length,
+      bonif_procesadas: bonif.length,
       cruzadas: aVincular.length,
-      sin_fila_en_report: sinFilaReport,
-      con_fila_pero_sin_venta: sinVenta,
+      sin_payment: sinPayment,
+      sin_shipment_en_payment: sinShipment,
+      con_shipment_pero_sin_venta: conShipmentSinVenta,
       escritos,
       muestra: aVincular.slice(0, 5)
     });
