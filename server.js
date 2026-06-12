@@ -598,6 +598,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             motivo_cancelacion: motivoCancelacion,
             monto_devuelto:   montoDevuelto,
             pack_id:          o.pack_id ? String(o.pack_id) : null,
+            shipment_id:      o.shipping?.id ? String(o.shipping.id) : null,
             linea_negocio_id: lineaId,
             tipo_envio:       null,
             fecha_entrega:    null,
