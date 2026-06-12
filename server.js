@@ -1720,27 +1720,23 @@ app.post('/mp/conciliar-bonificaciones', async (req, res) => {
       if (!reportId) return res.status(400).json({ error: 'No se pudo crear el reporte', detail: createData });
     }
 
-    // 2. Esperar a que esté listo (polling hasta ~2 min)
-    let fileUrl = null;
-    for (let i = 0; i < 24 && !fileUrl; i++) {
+    // 2. Esperar a que el reporte esté 'processed' en el listado y tomar su file_name.
+    //    MP descarga por file_name (NO por id: el GET por id da 403; no existe download_url).
+    let fileName = null;
+    for (let i = 0; i < 24 && !fileName; i++) {
       await new Promise(r => setTimeout(r, 5000));
       try {
-        const checkRes = await mpApi(`/v1/account/settlement_report/${reportId}`);
-        const checkData = await checkRes.json();
-        if ((checkData.status === 'ready' || checkData.status === 'processed') && checkData.download_url) fileUrl = checkData.download_url;
-        else if (checkData.status === 'error') return res.status(400).json({ error: 'El reporte falló', detail: checkData });
+        const listRes = await mpApi('/v1/account/settlement_report/list');
+        const list = await listRes.json();
+        const found = (Array.isArray(list) ? list : []).find(r => String(r.id) === String(reportId));
+        if (found?.status === 'processed' && found?.file_name) { fileName = found.file_name; break; }
+        if (found?.status === 'error') return res.status(400).json({ error: 'El reporte falló', detail: found });
       } catch (e) { /* reintenta */ }
     }
-    if (!fileUrl) {
-      const listRes = await mpApi('/v1/account/settlement_report/list');
-      const list = await listRes.json();
-      const found = (Array.isArray(list) ? list : []).find(r => r.id === reportId);
-      if (found && found.download_url) fileUrl = found.download_url;
-    }
-    if (!fileUrl) return res.status(202).json({ error: 'Reporte aún no disponible, reintentá en unos minutos', reportId });
+    if (!fileName) return res.status(202).json({ error: 'Reporte aún no disponible, reintentá en unos minutos', reportId });
 
-    // 3. Bajar y parsear el CSV
-    const csvRes = await fetch(fileUrl, { headers: { 'Authorization': 'Bearer ' + ML.access } });
+    // 3. Bajar y parsear el CSV (por file_name)
+    const csvRes = await mpApi(`/v1/account/settlement_report/${encodeURIComponent(fileName)}`);
     const csvText = await csvRes.text();
     const lines = csvText.split('\n').filter(l => l.trim());
     if (lines.length < 2) return res.status(400).json({ error: 'Reporte vacío' });
