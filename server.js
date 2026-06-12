@@ -129,24 +129,49 @@ async function saveMLToken(t) {
   }).catch(() => {});
 }
 
+let _mlRefreshing = null;
 async function refreshML() {
   if (!ML.refresh) return;
-  const r    = await fetch('https://api.mercadolibre.com/oauth/token', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ grant_type: 'refresh_token', client_id: ML_CLIENT_ID, client_secret: ML_CLIENT_SECRET, refresh_token: ML.refresh })
-  });
-  const data = await r.json();
-  if (data.access_token) {
-    await saveMLToken({ access: data.access_token, refresh: data.refresh_token, expires: Date.now() + data.expires_in * 1000 });
-    console.log('✓ ML token refrescado');
-  }
+  // Single-flight: un solo refresh a la vez. El sync dispara hasta 10 llamadas
+  // en paralelo; sin esto, todas refrescan con el MISMO refresh_token (que en ML
+  // es de un solo uso) y se invalidan entre sí → "ML se desconecta solo".
+  if (_mlRefreshing) return _mlRefreshing;
+  _mlRefreshing = (async () => {
+    try {
+      const r = await fetch('https://api.mercadolibre.com/oauth/token', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ grant_type: 'refresh_token', client_id: ML_CLIENT_ID, client_secret: ML_CLIENT_SECRET, refresh_token: ML.refresh })
+      });
+      const data = await r.json();
+      if (data.access_token) {
+        // ML rota el refresh_token; si por algún motivo no manda uno nuevo, conservamos el actual.
+        await saveMLToken({ access: data.access_token, refresh: data.refresh_token || ML.refresh, expires: Date.now() + data.expires_in * 1000 });
+        console.log('✓ ML token refrescado');
+      } else {
+        // No pisamos el token con null: puede ser un error transitorio y se reintenta
+        // en la próxima llamada. Si el refresh_token está realmente revocado, hay que
+        // reconectar ML desde la app (/ml/auth).
+        console.error('✗ ML refresh falló (no renovó):', JSON.stringify(data));
+      }
+    } catch (e) {
+      console.error('✗ ML refresh error de red:', e.message);
+    }
+  })().finally(() => { _mlRefreshing = null; });
+  return _mlRefreshing;
 }
 
 async function mlGet(path) {
   if (Date.now() > ML.expires - 60000) await refreshML();
-  const r = await fetch(`https://api.mercadolibre.com${path}`, {
+  let r = await fetch(`https://api.mercadolibre.com${path}`, {
     headers: { 'Authorization': `Bearer ${ML.access}` }
   });
+  // Si el token fue rechazado (vencido/rotado), refrescamos UNA vez y reintentamos.
+  if (r.status === 401) {
+    await refreshML();
+    r = await fetch(`https://api.mercadolibre.com${path}`, {
+      headers: { 'Authorization': `Bearer ${ML.access}` }
+    });
+  }
   if (!r.ok) throw new Error(`ML ${path}: ${r.status}`);
   return r.json();
 }
