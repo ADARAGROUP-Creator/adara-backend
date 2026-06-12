@@ -1695,6 +1695,129 @@ app.get('/mp/retenciones-refresh', (_, res) => {
   res.json({ ok: true, ...retencionesEstado });
 });
 
+// ── Conciliar bonificaciones de envío Flex con su venta (vía settlement report) ──
+// Las bonificaciones llegan a `movimientos` con REFERENCE_ID = su propio payment
+// (SOURCE_ID), NO el order de la venta. El settlement report de MP trae, por cada
+// SOURCE_ID, el ORDER_ID. Cruzamos:
+//   bonificación (ref campo 2 = SOURCE_ID) → report → ORDER_ID → venta (ml_order_id) → vínculo venta_ml
+// Por defecto DRY-RUN (no escribe). Para escribir: body { write: true }.
+app.post('/mp/conciliar-bonificaciones', async (req, res) => {
+  try {
+    if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
+    const { desde, hasta } = req.body || {};
+    const write = !!(req.body && req.body.write);
+    if (!desde || !hasta) return res.status(400).json({ error: 'Faltan desde/hasta (YYYY-MM-DD)' });
+
+    // 1. Generar el settlement report del rango
+    const createRes = await mpApi('/v1/account/settlement_report', {
+      method: 'POST',
+      body: JSON.stringify({ begin_date: `${desde}T00:00:00Z`, end_date: `${hasta}T23:59:59Z` })
+    });
+    const createData = await createRes.json();
+    const reportId = createData.id;
+    if (!reportId) return res.status(400).json({ error: 'No se pudo crear el reporte', detail: createData });
+
+    // 2. Esperar a que esté listo (polling hasta ~2 min)
+    let fileUrl = null;
+    for (let i = 0; i < 24 && !fileUrl; i++) {
+      await new Promise(r => setTimeout(r, 5000));
+      try {
+        const checkRes = await mpApi(`/v1/account/settlement_report/${reportId}`);
+        const checkData = await checkRes.json();
+        if ((checkData.status === 'ready' || checkData.status === 'processed') && checkData.download_url) fileUrl = checkData.download_url;
+        else if (checkData.status === 'error') return res.status(400).json({ error: 'El reporte falló', detail: checkData });
+      } catch (e) { /* reintenta */ }
+    }
+    if (!fileUrl) {
+      const listRes = await mpApi('/v1/account/settlement_report/list');
+      const list = await listRes.json();
+      const found = (Array.isArray(list) ? list : []).find(r => r.id === reportId);
+      if (found && found.download_url) fileUrl = found.download_url;
+    }
+    if (!fileUrl) return res.status(202).json({ error: 'Reporte aún no disponible, reintentá en unos minutos', reportId });
+
+    // 3. Bajar y parsear el CSV
+    const csvRes = await fetch(fileUrl, { headers: { 'Authorization': 'Bearer ' + ML.access } });
+    const csvText = await csvRes.text();
+    const lines = csvText.split('\n').filter(l => l.trim());
+    if (lines.length < 2) return res.status(400).json({ error: 'Reporte vacío' });
+    const sep = lines[0].includes(';') ? ';' : ',';
+    const parseLine = (line) => {
+      const out = []; let cur = '', q = false;
+      for (const ch of line) {
+        if (ch === '"') q = !q;
+        else if (ch === sep && !q) { out.push(cur); cur = ''; }
+        else cur += ch;
+      }
+      out.push(cur);
+      return out.map(v => String(v).replace(/"/g, '').trim());
+    };
+    const headers = parseLine(lines[0]);
+    const H = {}; headers.forEach((h, i) => H[h] = i);
+    if (H['SOURCE_ID'] == null || H['ORDER_ID'] == null) {
+      return res.status(400).json({ error: 'El reporte no trae SOURCE_ID u ORDER_ID', headers });
+    }
+    const orderBySource = {};
+    for (let i = 1; i < lines.length; i++) {
+      const vals = parseLine(lines[i]);
+      const s = vals[H['SOURCE_ID']], o = vals[H['ORDER_ID']];
+      if (s && o) orderBySource[s] = o;
+    }
+
+    // 4. Movimientos de bonificación pendientes del rango (sin vínculo)
+    const mpRow = await sbGet('cuentas', 'select=id&codigo=eq.mp_ars');
+    const mpId = mpRow && mpRow[0] && mpRow[0].id;
+    const vinc = await sbGet('vinculos', 'select=movimiento_id');
+    const conVinculo = new Set((vinc || []).map(v => v.movimiento_id));
+    const movs = await sbGet('movimientos',
+      `select=id,referencia_externa,monto&cuenta_id=eq.${mpId}` +
+      `&categoria=eq.cobro_venta&descripcion=ilike.*Bonificaci*env*&fecha=gte.${desde}&fecha=lte.${hasta}`);
+    const bonif = (movs || []).filter(m => !conVinculo.has(m.id));
+
+    const chunk = (arr, n) => { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o; };
+
+    // 5. Resolver venta por ORDER_ID
+    const orderIds = [...new Set(bonif.map(m => orderBySource[(m.referencia_externa || '').split('|')[1]]).filter(Boolean))];
+    const ventaByOrder = {};
+    for (const grp of chunk(orderIds, 150)) {
+      const rows = await sbGet('ventas_ml', `select=id,ml_order_id&ml_order_id=in.(${grp.join(',')})`).catch(() => []);
+      for (const v of (rows || [])) ventaByOrder[String(v.ml_order_id)] = v.id;
+    }
+
+    const aVincular = [];
+    let sinFilaReport = 0, sinVenta = 0;
+    for (const m of bonif) {
+      const src = (m.referencia_externa || '').split('|')[1];
+      const ord = orderBySource[src];
+      if (!ord) { sinFilaReport++; continue; }
+      const ventaId = ventaByOrder[String(ord)];
+      if (!ventaId) { sinVenta++; continue; }
+      aVincular.push({ movimiento_id: m.id, op_tipo: 'venta_ml', op_id: String(ventaId), monto: Math.abs(Number(m.monto) || 0) });
+    }
+
+    let escritos = 0;
+    if (write && aVincular.length) {
+      for (const grp of chunk(aVincular, 200)) {
+        await sbUpsert('vinculos', grp, 'movimiento_id,op_tipo,op_id');
+        escritos += grp.length;
+      }
+    }
+
+    res.json({
+      ok: true, dry: !write,
+      bonif_pendientes: bonif.length,
+      cruzadas: aVincular.length,
+      sin_fila_en_report: sinFilaReport,
+      con_fila_pero_sin_venta: sinVenta,
+      escritos,
+      muestra: aVincular.slice(0, 5)
+    });
+  } catch (e) {
+    console.error('conciliar-bonificaciones:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/mp/settlement-sync', async (req, res) => {
   try {
     if (!ML.access) return res.status(401).json({ error: 'ML no autenticado' });
