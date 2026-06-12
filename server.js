@@ -1709,6 +1709,30 @@ app.post('/mp/conciliar-bonificaciones', async (req, res) => {
     let reportId = (req.body && req.body.reportId) || null;
     if (!desde || !hasta) return res.status(400).json({ error: 'Faltan desde/hasta (YYYY-MM-DD)' });
 
+    // MODO INSPECT: { inspect: true } → no usa el report. Consulta el payment crudo de MP
+    // (/v1/payments/{id}) de una muestra de bonificaciones para ver si trae order/shipment
+    // en metadata/additional_info (datos que el settlement report resume y oculta).
+    if (req.body && req.body.inspect) {
+      const mpRowI = await sbGet('cuentas', 'select=id&codigo=eq.mp_ars');
+      const mpIdI = mpRowI && mpRowI[0] && mpRowI[0].id;
+      const vincI = await sbGet('vinculos', 'select=movimiento_id');
+      const conVincI = new Set((vincI || []).map(v => v.movimiento_id));
+      const movsI = await sbGet('movimientos',
+        `select=id,referencia_externa,monto,descripcion&cuenta_id=eq.${mpIdI}` +
+        `&categoria=eq.cobro_venta&descripcion=ilike.*Bonificaci*env*&fecha=gte.${desde}&fecha=lte.${hasta}`);
+      const bonifI = (movsI || []).filter(m => !conVincI.has(m.id));
+      const idsI = bonifI.slice(0, 3).map(m => (m.referencia_externa || '').split('|')[1]).filter(Boolean);
+      const out = [];
+      for (const id of idsI) {
+        // 1) payment crudo de MP
+        let payment = null, pStatus = null, pErr = null;
+        try { const r = await mpApi(`/v1/payments/${id}`); pStatus = r.status; payment = await r.json(); }
+        catch (e) { pErr = e.message; }
+        out.push({ source_id: id, payment_status: pStatus, payment_error: pErr, payment });
+      }
+      return res.json({ inspect: true, bonif_pendientes: bonifI.length, muestra: out });
+    }
+
     // 1. Generar el settlement report del rango (salvo que se reanude uno ya creado con reportId)
     if (!reportId) {
       const createRes = await mpApi('/v1/account/settlement_report', {
