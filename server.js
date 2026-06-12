@@ -1775,41 +1775,35 @@ app.post('/mp/conciliar-bonificaciones', async (req, res) => {
 
     const chunk = (arr, n) => { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o; };
 
-    // MODO DIAGNÓSTICO: { diag: true } → no cruza; muestra la estructura real del
-    // reporte y busca los IDs de bonificación en TODAS las columnas para hallar el puente.
+    // MODO DIAGNÓSTICO: { diag: true } → no cruza; analiza puntualmente las filas
+    // del reporte cuyo SOURCE_ID coincide con una bonificación pendiente.
     if (req.body && req.body.diag) {
-      const iType = H['TRANSACTION_TYPE'];
-      const tipos = {};
-      const rows = [];
+      const iType = H['TRANSACTION_TYPE'], iSource = H['SOURCE_ID'], iOrder = H['ORDER_ID'], iShip = H['SHIPPING_ID'], iPack = H['PACK_ID'];
+      const bonifIds = new Set(bonif.map(m => (m.referencia_externa || '').split('|')[1]).filter(Boolean));
+      const tiposBonif = {};
+      let encontrados = 0, conOrder = 0, conShip = 0, conPack = 0;
+      const muestraBonif = [];
       for (let i = 1; i < lines.length; i++) {
         const vals = parseLine(lines[i]);
-        const t = (iType != null ? vals[iType] : '?') || '(vacío)';
-        tipos[t] = (tipos[t] || 0) + 1;
-        rows.push(vals);
-      }
-      const bonifIds = new Set(bonif.map(m => (m.referencia_externa || '').split('|')[1]).filter(Boolean));
-      const idsEnColumna = {};
-      let ejemploMatch = null;
-      for (const vals of rows) {
-        for (let c = 0; c < vals.length; c++) {
-          if (bonifIds.has(vals[c])) {
-            const colName = headers[c] || ('col' + c);
-            idsEnColumna[colName] = (idsEnColumna[colName] || 0) + 1;
-            if (!ejemploMatch) ejemploMatch = { columna: colName, fila: Object.fromEntries(headers.map((h, idx) => [h, vals[idx]])) };
-          }
-        }
+        if (!bonifIds.has(vals[iSource])) continue;
+        encontrados++;
+        const t = vals[iType] || '(vacío)';
+        tiposBonif[t] = (tiposBonif[t] || 0) + 1;
+        if (iOrder != null && vals[iOrder]) conOrder++;
+        if (iShip  != null && vals[iShip])  conShip++;
+        if (iPack  != null && vals[iPack])  conPack++;
+        if (muestraBonif.length < 4) muestraBonif.push(Object.fromEntries(headers.map((h, idx) => [h, vals[idx]])));
       }
       return res.json({
         diag: true,
         reportId,
-        total_filas: lines.length - 1,
         bonif_pendientes: bonif.length,
-        headers,
-        tipos,
-        bonif_ids_muestra: [...bonifIds].slice(0, 5),
-        ids_bonif_encontrados_en_columna: idsEnColumna,
-        ejemplo_match: ejemploMatch,
-        muestra_filas: rows.slice(0, 3).map(vals => Object.fromEntries(headers.map((h, idx) => [h, vals[idx]])))
+        bonif_encontradas_en_report: encontrados,
+        bonif_con_order_id: conOrder,
+        bonif_con_shipping_id: conShip,
+        bonif_con_pack_id: conPack,
+        tipos_de_las_bonif: tiposBonif,
+        muestra_bonif: muestraBonif
       });
     }
 
