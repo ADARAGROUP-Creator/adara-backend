@@ -29,8 +29,20 @@ const screens = {
   posicion_fiscal: { fn: loadPosicionFiscal, title: 'Posición Fiscal', sub: 'IVA, IIBB y pagos a cuenta del período' }
 };
 
-async function route() {
+// Cola de navegación: serializa las cargas de pantalla. Sin esto, si una
+// pantalla pesada (ej. Conciliación, ~5.500 movs) sigue resolviendo sus fetch
+// cuando ya navegaste a otra, su render pinta el DOM DESPUÉS y pisa la nueva
+// (se veía el título de la pantalla nueva con el contenido de la anterior).
+// Al encadenar, una carga no arranca hasta que la anterior terminó de pintar.
+let _routing = Promise.resolve();
+
+function route() {
   const hash = (location.hash || '#home').slice(1);
+  _routing = _routing.then(() => renderScreen(hash)).catch(() => {});
+  return _routing;
+}
+
+async function renderScreen(hash) {
   const screen = screens[hash] || screens.home;
   // Actualizar nav activo
   document.querySelectorAll('.nav-item').forEach(a => {
