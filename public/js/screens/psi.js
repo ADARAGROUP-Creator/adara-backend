@@ -35,7 +35,7 @@ let STOCK_BY_COD = {};      // codigo -> unidades disponibles (Σ lotes.cantidad
 let DESC_BY_COD = {};       // codigo -> descripcion del catálogo skus
 let ROWS = [];              // filas calculadas (estado del módulo, para exportar)
 let SEMANAS = [];           // [{desde, hasta, label}]
-let PARAMS = { desde: '', hasta: '', diasObj: 30, ignorarQuiebres: true };
+let PARAMS = { desde: '', hasta: '', diasObj: 30, ignorarQuiebres: true, leadTime: 15, colchon: 7 };
 let BUSQ = '';
 
 const ALERTAS = ['negro', 'rojo', 'naranja', 'amarillo', 'verde'];
@@ -134,6 +134,11 @@ function calcular() {
     }
   }
 
+  // Punto de reorden (en días): hay que recomprar cuando los días de stock que
+  // quedan ya no alcanzan a cubrir el tránsito (lead time) + un colchón de margen.
+  // Si esperás a que el stock llegue a 0, quebrás durante el viaje de la compra.
+  const ropDias = num(PARAMS.leadTime) + num(PARAMS.colchon);
+
   // Métricas por SKU.
   ROWS = Object.values(map).map(r => {
     const enCatalogo = r.cod !== 'SIN_SKU' && (r.cod in DESC_BY_COD);
@@ -151,11 +156,17 @@ function calcular() {
     const necesario = Math.ceil(velDiaria * PARAMS.diasObj);
     const recompra = Math.max(0, necesario - stock);
     const alerta = alertaDe(stock, diasStock);
-    return { ...r, producto, enCatalogo, stock, promSem, velDiaria, diasStock, recompra, alerta };
+    // "Recomprar YA": hay algo para reponer Y el stock que queda ya no cubre lead+colchón.
+    // Los quebrados (diasStock 0) con recompra>0 caen acá naturalmente.
+    const recomprarYa = recompra > 0 && diasStock <= ropDias;
+    return { ...r, producto, enCatalogo, stock, promSem, velDiaria, diasStock, recompra, alerta, recomprarYa };
   });
 
-  // Orden: peor primero (negro→rojo→…), y dentro por días de stock asc.
-  ROWS.sort((a, b) => (ALERT_ORD[a.alerta] - ALERT_ORD[b.alerta]) || (a.diasStock - b.diasStock));
+  // Orden: primero los "Recomprar YA", después peor alerta (negro→rojo→…), y dentro por días asc.
+  ROWS.sort((a, b) =>
+    (Number(b.recomprarYa) - Number(a.recomprarYa)) ||
+    (ALERT_ORD[a.alerta] - ALERT_ORD[b.alerta]) ||
+    (a.diasStock - b.diasStock));
 }
 
 // Escala de 5 colores (ADARA-STOCK.md). Toda fila tiene ventas en el rango
@@ -176,6 +187,7 @@ function render() {
   const quebrados = ROWS.filter(r => r.alerta === 'negro').length;
   const criticos = ROWS.filter(r => r.alerta === 'rojo').length;
   const aReponer = ROWS.filter(r => r.recompra > 0).length;
+  const recomprarYa = ROWS.filter(r => r.recomprarYa).length;
 
   // Aviso si el stock de apertura no está cargado (lotes casi vacío).
   const sinStock = ROWS.filter(r => r.stock <= 0).length;
@@ -193,10 +205,17 @@ function render() {
       <label class="psi-lbl">Cobertura objetivo
         <input class="input psi-dias" id="psi-dias" type="number" min="1" step="1" value="${PARAMS.diasObj}"> días
       </label>
+      <label class="psi-lbl">Lead time
+        <input class="input psi-dias" id="psi-lead" type="number" min="0" step="1" value="${PARAMS.leadTime}"> días
+      </label>
+      <label class="psi-lbl">Colchón
+        <input class="input psi-dias" id="psi-colchon" type="number" min="0" step="1" value="${PARAMS.colchon}"> días
+      </label>
       <label class="psi-lbl psi-chk"><input type="checkbox" id="psi-quiebres" ${PARAMS.ignorarQuiebres ? 'checked' : ''}> Ignorar semanas sin venta (quiebres)</label>
       <button class="btn btn-primary" id="psi-calc">Recalcular</button>
       <span class="grow"></span>
       <input class="input" id="psi-busq" type="search" placeholder="Buscar SKU o producto…" style="min-width:200px" value="${esc(BUSQ)}">
+      <button class="btn btn-ghost psi-clear" id="psi-busq-clear" title="Limpiar búsqueda"${BUSQ ? '' : ' style="display:none"'}>✕</button>
       <button class="btn btn-ghost" id="psi-export">Exportar Excel</button>
     </div>
 
@@ -207,6 +226,7 @@ function render() {
       <div class="kpi"><div class="kpi-label">Uds vendidas</div><div class="kpi-value">${fmtNum(totalUds)}</div></div>
       <div class="kpi"><div class="kpi-label">⚫ Quebrados</div><div class="kpi-value">${quebrados}</div></div>
       <div class="kpi"><div class="kpi-label">🔴 Críticos (&lt;7d)</div><div class="kpi-value">${criticos}</div></div>
+      <div class="kpi psi-kpi-ya"><div class="kpi-label">🛒 Recomprar YA</div><div class="kpi-value">${recomprarYa}</div></div>
       <div class="kpi"><div class="kpi-label">A reponer</div><div class="kpi-value">${aReponer}</div></div>
     </div>
 
@@ -230,11 +250,24 @@ function render() {
   document.getElementById('psi-calc').addEventListener('click', aplicarParams);
   document.getElementById('psi-export').addEventListener('click', exportarXLSX);
   // Enter en cualquier control recalcula.
-  ['psi-desde', 'psi-hasta', 'psi-dias'].forEach(id => {
+  ['psi-desde', 'psi-hasta', 'psi-dias', 'psi-lead', 'psi-colchon'].forEach(id => {
     document.getElementById(id).addEventListener('keydown', e => { if (e.key === 'Enter') aplicarParams(); });
   });
   document.getElementById('psi-quiebres')?.addEventListener('change', aplicarParams);
-  document.getElementById('psi-busq')?.addEventListener('input', e => { BUSQ = e.target.value; pintarFilas(); });
+  document.getElementById('psi-busq')?.addEventListener('input', e => {
+    BUSQ = e.target.value;
+    const clr = document.getElementById('psi-busq-clear');
+    if (clr) clr.style.display = BUSQ ? '' : 'none';
+    pintarFilas();
+  });
+  document.getElementById('psi-busq-clear')?.addEventListener('click', () => {
+    BUSQ = '';
+    const inp = document.getElementById('psi-busq');
+    if (inp) inp.value = '';
+    document.getElementById('psi-busq-clear').style.display = 'none';
+    pintarFilas();
+    inp?.focus();
+  });
 }
 
 function mediana(arr) {
@@ -247,13 +280,18 @@ function mediana(arr) {
 function filaHTML(r) {
   const diasTxt = r.stock <= 0 ? '0' : (r.diasStock >= 999 ? '∞' : r.diasStock);
   const sem = r.semanas.map(s => `<td class="psi-c psi-mono ${s === 0 ? 'psi-muted' : ''}">${s || '—'}</td>`).join('');
-  const recompraCell = r.recompra > 0
-    ? `<td class="psi-c psi-mono psi-recompra">${fmtNum(r.recompra)}</td>`
-    : `<td class="psi-c psi-mono psi-muted">—</td>`;
+  let recompraCell;
+  if (r.recompra <= 0) {
+    recompraCell = `<td class="psi-c psi-mono psi-muted">—</td>`;
+  } else if (r.recomprarYa) {
+    recompraCell = `<td class="psi-c psi-mono psi-recompra psi-ya" title="Recomprar YA: quedan ≤ lead+colchón días de stock">🛒 ${fmtNum(r.recompra)}</td>`;
+  } else {
+    recompraCell = `<td class="psi-c psi-mono psi-recompra-soft" title="Recompra sugerida (todavía hay margen de días)">${fmtNum(r.recompra)}</td>`;
+  }
   const codCell = r.cod === 'SIN_SKU'
     ? `<span class="psi-tag-empty" title="Venta sin SKU asignado">sin SKU</span>`
     : `<span class="psi-cod">${esc(r.cod)}</span>${!r.enCatalogo ? ' <span class="psi-tag-empty" title="No está en el catálogo skus">?</span>' : ''}`;
-  return `<tr>
+  return `<tr class="${r.recomprarYa ? 'psi-row-ya' : ''}">
     <td class="psi-sticky">${codCell}</td>
     <td class="psi-prod psi-sticky2" title="${esc(r.producto)}">${esc(r.producto)}</td>
     ${sem}
@@ -284,11 +322,15 @@ function aplicarParams() {
   const desde = document.getElementById('psi-desde').value;
   const hasta = document.getElementById('psi-hasta').value;
   const dias = parseInt(document.getElementById('psi-dias').value, 10);
+  const lead = parseInt(document.getElementById('psi-lead').value, 10);
+  const colchon = parseInt(document.getElementById('psi-colchon').value, 10);
   if (!desde || !hasta) { window.toast('Elegí desde y hasta', 'error'); return; }
   if (desde > hasta) { window.toast('"Desde" no puede ser posterior a "Hasta"', 'error'); return; }
   PARAMS.desde = desde;
   PARAMS.hasta = hasta;
   PARAMS.diasObj = (dias && dias > 0) ? dias : 30;
+  PARAMS.leadTime = (Number.isFinite(lead) && lead >= 0) ? lead : 15;
+  PARAMS.colchon = (Number.isFinite(colchon) && colchon >= 0) ? colchon : 7;
   const chk = document.getElementById('psi-quiebres');
   PARAMS.ignorarQuiebres = chk ? chk.checked : true;
   loadPSI();
@@ -310,12 +352,13 @@ function cargarXLSX() {
 }
 
 async function exportarXLSX() {
-  if (!ROWS.length) { window.toast('No hay datos para exportar', 'error'); return; }
+  const filas = filasFiltradas();
+  if (!filas.length) { window.toast('No hay datos para exportar', 'error'); return; }
   let XLSX;
   try { XLSX = await cargarXLSX(); }
   catch (e) { window.toast(e.message, 'error'); return; }
 
-  const data = ROWS.map(r => {
+  const data = filas.map(r => {
     const row = { 'SKU': r.cod, 'Producto': r.producto };
     r.semanas.forEach((s, i) => { row[`Sem ${SEMANAS[i]?.label || (i + 1)}`] = s; });
     row['Prom/sem'] = Math.round(r.promSem * 10) / 10;
@@ -323,6 +366,7 @@ async function exportarXLSX() {
     row['Stock'] = r.stock;
     row['Días stock'] = r.stock <= 0 ? 0 : (r.diasStock >= 999 ? '∞' : r.diasStock);
     row['Recompra'] = r.recompra;
+    row['Recomprar YA'] = r.recomprarYa ? 'Sí' : '';
     row['Alerta'] = ALERT_LABEL[r.alerta];
     return row;
   });
@@ -330,7 +374,8 @@ async function exportarXLSX() {
   const ws = XLSX.utils.json_to_sheet(data);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'PSI');
-  XLSX.writeFile(wb, `PSI_${PARAMS.desde}_${PARAMS.hasta}.xlsx`);
+  const sufijo = BUSQ.trim() ? '_filtrado' : '';
+  XLSX.writeFile(wb, `PSI_${PARAMS.desde}_${PARAMS.hasta}${sufijo}.xlsx`);
 }
 
 // ── Utilidades ─────────────────────────────────────────────────────────────
@@ -357,6 +402,12 @@ function inyectarEstilo() {
     .psi-cod{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:13px;color:#D97706;font-weight:600}
     .psi-prod{min-width:260px}
     .psi-recompra{color:#B91C1C;font-weight:700}
+    .psi-recompra-soft{color:#A16207;font-weight:600}
+    .psi-ya{background:#FEF2F2}
+    .psi-row-ya{background:#FEF2F2}
+    .psi-row-ya .psi-sticky,.psi-row-ya .psi-sticky2{background:#FEF2F2}
+    .psi-kpi-ya{border-color:#FCA5A5;background:#FEF2F2}
+    .psi-clear{padding:6px 10px;color:#78716C}
     .psi-tag-empty{font-size:11px;color:#A8A29E;border:1px dashed #D6D3D1;padding:1px 6px;border-radius:6px}
     .psi-dias-verde{color:#15803D;font-weight:600}
     .psi-dias-amarillo{color:#A16207;font-weight:600}
