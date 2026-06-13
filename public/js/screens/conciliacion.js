@@ -16,6 +16,7 @@ let GASTOS = [];         // v_gastos_ap abiertos
 let COMPRAS = [];        // v_compras_ap con saldo
 let VINC_BY_MOV = {};    // movimiento_id -> [vinculos]
 let FILTRO = { cuenta: '', estado: 'por_conciliar' };
+let COLF = { fecha: '', cuenta: '', desc: '', cat: '', monto: '', estado: '', concil: '' }; // filtros por columna (estilo Excel)
 
 const LABEL_CUENTA = {
   supervielle_ars: 'Supervielle ARS', mp_ars: 'MP ARS', caja_ars: 'Caja ARS', caja_usd: 'Caja USD',
@@ -47,6 +48,14 @@ function esEspera(m) {
 // Accionable hoy: pago (salida) pendiente/parcial que no espera venta → gasto/compra.
 function esAccionable(m) {
   return (m.estado === 'pendiente' || m.estado === 'parcial') && !esEspera(m);
+}
+// Bucket de la columna "Conciliación" (categoría legible para el filtro por columna).
+function concilBucket(m) {
+  if (m.estado === 'conciliado') return 'Conciliado';
+  if (m.estado === 'auto') return 'Auto';
+  if (esAccionable(m)) return 'Accionable';
+  if ((m.estado === 'pendiente' || m.estado === 'parcial') && esEspera(m)) return 'Espera venta';
+  return 'Sin acción';
 }
 
 // Mejor sugerencia (gasto o compra) cuyo saldo coincida con el del movimiento.
@@ -118,6 +127,22 @@ function render() {
     pill('todos', 'Todos', base.length),
   ].join('');
 
+  // ── Filtros por columna (estilo Excel) ─────────────────────────────────
+  // Las opciones de cada select salen de lo que hay en la pestaña actual
+  // (post cuenta + pill de estado), ANTES de aplicar los filtros de columna.
+  const uniq = arr => [...new Set(arr.filter(x => x != null && x !== ''))]
+    .sort((a, b) => String(a).localeCompare(String(b), 'es'));
+  const optsCuenta = uniq(filtrados.map(m => cuentaLabel(m.cuenta_id)));
+  const optsCat    = uniq(filtrados.map(m => CAT_LABEL[m.categoria] || m.categoria));
+  const optsEstado = uniq(filtrados.map(m => LABEL_ESTADO[m.estado] || m.estado));
+  const optsConcil = uniq(filtrados.map(concilBucket));
+
+  const selF = (col, opts) =>
+    `<select class="cf" data-col="${col}"><option value="">(todas)</option>${
+      opts.map(o => `<option ${COLF[col] === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
+  const inpF = (col, ph) =>
+    `<input class="cf" data-col="${col}" type="text" placeholder="${ph}" value="${esc(COLF[col])}">`;
+
   root.innerHTML = `
     <div class="toolbar">
       <select class="select" id="c-cuenta" style="width:auto">${opcionesCuenta}</select>
@@ -133,26 +158,87 @@ function render() {
 
     ${filtrados.length === 0
       ? `<div class="empty">No hay movimientos para mostrar.</div>`
-      : `<div class="table-wrap"><table class="t" id="c-tabla">
-          <thead><tr>
-            <th style="width:62px">Fecha</th>
-            <th style="width:110px">Cuenta</th>
-            <th>Descripción</th>
-            <th style="width:130px">Categoría</th>
-            <th style="width:150px;text-align:right">Monto</th>
-            <th style="width:96px">Estado</th>
-            <th style="width:260px">Conciliación</th>
-          </tr></thead>
-          <tbody>${filtrados.map(filaHTML).join('')}</tbody>
-        </table></div>`}
+      : `<div class="con-bar">
+           <span class="con-count" id="c-count"></span>
+           <button class="con-clear" id="c-clear">Limpiar filtros</button>
+         </div>
+         <div class="table-wrap"><table class="t" id="c-tabla">
+          <thead>
+            <tr>
+              <th style="width:62px">Fecha</th>
+              <th style="width:110px">Cuenta</th>
+              <th>Descripción</th>
+              <th style="width:130px">Categoría</th>
+              <th style="width:150px;text-align:right">Monto</th>
+              <th style="width:96px">Estado</th>
+              <th style="width:260px">Conciliación</th>
+            </tr>
+            <tr class="con-filtros">
+              <th>${inpF('fecha', 'dd/mm')}</th>
+              <th>${selF('cuenta', optsCuenta)}</th>
+              <th>${inpF('desc', 'buscar…')}</th>
+              <th>${selF('cat', optsCat)}</th>
+              <th>${inpF('monto', 'monto')}</th>
+              <th>${selF('estado', optsEstado)}</th>
+              <th>${selF('concil', optsConcil)}</th>
+            </tr>
+          </thead>
+          <tbody id="c-tbody"></tbody>
+        </table></div>
+        <div class="empty" id="c-empty" style="display:none">Sin resultados para los filtros aplicados.</div>`}
   `;
 
   document.getElementById('c-cuenta').addEventListener('change', e => { FILTRO.cuenta = e.target.value; render(); });
   root.querySelectorAll('.pill').forEach(p => p.addEventListener('click', () => { FILTRO.estado = p.dataset.estado; render(); }));
 
+  // Filtros por columna: al tipear/elegir repintamos SOLO el tbody (no se pierde el foco).
+  root.querySelectorAll('.cf').forEach(el => {
+    const ev = el.tagName === 'SELECT' ? 'change' : 'input';
+    el.addEventListener(ev, e => { COLF[e.target.dataset.col] = e.target.value; pintarFilas(); });
+  });
+  const clr = document.getElementById('c-clear');
+  if (clr) clr.addEventListener('click', () => {
+    COLF = { fecha: '', cuenta: '', desc: '', cat: '', monto: '', estado: '', concil: '' };
+    render();
+  });
+
   // Delegación de eventos (la tabla puede tener miles de filas)
   const tabla = document.getElementById('c-tabla');
   if (tabla) tabla.addEventListener('click', onTablaClick);
+
+  pintarFilas();
+}
+
+// Filtro por columna: ¿el movimiento pasa los filtros de la fila estilo Excel?
+function pasaColumnas(m) {
+  if (COLF.cuenta && cuentaLabel(m.cuenta_id) !== COLF.cuenta) return false;
+  if (COLF.cat && (CAT_LABEL[m.categoria] || m.categoria) !== COLF.cat) return false;
+  if (COLF.estado && (LABEL_ESTADO[m.estado] || m.estado) !== COLF.estado) return false;
+  if (COLF.concil && concilBucket(m) !== COLF.concil) return false;
+  if (COLF.fecha) {
+    const hay = ((m.fecha || '') + ' ' + ddmm(m.fecha)).toLowerCase();
+    if (!hay.includes(COLF.fecha.toLowerCase())) return false;
+  }
+  if (COLF.desc && !String(m.descripcion || '').toLowerCase().includes(COLF.desc.toLowerCase())) return false;
+  if (COLF.monto) {
+    const q = COLF.monto.replace(',', '.').replace(/[^\d.]/g, '');
+    if (q && !Math.abs(Number(m.monto) || 0).toFixed(2).includes(q)) return false;
+  }
+  return true;
+}
+
+// Repinta únicamente las filas (tbody) según los filtros de columna actuales.
+function pintarFilas() {
+  const tbody = document.getElementById('c-tbody');
+  if (!tbody) return;
+  const base = MOVS.filter(m => !FILTRO.cuenta || String(m.cuenta_id) === FILTRO.cuenta);
+  const filtrados = base.filter(pasaEstado);
+  const visibles = filtrados.filter(pasaColumnas);
+  tbody.innerHTML = visibles.map(filaHTML).join('');
+  const cnt = document.getElementById('c-count');
+  if (cnt) cnt.textContent = `Mostrando ${visibles.length.toLocaleString('es-AR')} de ${filtrados.length.toLocaleString('es-AR')}`;
+  const empty = document.getElementById('c-empty');
+  if (empty) empty.style.display = visibles.length ? 'none' : 'block';
 }
 
 function filaHTML(m) {
@@ -372,6 +458,13 @@ function inyectarEstilo() {
     .con-pick-lbl{font-size:13px;font-weight:500}
     .con-pick-sub{font-size:12px;color:#78716C;margin-top:2px}
     .con-tag{font-size:11px;color:#0F6E56;background:#fff;border:1px solid #0F6E56;border-radius:6px;padding:0 6px;font-weight:400;margin-left:4px}
+    .con-bar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:12px 0 6px}
+    .con-count{font-size:13px;color:#78716C}
+    .con-clear{border:1px solid #E7E5E4;background:#fff;color:#57534E;border-radius:6px;cursor:pointer;font-size:12px;padding:5px 11px}
+    .con-clear:hover{border-color:#B91C1C;color:#B91C1C}
+    .con-filtros th{padding:4px 6px;background:#FAFAF9;border-top:1px solid #E7E5E4}
+    .con-filtros .cf{width:100%;box-sizing:border-box;font-size:12px;padding:4px 6px;border:1px solid #E7E5E4;border-radius:6px;background:#fff;font-family:inherit;color:#1C1917}
+    .con-filtros .cf:focus{outline:none;border-color:#0F6E56;box-shadow:0 0 0 2px rgba(15,110,86,.13)}
   `;
   const style = document.createElement('style');
   style.id = 'con-style';
