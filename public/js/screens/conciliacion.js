@@ -15,8 +15,13 @@ let MOVS = [];           // v_movimientos_estado (todos)
 let GASTOS = [];         // v_gastos_ap abiertos
 let COMPRAS = [];        // v_compras_ap con saldo
 let VINC_BY_MOV = {};    // movimiento_id -> [vinculos]
+let VINC_BY_VENTA = {};  // op_id (venta_ml = ventas_ml.id) -> [vinculos]
+let VENTAS_BY_MES = {};  // 'YYYY-MM' -> ventas_ml[] (cache, fetch on demand)
+let MES = '';            // período seleccionado (mes)
+let VISTA = 'movs';      // 'movs' | 'ventas' | 'ambas'
 let FILTRO = { cuenta: '', estado: 'por_conciliar' };
-let COLF = { fecha: '', cuenta: '', desc: '', cat: '', monto: '', estado: '', concil: '' }; // filtros por columna (estilo Excel)
+let COLF = { fecha: '', cuenta: '', desc: '', cat: '', monto: '', estado: '', concil: '' };   // filtros col. movimientos
+let COLV = { fecha: '', orden: '', prod: '', sku: '', cobrar: '', cobrado: '', estado: '' };   // filtros col. ventas
 
 const LABEL_CUENTA = {
   supervielle_ars: 'Supervielle ARS', mp_ars: 'MP ARS', caja_ars: 'Caja ARS', caja_usd: 'Caja USD',
@@ -86,16 +91,65 @@ export async function loadConciliacion() {
     GASTOS = await sbGet('v_gastos_ap', 'estado_pago=in.(pendiente,parcial)&order=fecha.desc');
     COMPRAS = await sbGet('v_compras_ap', 'saldo_ap_ars=gt.0&order=fecha.desc');
     const vinc = await sbGet('vinculos', 'order=id.desc');
-    VINC_BY_MOV = {};
-    for (const v of vinc) (VINC_BY_MOV[v.movimiento_id] = VINC_BY_MOV[v.movimiento_id] || []).push(v);
+    VINC_BY_MOV = {}; VINC_BY_VENTA = {};
+    for (const v of vinc) {
+      (VINC_BY_MOV[v.movimiento_id] = VINC_BY_MOV[v.movimiento_id] || []).push(v);
+      if (v.op_tipo === 'venta_ml') (VINC_BY_VENTA[String(v.op_id)] = VINC_BY_VENTA[String(v.op_id)] || []).push(v);
+    }
   } catch (e) {
     root.innerHTML = `<div class="error">No se pudo cargar la conciliación: ${e.message}<br><br>
       Si dice algo de permisos sobre <b>vinculos</b>, corré en Supabase: <code>grant select on vinculos to anon, authenticated;</code></div>`;
     return;
   }
+  if (!MES) MES = mesPorDefecto();
   inyectarEstilo();
+  await ensureVentas(MES);
   render();
 }
+
+// ── Período (mes) y ventas ─────────────────────────────────────────────
+function mesPorDefecto() {
+  const ms = MOVS.map(m => (m.fecha || '').slice(0, 7)).filter(Boolean).sort();
+  return ms.length ? ms[ms.length - 1] : new Date().toISOString().slice(0, 7);
+}
+function mesesDisponibles() {
+  const s = new Set();
+  MOVS.forEach(m => { const k = (m.fecha || '').slice(0, 7); if (k) s.add(k); });
+  Object.keys(VENTAS_BY_MES).forEach(k => s.add(k));
+  if (MES) s.add(MES);
+  return [...s].sort().reverse();
+}
+async function ensureVentas(mes) {
+  if (!mes || VENTAS_BY_MES[mes]) return;
+  try {
+    VENTAS_BY_MES[mes] = await sbGet('ventas_ml', `periodo=eq.${mes}&order=fecha.desc,id.desc`);
+  } catch (e) {
+    VENTAS_BY_MES[mes] = [];
+    if (window.toast) window.toast('No se pudieron cargar las ventas del mes: ' + e.message, 'error');
+  }
+}
+const MES_NOM = ['', 'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
+const mesLabel = k => { if (!k) return ''; const [y, m] = k.split('-'); return `${MES_NOM[Number(m)] || m} ${y}`; };
+
+// Datasets derivados del período/cuenta seleccionados.
+const enMes = f => (f || '').slice(0, 7) === MES;
+function movsBase() { return MOVS.filter(m => enMes(m.fecha) && (!FILTRO.cuenta || String(m.cuenta_id) === FILTRO.cuenta)); }
+function movsFiltrados() { return movsBase().filter(pasaEstado); }
+function ventasMes() { return VENTAS_BY_MES[MES] || []; }
+
+// Conciliación de una venta ML (vinculos op_tipo='venta_ml', op_id = ventas_ml.id).
+function ventaCobrado(v) {
+  return (VINC_BY_VENTA[String(v.id)] || []).reduce((s, x) => s + Math.abs(Number(x.monto) || 0), 0);
+}
+function ventaEstado(v) {
+  if (v.ml_status === 'cancelled') return 'Cancelada';
+  const cobrado = ventaCobrado(v);
+  const pc = Math.abs(Number(v.por_cobrar) || 0);
+  if (cobrado < 0.02) return 'Sin cobro';
+  if (Math.abs(cobrado - pc) < 0.02) return 'Conciliada';
+  return 'Parcial';
+}
+const VEST_CLASS = { 'Conciliada': 'conciliada', 'Parcial': 'parcial', 'Sin cobro': 'sincobro', 'Cancelada': 'cancelada' };
 
 function pasaEstado(m) {
   if (FILTRO.estado === 'por_conciliar') return m.estado === 'pendiente' || m.estado === 'parcial';
@@ -105,108 +159,138 @@ function pasaEstado(m) {
 
 function render() {
   const root = document.getElementById('app-screens');
-  const base = MOVS.filter(m => !FILTRO.cuenta || String(m.cuenta_id) === FILTRO.cuenta);
+  const mb = movsBase();
+  const mf = movsFiltrados();
+  const ventas = ventasMes();
 
-  const nPorConciliar = base.filter(m => m.estado === 'pendiente' || m.estado === 'parcial').length;
-  const nConciliados = base.filter(m => m.estado === 'conciliado').length;
-  const nAuto = base.filter(m => m.estado === 'auto').length;
-  const montoAConciliar = base.filter(esAccionable).reduce((s, m) => s + Math.abs(Number(m.saldo_pendiente) || 0), 0);
+  const verMovs = VISTA === 'movs' || VISTA === 'ambas';
+  const verVentas = VISTA === 'ventas' || VISTA === 'ambas';
 
-  const filtrados = base.filter(pasaEstado);
+  // KPIs (movimientos del mes/cuenta)
+  const nPorConciliar = mb.filter(m => m.estado === 'pendiente' || m.estado === 'parcial').length;
+  const nConciliados = mb.filter(m => m.estado === 'conciliado').length;
+  const nAuto = mb.filter(m => m.estado === 'auto').length;
+  const montoAConciliar = mb.filter(esAccionable).reduce((s, m) => s + Math.abs(Number(m.saldo_pendiente) || 0), 0);
 
+  // Toolbar
   const opcionesCuenta = ['<option value="">Todas las cuentas</option>']
     .concat(CUENTAS.map(c => `<option value="${c.id}" ${FILTRO.cuenta === String(c.id) ? 'selected' : ''}>${cuentaLabel(c.id)}</option>`))
     .join('');
+  const opcionesMes = mesesDisponibles()
+    .map(k => `<option value="${k}" ${k === MES ? 'selected' : ''}>${mesLabel(k)}</option>`).join('');
+  const vbtn = (v, l) => `<button class="${VISTA === v ? 'active' : ''}" data-vista="${v}">${l}</button>`;
 
-  const pill = (val, label, n) =>
-    `<button class="pill ${FILTRO.estado === val ? 'active' : ''}" data-estado="${val}">${label} <span class="num">${n}</span></button>`;
+  // Filtros por columna: helpers de armado
+  const uniq = arr => [...new Set(arr.filter(x => x != null && x !== ''))].sort((a, b) => String(a).localeCompare(String(b), 'es'));
+  const selF = (col, opts) => `<select class="cf" data-col="${col}"><option value="">(todas)</option>${opts.map(o => `<option ${COLF[col] === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
+  const inpF = (col, ph) => `<input class="cf" data-col="${col}" type="text" placeholder="${ph}" value="${esc(COLF[col])}">`;
+  const selV = (col, opts) => `<select class="vf" data-col="${col}"><option value="">(todas)</option>${opts.map(o => `<option ${COLV[col] === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
+  const inpV = (col, ph) => `<input class="vf" data-col="${col}" type="text" placeholder="${ph}" value="${esc(COLV[col])}">`;
+
+  const optsCuenta = uniq(mf.map(m => cuentaLabel(m.cuenta_id)));
+  const optsCat = uniq(mf.map(m => CAT_LABEL[m.categoria] || m.categoria));
+  const optsEstadoM = uniq(mf.map(m => LABEL_ESTADO[m.estado] || m.estado));
+  const optsConcil = uniq(mf.map(concilBucket));
+  const optsVEstado = uniq(ventas.map(ventaEstado));
+
+  const pill = (val, label, n) => `<button class="pill ${FILTRO.estado === val ? 'active' : ''}" data-estado="${val}">${label} <span class="num">${n}</span></button>`;
   const pills = [
     pill('por_conciliar', 'Por conciliar', nPorConciliar),
     pill('conciliado', 'Conciliados', nConciliados),
     pill('auto', 'Auto', nAuto),
-    pill('todos', 'Todos', base.length),
+    pill('todos', 'Todos', mb.length),
   ].join('');
 
-  // ── Filtros por columna (estilo Excel) ─────────────────────────────────
-  // Las opciones de cada select salen de lo que hay en la pestaña actual
-  // (post cuenta + pill de estado), ANTES de aplicar los filtros de columna.
-  const uniq = arr => [...new Set(arr.filter(x => x != null && x !== ''))]
-    .sort((a, b) => String(a).localeCompare(String(b), 'es'));
-  const optsCuenta = uniq(filtrados.map(m => cuentaLabel(m.cuenta_id)));
-  const optsCat    = uniq(filtrados.map(m => CAT_LABEL[m.categoria] || m.categoria));
-  const optsEstado = uniq(filtrados.map(m => LABEL_ESTADO[m.estado] || m.estado));
-  const optsConcil = uniq(filtrados.map(concilBucket));
+  const panelMovs = !verMovs ? '' : `
+    <div class="con-panel">
+      ${VISTA === 'ambas' ? `<div class="con-panel-title">Movimientos bancarios</div>` : ''}
+      <div class="pills">${pills}</div>
+      ${mf.length === 0
+        ? `<div class="empty">No hay movimientos en este período.</div>`
+        : `<div class="con-bar"><span class="con-count" id="c-count"></span>
+             <button class="con-clear" id="c-clear">Limpiar filtros</button></div>
+           <div class="table-wrap"><table class="t" id="c-tabla">
+            <thead>
+              <tr><th style="width:58px">Fecha</th><th style="width:104px">Cuenta</th><th>Descripción</th>
+                <th style="width:120px">Categoría</th><th style="width:140px;text-align:right">Monto</th>
+                <th style="width:90px">Estado</th><th style="width:240px">Conciliación</th></tr>
+              <tr class="con-filtros">
+                <th>${inpF('fecha', 'dd/mm')}</th><th>${selF('cuenta', optsCuenta)}</th><th>${inpF('desc', 'buscar…')}</th>
+                <th>${selF('cat', optsCat)}</th><th>${inpF('monto', 'monto')}</th><th>${selF('estado', optsEstadoM)}</th><th>${selF('concil', optsConcil)}</th>
+              </tr>
+            </thead>
+            <tbody id="c-tbody"></tbody>
+          </table></div>
+          <div class="empty" id="c-empty" style="display:none">Sin resultados para los filtros aplicados.</div>`}
+    </div>`;
 
-  const selF = (col, opts) =>
-    `<select class="cf" data-col="${col}"><option value="">(todas)</option>${
-      opts.map(o => `<option ${COLF[col] === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
-  const inpF = (col, ph) =>
-    `<input class="cf" data-col="${col}" type="text" placeholder="${ph}" value="${esc(COLF[col])}">`;
+  const panelVentas = !verVentas ? '' : `
+    <div class="con-panel">
+      ${VISTA === 'ambas' ? `<div class="con-panel-title">Ventas facturadas</div>` : ''}
+      ${ventas.length === 0
+        ? `<div class="empty">No hay ventas en este período.</div>`
+        : `<div class="con-bar"><span class="con-count" id="v-count"></span>
+             <button class="con-clear" id="v-clear">Limpiar filtros</button></div>
+           <div class="table-wrap"><table class="t" id="v-tabla">
+            <thead>
+              <tr><th style="width:58px">Fecha</th><th style="width:128px">Orden</th><th>Producto</th>
+                <th style="width:70px">SKU</th><th style="width:130px;text-align:right">Por cobrar</th>
+                <th style="width:130px;text-align:right">Cobrado</th><th style="width:104px">Estado</th></tr>
+              <tr class="con-filtros">
+                <th>${inpV('fecha', 'dd/mm')}</th><th>${inpV('orden', 'orden')}</th><th>${inpV('prod', 'buscar…')}</th>
+                <th>${inpV('sku', 'sku')}</th><th>${inpV('cobrar', 'monto')}</th><th>${inpV('cobrado', 'monto')}</th><th>${selV('estado', optsVEstado)}</th>
+              </tr>
+            </thead>
+            <tbody id="v-tbody"></tbody>
+          </table></div>
+          <div class="empty" id="v-empty" style="display:none">Sin resultados para los filtros aplicados.</div>`}
+    </div>`;
 
   root.innerHTML = `
-    <div class="toolbar">
+    <div class="toolbar con-top">
+      <div class="con-mesctl"><span class="con-lbl">Período</span>
+        <select class="select" id="c-mes" style="width:auto">${opcionesMes}</select></div>
       <select class="select" id="c-cuenta" style="width:auto">${opcionesCuenta}</select>
+      <div class="con-views">${vbtn('movs', 'Movimientos')}${vbtn('ventas', 'Ventas')}${vbtn('ambas', 'Ambas')}</div>
     </div>
 
-    <div class="kpi-grid" style="margin:14px 0">
-      <div class="kpi"><div class="kpi-label">Por conciliar</div><div class="kpi-value">${nPorConciliar}</div></div>
+    ${verMovs ? `<div class="kpi-grid" style="margin:14px 0">
+      <div class="kpi"><div class="kpi-label">Por conciliar (mes)</div><div class="kpi-value">${nPorConciliar}</div></div>
       <div class="kpi"><div class="kpi-label">Monto a conciliar (pagos)</div><div class="kpi-value">${money(montoAConciliar)}</div></div>
-      <div class="kpi"><div class="kpi-label">Conciliados</div><div class="kpi-value">${nConciliados}</div></div>
+      <div class="kpi"><div class="kpi-label">Conciliados (mes)</div><div class="kpi-value">${nConciliados}</div></div>
+    </div>` : ''}
+
+    <div class="con-panels ${VISTA === 'ambas' ? 'con-dual' : ''}">
+      ${panelMovs}
+      ${panelVentas}
     </div>
-
-    <div class="pills">${pills}</div>
-
-    ${filtrados.length === 0
-      ? `<div class="empty">No hay movimientos para mostrar.</div>`
-      : `<div class="con-bar">
-           <span class="con-count" id="c-count"></span>
-           <button class="con-clear" id="c-clear">Limpiar filtros</button>
-         </div>
-         <div class="table-wrap"><table class="t" id="c-tabla">
-          <thead>
-            <tr>
-              <th style="width:62px">Fecha</th>
-              <th style="width:110px">Cuenta</th>
-              <th>Descripción</th>
-              <th style="width:130px">Categoría</th>
-              <th style="width:150px;text-align:right">Monto</th>
-              <th style="width:96px">Estado</th>
-              <th style="width:260px">Conciliación</th>
-            </tr>
-            <tr class="con-filtros">
-              <th>${inpF('fecha', 'dd/mm')}</th>
-              <th>${selF('cuenta', optsCuenta)}</th>
-              <th>${inpF('desc', 'buscar…')}</th>
-              <th>${selF('cat', optsCat)}</th>
-              <th>${inpF('monto', 'monto')}</th>
-              <th>${selF('estado', optsEstado)}</th>
-              <th>${selF('concil', optsConcil)}</th>
-            </tr>
-          </thead>
-          <tbody id="c-tbody"></tbody>
-        </table></div>
-        <div class="empty" id="c-empty" style="display:none">Sin resultados para los filtros aplicados.</div>`}
   `;
 
+  document.getElementById('c-mes').addEventListener('change', async e => { MES = e.target.value; await ensureVentas(MES); render(); });
   document.getElementById('c-cuenta').addEventListener('change', e => { FILTRO.cuenta = e.target.value; render(); });
+  root.querySelectorAll('.con-views button').forEach(b => b.addEventListener('click', () => { VISTA = b.dataset.vista; render(); }));
   root.querySelectorAll('.pill').forEach(p => p.addEventListener('click', () => { FILTRO.estado = p.dataset.estado; render(); }));
 
-  // Filtros por columna: al tipear/elegir repintamos SOLO el tbody (no se pierde el foco).
+  // Filtros por columna: repintan SOLO el tbody respectivo (no se pierde el foco).
   root.querySelectorAll('.cf').forEach(el => {
     const ev = el.tagName === 'SELECT' ? 'change' : 'input';
     el.addEventListener(ev, e => { COLF[e.target.dataset.col] = e.target.value; pintarFilas(); });
   });
-  const clr = document.getElementById('c-clear');
-  if (clr) clr.addEventListener('click', () => {
-    COLF = { fecha: '', cuenta: '', desc: '', cat: '', monto: '', estado: '', concil: '' };
-    render();
+  root.querySelectorAll('.vf').forEach(el => {
+    const ev = el.tagName === 'SELECT' ? 'change' : 'input';
+    el.addEventListener(ev, e => { COLV[e.target.dataset.col] = e.target.value; pintarVentas(); });
   });
+  const clr = document.getElementById('c-clear');
+  if (clr) clr.addEventListener('click', () => { COLF = { fecha: '', cuenta: '', desc: '', cat: '', monto: '', estado: '', concil: '' }; render(); });
+  const clrv = document.getElementById('v-clear');
+  if (clrv) clrv.addEventListener('click', () => { COLV = { fecha: '', orden: '', prod: '', sku: '', cobrar: '', cobrado: '', estado: '' }; render(); });
 
-  // Delegación de eventos (la tabla puede tener miles de filas)
+  // Delegación de eventos (sólo la tabla de movimientos tiene acciones)
   const tabla = document.getElementById('c-tabla');
   if (tabla) tabla.addEventListener('click', onTablaClick);
 
-  pintarFilas();
+  if (verMovs) pintarFilas();
+  if (verVentas) pintarVentas();
 }
 
 // Filtro por columna: ¿el movimiento pasa los filtros de la fila estilo Excel?
@@ -227,18 +311,57 @@ function pasaColumnas(m) {
   return true;
 }
 
-// Repinta únicamente las filas (tbody) según los filtros de columna actuales.
+// Repinta únicamente las filas de movimientos según los filtros de columna.
 function pintarFilas() {
   const tbody = document.getElementById('c-tbody');
   if (!tbody) return;
-  const base = MOVS.filter(m => !FILTRO.cuenta || String(m.cuenta_id) === FILTRO.cuenta);
-  const filtrados = base.filter(pasaEstado);
+  const filtrados = movsFiltrados();
   const visibles = filtrados.filter(pasaColumnas);
   tbody.innerHTML = visibles.map(filaHTML).join('');
   const cnt = document.getElementById('c-count');
   if (cnt) cnt.textContent = `Mostrando ${visibles.length.toLocaleString('es-AR')} de ${filtrados.length.toLocaleString('es-AR')}`;
   const empty = document.getElementById('c-empty');
   if (empty) empty.style.display = visibles.length ? 'none' : 'block';
+}
+
+// Filtro por columna de la tabla de ventas.
+function pasaColumnasV(v) {
+  if (COLV.estado && ventaEstado(v) !== COLV.estado) return false;
+  if (COLV.fecha) { const h = ((v.fecha || '') + ' ' + ddmm(v.fecha)).toLowerCase(); if (!h.includes(COLV.fecha.toLowerCase())) return false; }
+  if (COLV.orden && !String(v.ml_order_id || '').includes(COLV.orden)) return false;
+  if (COLV.prod && !String(v.titulo || '').toLowerCase().includes(COLV.prod.toLowerCase())) return false;
+  if (COLV.sku && !String(v.sku || '').toLowerCase().includes(COLV.sku.toLowerCase())) return false;
+  if (COLV.cobrar) { const q = COLV.cobrar.replace(',', '.').replace(/[^\d.]/g, ''); if (q && !Math.abs(Number(v.por_cobrar) || 0).toFixed(2).includes(q)) return false; }
+  if (COLV.cobrado) { const q = COLV.cobrado.replace(',', '.').replace(/[^\d.]/g, ''); if (q && !ventaCobrado(v).toFixed(2).includes(q)) return false; }
+  return true;
+}
+
+// Repinta únicamente las filas de ventas según los filtros de columna.
+function pintarVentas() {
+  const tbody = document.getElementById('v-tbody');
+  if (!tbody) return;
+  const todas = ventasMes();
+  const visibles = todas.filter(pasaColumnasV);
+  tbody.innerHTML = visibles.map(filaVentaHTML).join('');
+  const cnt = document.getElementById('v-count');
+  if (cnt) cnt.textContent = `Mostrando ${visibles.length.toLocaleString('es-AR')} de ${todas.length.toLocaleString('es-AR')}`;
+  const empty = document.getElementById('v-empty');
+  if (empty) empty.style.display = visibles.length ? 'none' : 'block';
+}
+
+function filaVentaHTML(v) {
+  const est = ventaEstado(v);
+  const cobrado = ventaCobrado(v);
+  const dev = v.devuelta ? `<span class="con-vdev">devuelta</span>` : '';
+  return `<tr>
+    <td>${ddmm(v.fecha)}</td>
+    <td class="con-mono" title="${esc(v.ml_order_id || '')}">${esc(v.ml_order_id || '—')}</td>
+    <td>${esc(v.titulo || '—')}${dev}</td>
+    <td class="con-mono">${esc(v.sku || '—')}</td>
+    <td style="text-align:right" class="con-mono">${money(v.por_cobrar)}</td>
+    <td style="text-align:right" class="con-mono">${cobrado > 0.02 ? money(cobrado) : '<span class="con-dash">—</span>'}</td>
+    <td><span class="con-vchip con-vchip-${VEST_CLASS[est]}">${est}</span></td>
+  </tr>`;
 }
 
 function filaHTML(m) {
@@ -465,6 +588,26 @@ function inyectarEstilo() {
     .con-filtros th{padding:4px 6px;background:#FAFAF9;border-top:1px solid #E7E5E4}
     .con-filtros .cf{width:100%;box-sizing:border-box;font-size:12px;padding:4px 6px;border:1px solid #E7E5E4;border-radius:6px;background:#fff;font-family:inherit;color:#1C1917}
     .con-filtros .cf:focus{outline:none;border-color:#0F6E56;box-shadow:0 0 0 2px rgba(15,110,86,.13)}
+    .con-filtros .vf{width:100%;box-sizing:border-box;font-size:12px;padding:4px 6px;border:1px solid #E7E5E4;border-radius:6px;background:#fff;font-family:inherit;color:#1C1917}
+    .con-filtros .vf:focus{outline:none;border-color:#0F6E56;box-shadow:0 0 0 2px rgba(15,110,86,.13)}
+    .con-top{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .con-mesctl{display:flex;align-items:center;gap:8px}
+    .con-lbl{font-size:12px;color:#78716C}
+    .con-views{display:inline-flex;border:1px solid #E7E5E4;border-radius:8px;overflow:hidden}
+    .con-views button{border:0;background:#fff;color:#57534E;font-size:13px;padding:7px 13px;cursor:pointer;font-family:inherit;border-right:1px solid #E7E5E4}
+    .con-views button:last-child{border-right:0}
+    .con-views button.active{background:#0F6E56;color:#fff}
+    .con-panels{margin-top:4px}
+    .con-dual{display:flex;gap:16px;align-items:flex-start}
+    .con-dual > .con-panel{flex:1;min-width:0}
+    .con-panel-title{font-size:14px;font-weight:600;color:#1C1917;margin:0 0 8px}
+    .con-vchip{font-size:12px;padding:2px 8px;border-radius:6px;white-space:nowrap}
+    .con-vchip-conciliada{background:#E1F5EE;color:#0F6E56}
+    .con-vchip-parcial{background:#E6F1FB;color:#0C447C}
+    .con-vchip-sincobro{background:#FAEEDA;color:#854F0B}
+    .con-vchip-cancelada{background:#F3E7E7;color:#9B5151}
+    .con-vdev{font-size:11px;background:#F1EFE8;color:#9A3412;border-radius:6px;padding:1px 6px;margin-left:6px}
+    @media(max-width:1100px){.con-dual{flex-direction:column}.con-dual > .con-panel{width:100%}}
   `;
   const style = document.createElement('style');
   style.id = 'con-style';
