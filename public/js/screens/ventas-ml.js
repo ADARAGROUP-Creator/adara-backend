@@ -25,7 +25,7 @@ let MODO = 'dia';            // dia | mes
 let FECHA = '';              // YYYY-MM-DD (modo día)
 let MES = '';                // YYYY-MM (modo mes)
 let FILTRO = 'todas';        // todas | por_cobrar | cobradas | conciliadas | canceladas | devueltas
-let COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', com: '', envio: '', imp: '', fin: '', cobrar: '', estado: '' }; // filtros por columna
+let COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', com: '', envio: '', imp: '', fin: '', cobrar: '', fcobro: '', estado: '' }; // filtros por columna
 let BONIF_MAP_CUR = {};      // bonifs del período actual (para el repintado parcial de filtros)
 
 // ── Solapas de la pantalla ──────────────────────────────────────────────
@@ -333,6 +333,7 @@ function renderVentas() {
       <th>${vIn('imp', 'monto')}</th>
       <th>${vIn('fin', 'monto')}</th>
       <th>${vIn('cobrar', 'monto')}</th>
+      <th>${vIn('fcobro', 'dd/mm')}</th>
       <th>${vSel('estado', optsVEst)}</th>
       <th></th>
     </tr>`;
@@ -411,6 +412,7 @@ function renderVentas() {
                 <th style="width:84px;text-align:right">Impuestos</th>
                 <th style="width:88px;text-align:right">Financiero</th>
                 <th style="width:104px;text-align:right">Por cobrar</th>
+                <th style="width:64px">F. cobro</th>
                 <th style="width:84px">Estado</th>
                 <th style="width:230px">Cobro / Conciliación</th>
               </tr>
@@ -452,7 +454,7 @@ function renderVentas() {
       });
       const vclr = document.getElementById('vml-clear');
       if (vclr) vclr.addEventListener('click', () => {
-        COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', com: '', envio: '', imp: '', fin: '', cobrar: '', estado: '' };
+        COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', com: '', envio: '', imp: '', fin: '', cobrar: '', fcobro: '', estado: '' };
         render();
       });
       pintarVML();
@@ -576,6 +578,7 @@ function filaHTML(v, esMes, bonifMap) {
     ${celdaMonto(v.impuestos)}
     ${celdaMonto(v.costo_financiero)}
     <td style="text-align:right" class="vml-mono vml-fuerte">${money(v.por_cobrar)}</td>
+    <td class="vml-mono">${v.fecha_cobro ? esc(ddmm(v.fecha_cobro)) : '—'}</td>
     <td><span class="vml-est vml-est-${est.cls || 'ok'}">${esc(est.txt)}</span></td>
     <td>${cobroCell(v, bonifMap)}</td>
   </tr>`;
@@ -604,6 +607,7 @@ function pasaColV(v) {
   if (COLV.imp && !num(v.impuestos, COLV.imp)) return false;
   if (COLV.fin && !num(v.costo_financiero, COLV.fin)) return false;
   if (COLV.cobrar && !num(v.por_cobrar, COLV.cobrar)) return false;
+  if (COLV.fcobro) { const h = ((v.fecha_cobro || '') + ' ' + ddmm(v.fecha_cobro)).toLowerCase(); if (!h.includes(COLV.fcobro.toLowerCase())) return false; }
   return true;
 }
 
@@ -623,7 +627,7 @@ function filaTotales(vis, esMes) {
     <td style="text-align:right" class="vml-mono">${money(sum('impuestos'))}</td>
     <td style="text-align:right" class="vml-mono">${money(sum('costo_financiero'))}</td>
     <td style="text-align:right" class="vml-mono vml-fuerte">${money(sum('por_cobrar'))}</td>
-    <td></td><td></td>
+    <td></td><td></td><td></td>
   </tr>`;
 }
 
