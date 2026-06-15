@@ -25,6 +25,8 @@ let MODO = 'dia';            // dia | mes
 let FECHA = '';              // YYYY-MM-DD (modo día)
 let MES = '';                // YYYY-MM (modo mes)
 let FILTRO = 'todas';        // todas | por_cobrar | cobradas | conciliadas | canceladas | devueltas
+let COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', com: '', envio: '', imp: '', fin: '', cobrar: '', estado: '' }; // filtros por columna
+let BONIF_MAP_CUR = {};      // bonifs del período actual (para el repintado parcial de filtros)
 
 // ── Solapas de la pantalla ──────────────────────────────────────────────
 
@@ -314,6 +316,27 @@ function renderVentas() {
   const visibles = FILTRO === 'todas' ? base : base.filter(v => clase(v) === FILTRO);
   const totCobrar = base.reduce((s, v) => s + (Number(v.por_cobrar) || 0), 0);
 
+  // ── Filtros por columna (estilo Excel) ──
+  const optsVEst = [...new Set(base.map(v => (ESTADO_LBL[clase(v)] && ESTADO_LBL[clase(v)].txt) || clase(v)))]
+    .filter(Boolean).sort((a, b) => String(a).localeCompare(String(b), 'es'));
+  const vIn = (col, ph) => `<input class="vmlf" data-col="${col}" type="text" placeholder="${ph}" value="${esc(COLV[col])}">`;
+  const vSel = (col, opts) => `<select class="vmlf" data-col="${col}"><option value="">(todas)</option>${opts.map(o => `<option ${COLV[col] === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
+  const filtroRow = `<tr class="vml-filtros">
+      ${esMes ? `<th>${vIn('fecha', 'dd/mm')}</th>` : ''}
+      <th>${vIn('venta', '# venta')}</th>
+      <th>${vIn('prod', 'buscar…')}</th>
+      <th>${vIn('sku', 'sku')}</th>
+      <th>${vIn('cant', 'cant')}</th>
+      <th>${vIn('bruto', 'monto')}</th>
+      <th>${vIn('com', 'monto')}</th>
+      <th>${vIn('envio', 'monto')}</th>
+      <th>${vIn('imp', 'monto')}</th>
+      <th>${vIn('fin', 'monto')}</th>
+      <th>${vIn('cobrar', 'monto')}</th>
+      <th>${vSel('estado', optsVEst)}</th>
+      <th></th>
+    </tr>`;
+
   const modoHTML = `
     <div class="vml-modo">
       <button class="${!esMes ? 'active' : ''}" data-modo="dia">Día</button>
@@ -372,24 +395,31 @@ function renderVentas() {
       ${pills}
       ${visibles.length === 0
         ? `<div class="empty" style="margin-top:14px">No hay ventas en este filtro para ${vacioTxt}.</div>`
-        : `<div class="table-wrap" style="margin-top:14px"><table class="t" id="vml-tabla">
-            <thead><tr>
-              ${esMes ? '<th style="width:50px">Fecha</th>' : ''}
-              <th style="width:120px"># Venta</th>
-              <th>Producto</th>
-              <th style="width:56px">SKU</th>
-              <th style="width:34px;text-align:right">Cant</th>
-              <th style="width:96px;text-align:right">Bruto</th>
-              <th style="width:90px;text-align:right">Comisión</th>
-              <th style="width:84px;text-align:right">Envío</th>
-              <th style="width:84px;text-align:right">Impuestos</th>
-              <th style="width:88px;text-align:right">Financiero</th>
-              <th style="width:104px;text-align:right">Por cobrar</th>
-              <th style="width:84px">Estado</th>
-              <th style="width:230px">Cobro / Conciliación</th>
-            </tr></thead>
-            <tbody>${visibles.map(v => filaHTML(v, esMes, BONIF_MAP)).join('')}</tbody>
-          </table></div>`}
+        : `<div class="vml-fbar"><span class="vml-count-lbl" id="vml-count"></span>
+             <button class="vml-clear" id="vml-clear">Limpiar filtros</button></div>
+           <div class="table-wrap"><table class="t" id="vml-tabla">
+            <thead>
+              <tr>
+                ${esMes ? '<th style="width:50px">Fecha</th>' : ''}
+                <th style="width:120px"># Venta</th>
+                <th>Producto</th>
+                <th style="width:56px">SKU</th>
+                <th style="width:34px;text-align:right">Cant</th>
+                <th style="width:96px;text-align:right">Bruto</th>
+                <th style="width:90px;text-align:right">Comisión</th>
+                <th style="width:84px;text-align:right">Envío</th>
+                <th style="width:84px;text-align:right">Impuestos</th>
+                <th style="width:88px;text-align:right">Financiero</th>
+                <th style="width:104px;text-align:right">Por cobrar</th>
+                <th style="width:84px">Estado</th>
+                <th style="width:230px">Cobro / Conciliación</th>
+              </tr>
+              ${filtroRow}
+            </thead>
+            <tbody id="vml-tbody"></tbody>
+            <tfoot id="vml-tfoot"></tfoot>
+          </table></div>
+          <div class="empty" id="vml-empty" style="display:none;margin-top:10px">Sin resultados para los filtros aplicados.</div>`}
         `}
     ` : `<div class="empty">Todavía no hay ventas cargadas. Tocá <b>Sincronizar ventas</b> para traerlas de Mercado Libre.</div>`}
   `;
@@ -414,6 +444,18 @@ function renderVentas() {
       if (tabla) tabla.addEventListener('click', onTablaClick);
       const cTodas = document.getElementById('vml-conc-todas');
       if (cTodas) cTodas.addEventListener('click', conciliarTodas);
+      // Filtros por columna: repintan SOLO el tbody/tfoot (no se pierde el foco).
+      BONIF_MAP_CUR = BONIF_MAP;
+      root.querySelectorAll('.vmlf').forEach(el => {
+        const ev = el.tagName === 'SELECT' ? 'change' : 'input';
+        el.addEventListener(ev, e => { COLV[e.target.dataset.col] = e.target.value; pintarVML(); });
+      });
+      const vclr = document.getElementById('vml-clear');
+      if (vclr) vclr.addEventListener('click', () => {
+        COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', com: '', envio: '', imp: '', fin: '', cobrar: '', estado: '' };
+        render();
+      });
+      pintarVML();
     }
   }
 }
@@ -537,6 +579,68 @@ function filaHTML(v, esMes, bonifMap) {
     <td><span class="vml-est vml-est-${est.cls || 'ok'}">${esc(est.txt)}</span></td>
     <td>${cobroCell(v, bonifMap)}</td>
   </tr>`;
+}
+
+// Base del período tras el pill de estado (sin filtros de columna).
+function ventasVisiblesBase() {
+  const b = conjuntoActual();
+  return FILTRO === 'todas' ? b : b.filter(v => clase(v) === FILTRO);
+}
+
+// Filtro por columna (estilo Excel) de la tabla de ventas.
+function pasaColV(v) {
+  const cl = clase(v);
+  const est = (ESTADO_LBL[cl] && ESTADO_LBL[cl].txt) || cl;
+  const num = (field, q) => { const x = q.replace(',', '.').replace(/[^\d.]/g, ''); return !x || Math.abs(Number(field) || 0).toFixed(2).includes(x); };
+  if (COLV.estado && est !== COLV.estado) return false;
+  if (COLV.fecha) { const h = ((v.fecha || '') + ' ' + ddmm(v.fecha)).toLowerCase(); if (!h.includes(COLV.fecha.toLowerCase())) return false; }
+  if (COLV.venta && !String(v.ml_order_id || '').includes(COLV.venta)) return false;
+  if (COLV.prod && !String(v.titulo || '').toLowerCase().includes(COLV.prod.toLowerCase())) return false;
+  if (COLV.sku && !String(v.sku || '').toLowerCase().includes(COLV.sku.toLowerCase())) return false;
+  if (COLV.cant) { const x = COLV.cant.replace(/[^\d]/g, ''); if (x && !String(v.cantidad || 1).includes(x)) return false; }
+  if (COLV.bruto && !num(v.importe_bruto, COLV.bruto)) return false;
+  if (COLV.com && !num(v.cargo_venta, COLV.com)) return false;
+  if (COLV.envio && !num(v.cargo_envio, COLV.envio)) return false;
+  if (COLV.imp && !num(v.impuestos, COLV.imp)) return false;
+  if (COLV.fin && !num(v.costo_financiero, COLV.fin)) return false;
+  if (COLV.cobrar && !num(v.por_cobrar, COLV.cobrar)) return false;
+  return true;
+}
+
+// Fila de totales (suma de las columnas numéricas sobre lo filtrado).
+function filaTotales(vis, esMes) {
+  const sum = f => vis.reduce((s, v) => s + (Number(v[f]) || 0), 0);
+  const cant = vis.reduce((s, v) => s + (Number(v.cantidad) || 1), 0);
+  return `<tr class="vml-tot">
+    ${esMes ? '<td></td>' : ''}
+    <td class="vml-tot-lbl">Totales</td>
+    <td>${vis.length.toLocaleString('es-AR')} ventas</td>
+    <td></td>
+    <td style="text-align:right">${cant.toLocaleString('es-AR')}</td>
+    <td style="text-align:right" class="vml-mono">${money(sum('importe_bruto'))}</td>
+    <td style="text-align:right" class="vml-mono">${money(sum('cargo_venta'))}</td>
+    <td style="text-align:right" class="vml-mono">${money(sum('cargo_envio'))}</td>
+    <td style="text-align:right" class="vml-mono">${money(sum('impuestos'))}</td>
+    <td style="text-align:right" class="vml-mono">${money(sum('costo_financiero'))}</td>
+    <td style="text-align:right" class="vml-mono vml-fuerte">${money(sum('por_cobrar'))}</td>
+    <td></td><td></td>
+  </tr>`;
+}
+
+// Repinta sólo el cuerpo y la fila de totales según los filtros de columna.
+function pintarVML() {
+  const tbody = document.getElementById('vml-tbody');
+  if (!tbody) return;
+  const esMes = MODO === 'mes';
+  const base = ventasVisiblesBase();
+  const vis = base.filter(pasaColV);
+  tbody.innerHTML = vis.map(v => filaHTML(v, esMes, BONIF_MAP_CUR)).join('');
+  const tfoot = document.getElementById('vml-tfoot');
+  if (tfoot) tfoot.innerHTML = filaTotales(vis, esMes);
+  const cnt = document.getElementById('vml-count');
+  if (cnt) cnt.textContent = `Mostrando ${vis.length.toLocaleString('es-AR')} de ${base.length.toLocaleString('es-AR')}`;
+  const empty = document.getElementById('vml-empty');
+  if (empty) empty.style.display = vis.length ? 'none' : 'block';
 }
 
 function onTablaClick(e) {
@@ -1080,6 +1184,15 @@ function inyectarEstilo() {
     .vml-det-fecha{color:#A8A29E;min-width:42px}
     .vml-det-monto{color:#0F6E56}
     .vml-det-empty{color:#A8A29E}
+    .vml-fbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:12px 0 6px}
+    .vml-count-lbl{font-size:13px;color:#78716C}
+    .vml-clear{border:1px solid #E7E5E4;background:#fff;color:#57534E;border-radius:6px;cursor:pointer;font-size:12px;padding:5px 11px}
+    .vml-clear:hover{border-color:#B91C1C;color:#B91C1C}
+    .vml-filtros th{padding:4px 6px;background:#FAFAF9;border-top:1px solid #E7E5E4}
+    .vml-filtros .vmlf{width:100%;box-sizing:border-box;font-size:12px;padding:4px 6px;border:1px solid #E7E5E4;border-radius:6px;background:#fff;font-family:inherit;color:#1C1917}
+    .vml-filtros .vmlf:focus{outline:none;border-color:#0F6E56;box-shadow:0 0 0 2px rgba(15,110,86,.13)}
+    .vml-tot td{position:sticky;bottom:0;background:#F5F5F4;border-top:2px solid #D6D3D1;font-weight:600;padding:8px 6px}
+    .vml-tot-lbl{color:#1C1917}
   `;
   const style = document.createElement('style');
   style.id = 'vml-style';
