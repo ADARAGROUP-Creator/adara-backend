@@ -25,7 +25,7 @@ let MODO = 'dia';            // dia | mes
 let FECHA = '';              // YYYY-MM-DD (modo día)
 let MES = '';                // YYYY-MM (modo mes)
 let FILTRO = 'todas';        // todas | por_cobrar | cobradas | conciliadas | canceladas | devueltas
-let COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', com: '', envio: '', imp: '', fin: '', cobrar: '', fcobro: '', estado: '' }; // filtros por columna
+let COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', com: '', envio: '', imp: '', fin: '', cobrar: '', envest: '', estado: '' }; // filtros por columna
 let BONIF_MAP_CUR = {};      // bonifs del período actual (para el repintado parcial de filtros)
 
 // ── Solapas de la pantalla ──────────────────────────────────────────────
@@ -319,6 +319,7 @@ function renderVentas() {
   // ── Filtros por columna (estilo Excel) ──
   const optsVEst = [...new Set(base.map(v => (ESTADO_LBL[clase(v)] && ESTADO_LBL[clase(v)].txt) || clase(v)))]
     .filter(Boolean).sort((a, b) => String(a).localeCompare(String(b), 'es'));
+  const optsEnvest = [...new Set(base.map(v => v.estado_envio))].filter(Boolean).sort((a, b) => String(a).localeCompare(String(b), 'es'));
   const vIn = (col, ph) => `<input class="vmlf" data-col="${col}" type="text" placeholder="${ph}" value="${esc(COLV[col])}">`;
   const vSel = (col, opts) => `<select class="vmlf" data-col="${col}"><option value="">(todas)</option>${opts.map(o => `<option ${COLV[col] === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
   const filtroRow = `<tr class="vml-filtros">
@@ -333,7 +334,7 @@ function renderVentas() {
       <th>${vIn('imp', 'monto')}</th>
       <th>${vIn('fin', 'monto')}</th>
       <th>${vIn('cobrar', 'monto')}</th>
-      <th>${vIn('fcobro', 'dd/mm')}</th>
+      <th>${vSel('envest', optsEnvest)}</th>
       <th>${vSel('estado', optsVEst)}</th>
       <th></th>
     </tr>`;
@@ -412,7 +413,7 @@ function renderVentas() {
                 <th style="width:84px;text-align:right">Impuestos</th>
                 <th style="width:88px;text-align:right">Financiero</th>
                 <th style="width:104px;text-align:right">Por cobrar</th>
-                <th style="width:64px">F. cobro</th>
+                <th style="width:104px">Estado envío</th>
                 <th style="width:84px">Estado</th>
                 <th style="width:230px">Cobro / Conciliación</th>
               </tr>
@@ -454,7 +455,7 @@ function renderVentas() {
       });
       const vclr = document.getElementById('vml-clear');
       if (vclr) vclr.addEventListener('click', () => {
-        COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', com: '', envio: '', imp: '', fin: '', cobrar: '', fcobro: '', estado: '' };
+        COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', com: '', envio: '', imp: '', fin: '', cobrar: '', envest: '', estado: '' };
         render();
       });
       pintarVML();
@@ -578,7 +579,7 @@ function filaHTML(v, esMes, bonifMap) {
     ${celdaMonto(v.impuestos)}
     ${celdaMonto(v.costo_financiero)}
     <td style="text-align:right" class="vml-mono vml-fuerte">${money(v.por_cobrar)}</td>
-    <td class="vml-mono">${v.fecha_cobro ? esc(ddmm(v.fecha_cobro)) : '—'}</td>
+    <td>${v.estado_envio ? `<span class="vml-env vml-env-${esc(v.estado_envio)}">${esc(v.estado_envio.replace(/_/g, ' '))}</span>` : '<span class="con-dash">—</span>'}</td>
     <td><span class="vml-est vml-est-${est.cls || 'ok'}">${esc(est.txt)}</span></td>
     <td>${cobroCell(v, bonifMap)}</td>
   </tr>`;
@@ -607,7 +608,7 @@ function pasaColV(v) {
   if (COLV.imp && !num(v.impuestos, COLV.imp)) return false;
   if (COLV.fin && !num(v.costo_financiero, COLV.fin)) return false;
   if (COLV.cobrar && !num(v.por_cobrar, COLV.cobrar)) return false;
-  if (COLV.fcobro) { const h = ((v.fecha_cobro || '') + ' ' + ddmm(v.fecha_cobro)).toLowerCase(); if (!h.includes(COLV.fcobro.toLowerCase())) return false; }
+  if (COLV.envest && (v.estado_envio || '') !== COLV.envest) return false;
   return true;
 }
 
@@ -1197,6 +1198,10 @@ function inyectarEstilo() {
     .vml-filtros .vmlf:focus{outline:none;border-color:#0F6E56;box-shadow:0 0 0 2px rgba(15,110,86,.13)}
     .vml-tot td{position:sticky;bottom:0;background:#F5F5F4;border-top:2px solid #D6D3D1;font-weight:600;padding:8px 6px}
     .vml-tot-lbl{color:#1C1917}
+    .vml-env{font-size:11px;padding:2px 7px;border-radius:6px;white-space:nowrap;text-transform:capitalize}
+    .vml-env-entregado{background:#E1F5EE;color:#0F6E56}
+    .vml-env-despachado{background:#E6F1FB;color:#0C447C}
+    .vml-env-no_preparado{background:#F1EFEC;color:#78716C}
   `;
   const style = document.createElement('style');
   style.id = 'vml-style';
