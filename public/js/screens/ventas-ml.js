@@ -470,19 +470,16 @@ function celdaMonto(valor) {
 }
 
 function cobroCellInner(v, bonifMap) {
-  // Canceladas que SALIERON del depósito (despachado/entregado) → flujo de
-  // recepción. `cancelled` ≠ "no salió": la unidad salió pero la venta cancelada
-  // no consumió FIFO, así que ADARA la sobrestima hasta saber si volvió.
-  // Semántica INVERTIDA vs devoluciones: OK = no cambia stock (ya estaba contado);
-  // No disp. = descuenta (faltante, corrige la sobrestimación). Ver CANC2.
+  // Canceladas que SALIERON del depósito (despachado/entregado) → la recepción
+  // se registra DESDE el detalle (abrir la fila), para revisar la plata antes de
+  // decidir. `cancelled` ≠ "no salió": la unidad salió pero la venta cancelada no
+  // consumió FIFO, así que ADARA la sobrestima hasta saber si volvió. Ver CANC2.
   if (v.ml_status === 'cancelled' && (v.estado_envio === 'despachado' || v.estado_envio === 'entregado')) {
     if (v.recepcion_condicion) {
       const lbl = v.recepcion_condicion === 'ok' ? '📦 reingresado' : '❌ no disp.';
       return `<span class="vml-rev" title="Recepción ya registrada (${esc(v.recepcion_condicion)})">${lbl}</span>`;
     }
-    return `<span class="vml-rev" title="Salió del depósito y se canceló: registrá si el producto volvió">¿volvió?</span>`
-      + `<button class="btn btn-ghost vml-mini" data-accion="recepcion-ok" data-venta="${v.id}" title="Volvió y es vendible — no cambia el stock (ya estaba contado)">📦 OK stock</button>`
-      + `<button class="btn btn-ghost vml-mini" data-accion="recepcion-no" data-venta="${v.id}" title="No volvió → pérdida: descuenta stock (corrige la sobrestimación)">❌ No disp.</button>`;
+    return `<span class="vml-rec-pend" title="Salió del depósito y se canceló: abrí el detalle para registrar si el producto volvió">⚠ revisar recepción</span>`;
   }
   if (estaConciliada(v)) {
     const n = (VINC_BY_VENTA[v.id] || []).length;
@@ -668,8 +665,6 @@ function onTablaClick(e) {
     if (btn.dataset.accion === 'conciliar') conciliar(btn.dataset.venta);
     else if (btn.dataset.accion === 'desvincular') desvincular(btn.dataset.venta);
     else if (btn.dataset.accion === 'toggle') toggleDetalle(btn);
-    else if (btn.dataset.accion === 'recepcion-ok') recepcionCancelada(btn.dataset.venta, 'ok');
-    else if (btn.dataset.accion === 'recepcion-no') recepcionCancelada(btn.dataset.venta, 'no_disponible');
     return;
   }
   if (e.target.closest('a')) return;                 // el N° de venta sigue abriendo ML
@@ -686,16 +681,46 @@ async function openVentaDetalle(ventaId) {
   document.body.appendChild(overlay);
   const close = () => overlay.remove();
   overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
-  const pintar = (inner) => {
+
+  // Ejecuta la acción y cierra el modal: la acción recarga la lista (loadVentasML),
+  // así la venta procesada se "limpia" y quedan a la vista las pendientes.
+  const actuar = fn => { close(); fn(); };
+
+  const pintar = (inner, actionsHTML = '', wire = null) => {
     overlay.querySelector('.modal').innerHTML = inner +
-      `<div class="modal-actions"><button class="btn btn-ghost" id="vd-close">Cerrar</button></div>`;
+      `<div class="modal-actions">${actionsHTML}<button class="btn btn-ghost" id="vd-close">Cerrar</button></div>`;
     overlay.querySelector('#vd-close').addEventListener('click', close);
+    if (wire) wire();
   };
+
   try {
     const r = await fetch('/venta/' + encodeURIComponent(ventaId) + '/detalle');
     const data = await r.json().catch(() => ({}));
     if (!r.ok || !data.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
-    pintar(ventaDetalleHTML(data));
+
+    // Acciones contextuales según el estado (se decide con datos del cliente).
+    const v = VENTAS.find(x => String(x.id) === String(ventaId));
+    let actionsHTML = '', wire = null;
+    if (v) {
+      const salioCancelada = v.ml_status === 'cancelled'
+        && (v.estado_envio === 'despachado' || v.estado_envio === 'entregado')
+        && !v.recepcion_condicion;
+      if (conciliable(v, asignarBonifs([v]))) {
+        actionsHTML = `<button class="btn btn-primary" id="vd-conc">✓ Conciliar</button>`;
+        wire = () => overlay.querySelector('#vd-conc').addEventListener('click', () => actuar(() => conciliar(ventaId)));
+      } else if (salioCancelada) {
+        actionsHTML = `<button class="btn btn-primary" id="vd-rec-ok" title="Volvió y es vendible — no cambia el stock">📦 OK stock</button>`
+          + `<button class="btn btn-ghost" id="vd-rec-no" title="No volvió → pérdida: descuenta stock">❌ No disp.</button>`;
+        wire = () => {
+          overlay.querySelector('#vd-rec-ok').addEventListener('click', () => actuar(() => recepcionCancelada(ventaId, 'ok')));
+          overlay.querySelector('#vd-rec-no').addEventListener('click', () => actuar(() => recepcionCancelada(ventaId, 'no_disponible')));
+        };
+      } else if (estaConciliada(v)) {
+        actionsHTML = `<button class="btn btn-ghost" id="vd-desv">Deshacer conciliación</button>`;
+        wire = () => overlay.querySelector('#vd-desv').addEventListener('click', () => actuar(() => desvincular(ventaId)));
+      }
+    }
+    pintar(ventaDetalleHTML(data), actionsHTML, wire);
   } catch (e) {
     pintar(`<div class="card-title">Detalle de la venta</div><div class="error">No se pudo cargar: ${esc(e.message)}</div>`);
   }
@@ -1260,6 +1285,7 @@ function inyectarEstilo() {
     .vml-cobro-no{font-size:12px;color:#857a5c;background:#FAF6EC;border:1px dashed #E3D9BE;border-radius:6px;padding:2px 8px}
     .vml-conc{color:#0F6E56;font-weight:600;margin-right:6px}
     .vml-rev{font-size:12px;color:#92500A;background:#FAF1E1;border-radius:6px;padding:2px 8px}
+    .vml-rec-pend{font-size:12px;font-weight:600;color:#9A3412;background:#FEEFE6;border:1px solid #F5C9AE;border-radius:6px;padding:2px 8px;white-space:nowrap}
     .vml-mini{padding:4px 10px;font-size:13px}
     .vml-x{border:0;background:transparent;color:#A8A29E;cursor:pointer;font-size:13px;padding:0 2px}
     .vml-x:hover{color:#B91C1C}
