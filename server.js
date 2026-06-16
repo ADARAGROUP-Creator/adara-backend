@@ -1149,9 +1149,15 @@ app.post('/ml/recepcion', async (req, res) => {
     if (condicion === 'no_disponible' && !nota?.trim()) return res.status(400).json({ error: 'Nota obligatoria para producto no disponible' });
 
     // Traer venta
-    const ventas = await sbGet('ventas_ml', `id=eq.${venta_id}&select=id,sku,titulo,periodo,claim_status,recepcion_condicion,ml_order_id&limit=1`);
+    const ventas = await sbGet('ventas_ml', `id=eq.${venta_id}&select=id,sku,titulo,periodo,claim_status,recepcion_condicion,ml_order_id,ml_status,estado_envio,cantidad&limit=1`);
     if (!ventas?.length) return res.status(404).json({ error: 'Venta no encontrada' });
     const venta = ventas[0];
+
+    // Idempotencia: si ya tiene recepción registrada, no re-procesar (evita doble
+    // reverso/ajuste de stock).
+    if (venta.recepcion_condicion) {
+      return res.status(409).json({ error: `Esta venta ya tiene recepción registrada (${venta.recepcion_condicion}).` });
+    }
 
     const hoy = new Date().toISOString().split('T')[0];
     const nuevoClaimStatus = condicion === 'ok' ? 'reingresado' : 'perdida';
@@ -1165,7 +1171,7 @@ app.post('/ml/recepcion', async (req, res) => {
       aprobada: true,
     });
 
-    // 2. Insertar en stock_devoluciones
+    // 2. Insertar en stock_devoluciones (registro físico de la recepción)
     await sb('POST', 'stock_devoluciones', [{
       venta_ml_id: venta_id,
       sku: venta.sku || null,
@@ -1176,29 +1182,46 @@ app.post('/ml/recepcion', async (req, res) => {
       periodo: venta.periodo || null,
     }]);
 
-    // 3. Si ok → revertir el consumo FIFO: devuelve las unidades al lote original
-    //    (consumo_lote.reverso_devolucion) con el costo snapshot, y revierte el CMV.
-    //    Reemplaza el viejo +1 a `catalogo_skus` (modelo v21 muerto). Solo afecta
-    //    ventas que ya consumieron stock (fecha >= seed); idempotente por neto.
-    //    Si 'no_disponible' no hay reverso → la unidad es pérdida (P3).
-    //    El reverso se fecha en `hoy` (= recepcion_fecha); la plata se imputa
-    //    aparte al mes del movimiento MP (O10). Ver ADARA-COSTEO-FIFO.md Fase 3.
-    let reversoStock = null, stockActualizado = false;
-    if (condicion === 'ok' && venta.ml_order_id) {
-      try {
-        const rev = await sbRpc('fn_revertir_devolucion', { p_ml_order_id: venta.ml_order_id, p_fecha: hoy });
-        reversoStock = Array.isArray(rev) ? rev[0] : rev;
-        stockActualizado = (reversoStock?.reversos_creados || 0) > 0;
-        if (stockActualizado) {
-          console.log(`  → Reverso FIFO devolución order ${venta.ml_order_id}: +${reversoStock.unidades_devueltas}u al lote original`);
+    // 3. Efecto en stock — la semántica DEPENDE de si la venta consumió FIFO.
+    //    Las funciones de DB deciden solas (idempotentes); el endpoint solo
+    //    dispara la correcta según condición. Ver ADARA-DECISIONES.md CANC2.
+    //
+    //    a) condicion='ok' (el producto volvió) → fn_revertir_devolucion:
+    //       - devolución del circuito costeado (consumió FIFO) → reverso = +stock al lote.
+    //       - cancelada despachada (NO consumió) → reversos=0, no-op (ADARA ya la contaba). ✓
+    //    b) condicion='no_disponible' (no volvió) → fn_ajuste_cancelada_no_retornada:
+    //       - cancelada despachada/entregada que NO consumió → faltante FIFO = −stock
+    //         (corrige la sobrestimación; pérdida de inventario, P3).
+    //       - devolución que SÍ consumió → no-op (la pérdida ya está en el CMV).
+    //    Fechado a `hoy` (= recepcion_fecha); la plata se imputa aparte al mes del
+    //    movimiento MP (O10). Ver ADARA-COSTEO-FIFO.md / ADARA-STOCK.md.
+    let reversoStock = null, ajusteStock = null, stockActualizado = false;
+    if (condicion === 'ok') {
+      if (venta.ml_order_id) {
+        try {
+          const rev = await sbRpc('fn_revertir_devolucion', { p_ml_order_id: venta.ml_order_id, p_fecha: hoy });
+          reversoStock = Array.isArray(rev) ? rev[0] : rev;
+          stockActualizado = (reversoStock?.reversos_creados || 0) > 0;
+          if (stockActualizado) console.log(`  → Reverso FIFO order ${venta.ml_order_id}: +${reversoStock.unidades_devueltas}u al lote original`);
+        } catch (e) {
+          console.warn('  → Reverso FIFO falló (no bloquea la recepción):', e.message);
+          reversoStock = { error: e.message };
         }
+      }
+    } else { // no_disponible
+      try {
+        const aj = await sbRpc('fn_ajuste_cancelada_no_retornada', { p_venta_id: venta_id, p_fecha: hoy });
+        ajusteStock = Array.isArray(aj) ? aj[0] : aj;
+        stockActualizado = (ajusteStock?.unidades_ajustadas || 0) > 0;
+        if (stockActualizado) console.log(`  → Faltante cancelada venta ${venta_id}: −${ajusteStock.unidades_ajustadas}u (FIFO)`);
+        if (ajusteStock && ajusteStock.faltante > 0) console.warn(`  → Venta ${venta_id}: ${ajusteStock.faltante}u sin lote disponible para descontar (revisar stock SKU ${venta.sku}).`);
       } catch (e) {
-        console.warn('  → Reverso FIFO falló (no bloquea la recepción):', e.message);
-        reversoStock = { error: e.message };
+        console.warn('  → Ajuste de cancelada falló (no bloquea la recepción):', e.message);
+        ajusteStock = { error: e.message };
       }
     }
 
-    res.json({ ok: true, claim_status: nuevoClaimStatus, stock_actualizado: stockActualizado, reverso_stock: reversoStock });
+    res.json({ ok: true, claim_status: nuevoClaimStatus, stock_actualizado: stockActualizado, reverso_stock: reversoStock, ajuste_stock: ajusteStock });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -3743,15 +3766,28 @@ app.get('/venta/:id/detalle', async (req, res) => {
     const venta = vs[0];
     if (!venta) return res.status(404).json({ error: 'Venta no encontrada' });
 
-    // Movimientos vinculados a la venta (op_tipo='venta_ml', op_id=venta.id)
+    // Movimientos de la venta por DOS vías (dedup por id):
+    //  a) vínculos (op_tipo='venta_ml') — cuando la venta está conciliada
+    //  b) op_id del extracto (= 2º campo de referencia_externa, entre pipes) ==
+    //     mp_payment_id de la venta — así una cancelada NO conciliada también
+    //     muestra su cobro + devolución en el modal (fix 16/6).
+    const _movSel = 'select=id,fecha,categoria,monto,descripcion';
+    const movById = new Map();
+    const addMovs = rows => rows.forEach(m => { if (!movById.has(m.id)) movById.set(m.id, m); });
+
     const vincs = await sbGet('vinculos', `op_tipo=eq.venta_ml&op_id=eq.${id}&select=movimiento_id`);
-    let movs = [];
     for (const ch of _chunk(vincs.map(v => v.movimiento_id), 200)) {
       if (!ch.length) continue;
-      const r = await sbGet('movimientos',
-        `id=in.(${ch.join(',')})&select=id,fecha,categoria,monto,descripcion`);
-      movs = movs.concat(r);
+      addMovs(await sbGet('movimientos', `id=in.(${ch.join(',')})&${_movSel}`));
     }
+
+    const pids = [venta.mp_payment_id, ...String(venta.mp_payment_ids || '').split(',')]
+      .map(s => String(s || '').trim()).filter(Boolean);
+    for (const pid of [...new Set(pids)]) {
+      // referencia_externa LIKE '%|<pid>|%' (pipe codificado %7C)
+      addMovs(await sbGet('movimientos', `referencia_externa=like.*%7C${pid}%7C*&${_movSel}`));
+    }
+    const movs = [...movById.values()];
     const byFecha = (a, b) => String(a.fecha).localeCompare(String(b.fecha));
     const DEVCATS = ['devolucion', 'venta_cancelada', 'cargo_envio_devolucion'];
     const cobros       = movs.filter(m => m.categoria === 'cobro_venta').sort(byFecha);
