@@ -704,11 +704,23 @@ async function openVentaDetalle(ventaId) {
 // Arma el HTML del detalle a partir de { venta, cobros, devoluciones, retenciones }.
 function ventaDetalleHTML({ venta, cobros, devoluciones, retenciones }) {
   const sum = arr => arr.reduce((s, x) => s + (Number(x.monto) || 0), 0);
-  const lineaMov = m => `<div class="vml-dev-linea">
+  // Separa el N° de operación (≥8 dígitos al final, normalmente tras "·") para
+  // mostrarlo completo y seleccionable, igual que en retenciones (la descripción
+  // larga ya no lo recorta).
+  const splitOpId = s => {
+    s = String(s || '');
+    const mm = s.match(/(\d{8,})\s*$/);
+    if (!mm) return { desc: s || '—', op: '' };
+    return { desc: s.slice(0, mm.index).replace(/[\s·\-]+$/, '') || '—', op: mm[1] };
+  };
+  const lineaMov = m => {
+    const { desc, op } = splitOpId(m.descripcion || m.categoria || '—');
+    return `<div class="vml-dev-linea">
       <span class="vml-det-fecha">${esc(ddmm(m.fecha))}</span>
-      <span class="vml-dev-ldesc">${esc(m.descripcion || m.categoria || '—')}</span>
+      <span class="vml-dev-ldesc">${esc(desc)}${op ? ` <span class="vml-det-num">${esc(op)}</span>` : ''}</span>
       <span class="vml-mono ${m.monto < 0 ? 'vml-neg' : m.monto > 0 ? 'vml-pos' : 'vml-cero'}">${m.monto < 0 ? '−' : ''}${money(m.monto)}</span>
     </div>`;
+  };
   const lineaRet = r => `<div class="vml-dev-linea">
       <span class="vml-det-fecha">${r.fecha ? esc(ddmm(r.fecha)) : '—'}</span>
       <span class="vml-dev-ldesc">${esc([r.tipo, r.jurisdiccion].filter(Boolean).join(' · ') || r.detail || '—')}${r.mp_source_id ? ` <span class="vml-det-num">${esc(String(r.mp_source_id))}</span>` : ''}</span>
@@ -732,10 +744,21 @@ function ventaDetalleHTML({ venta, cobros, devoluciones, retenciones }) {
         Por cobrar <b class="vml-mono">${money(venta.por_cobrar)}</b>${venta.devuelta ? ' · <span class="vml-dev-claim">devuelta</span>' : ''}</div>
     </div>`;
 
+  // Resultado neto de caja = cobros + devoluciones (los movimientos reales del
+  // extracto). Las retenciones NO se suman: ya van embebidas en el cobro neto
+  // liquidado (sumarlas duplicaría). Una cancelada con reintegro total cierra en 0.
+  const neto = sum(cobros) + sum(devoluciones);
+  const totalLinea = `
+    <div class="vml-det-total">
+      <span>Resultado neto<span class="vml-det-totsub">cobro + devoluciones · las retenciones ya van dentro del cobro</span></span>
+      <span class="vml-mono ${neto < 0 ? 'vml-neg' : neto > 0 ? 'vml-pos' : ''}">${neto < 0 ? '−' : ''}${money(neto)}</span>
+    </div>`;
+
   return `<div class="card-title">Detalle de la venta</div>${cab}
     ${bloque('Cobro', sum(cobros), cobros.map(lineaMov), 'Sin cobro conciliado todavía (puede faltar cargar el AS de ese mes).')}
     ${bloque('Impuestos / retenciones', sum(retenciones), retenciones.map(lineaRet), 'Sin retenciones cargadas para esta venta.')}
-    ${bloque('Devoluciones', sum(devoluciones), devoluciones.map(lineaMov), 'Sin devoluciones.')}`;
+    ${bloque('Devoluciones', sum(devoluciones), devoluciones.map(lineaMov), 'Sin devoluciones.')}
+    ${totalLinea}`;
 }
 
 // Vincula el pago principal y, si hace falta para llegar al por_cobrar, también
@@ -1187,7 +1210,9 @@ function inyectarEstilo() {
     .vml-dev-prod{font-size:12px;color:#78716C;margin-top:2px}
     .vml-dev-lineas{display:flex;flex-direction:column;gap:2px}
     .vml-dev-linea{display:grid;grid-template-columns:42px 1fr auto;gap:10px;align-items:baseline;font-size:12px}
-    .vml-dev-ldesc{color:#57534E;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .vml-dev-ldesc{color:#57534E;overflow-wrap:anywhere;white-space:normal}
+    .vml-det-total{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-top:14px;border-top:2px solid #D6D3D1;padding-top:10px;font-weight:700;font-size:13px}
+    .vml-det-totsub{display:block;font-size:11px;color:#A8A29E;font-weight:400;margin-top:2px}
     .vml-row-click{cursor:pointer}
     .vml-row-click:hover td{background:#FAF7F2}
     .vml-detalle-modal{max-width:560px;width:92vw}
