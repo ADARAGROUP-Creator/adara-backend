@@ -470,6 +470,20 @@ function celdaMonto(valor) {
 }
 
 function cobroCellInner(v, bonifMap) {
+  // Canceladas que SALIERON del depósito (despachado/entregado) → flujo de
+  // recepción. `cancelled` ≠ "no salió": la unidad salió pero la venta cancelada
+  // no consumió FIFO, así que ADARA la sobrestima hasta saber si volvió.
+  // Semántica INVERTIDA vs devoluciones: OK = no cambia stock (ya estaba contado);
+  // No disp. = descuenta (faltante, corrige la sobrestimación). Ver CANC2.
+  if (v.ml_status === 'cancelled' && (v.estado_envio === 'despachado' || v.estado_envio === 'entregado')) {
+    if (v.recepcion_condicion) {
+      const lbl = v.recepcion_condicion === 'ok' ? '📦 reingresado' : '❌ no disp.';
+      return `<span class="vml-rev" title="Recepción ya registrada (${esc(v.recepcion_condicion)})">${lbl}</span>`;
+    }
+    return `<span class="vml-rev" title="Salió del depósito y se canceló: registrá si el producto volvió">¿volvió?</span>`
+      + `<button class="btn btn-ghost vml-mini" data-accion="recepcion-ok" data-venta="${v.id}" title="Volvió y es vendible — no cambia el stock (ya estaba contado)">📦 OK stock</button>`
+      + `<button class="btn btn-ghost vml-mini" data-accion="recepcion-no" data-venta="${v.id}" title="No volvió → pérdida: descuenta stock (corrige la sobrestimación)">❌ No disp.</button>`;
+  }
   if (estaConciliada(v)) {
     const n = (VINC_BY_VENTA[v.id] || []).length;
     const detalle = n > 1 ? ' (varios mov.)' : '';
@@ -654,6 +668,8 @@ function onTablaClick(e) {
     if (btn.dataset.accion === 'conciliar') conciliar(btn.dataset.venta);
     else if (btn.dataset.accion === 'desvincular') desvincular(btn.dataset.venta);
     else if (btn.dataset.accion === 'toggle') toggleDetalle(btn);
+    else if (btn.dataset.accion === 'recepcion-ok') recepcionCancelada(btn.dataset.venta, 'ok');
+    else if (btn.dataset.accion === 'recepcion-no') recepcionCancelada(btn.dataset.venta, 'no_disponible');
     return;
   }
   if (e.target.closest('a')) return;                 // el N° de venta sigue abriendo ML
@@ -757,6 +773,49 @@ async function conciliar(ventaId) {
     await loadVentasML();
   } catch (e) {
     window.toast('Error al conciliar: ' + e.message, 'error');
+  }
+}
+
+// Registra la recepción física de una cancelada que salió del depósito.
+//  - 'ok'           → el producto volvió y es vendible. NO cambia el stock
+//                     (la cancelada nunca lo descontó: ADARA ya lo contaba).
+//  - 'no_disponible'→ no volvió → pérdida: descuenta el stock por FIFO (faltante),
+//                     corrigiendo la sobrestimación. Requiere nota.
+// Semántica invertida vs devoluciones (ver server.js /ml/recepcion, CANC2).
+async function recepcionCancelada(ventaId, condicion) {
+  const v = VENTAS.find(x => String(x.id) === String(ventaId));
+  const prod = v ? `${v.sku || ''} ${v.titulo || ''}`.trim() : ('venta #' + ventaId);
+  let nota = null;
+  if (condicion === 'no_disponible') {
+    nota = prompt(`El producto NO volvió (pérdida). Se descontará del stock por FIFO.\n\n${prod}\n\nNota (obligatoria):`);
+    if (nota === null) return;                 // canceló el prompt
+    if (!nota.trim()) { window.toast('La nota es obligatoria', 'error'); return; }
+  } else {
+    if (!confirm(`Confirmás que el producto VOLVIÓ y es vendible?\n\n${prod}\n\nNo modifica el stock (ya estaba contado).`)) return;
+  }
+
+  window.toast('Registrando recepción…');
+  try {
+    const r = await fetch('/ml/recepcion', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ venta_id: ventaId, condicion, nota: nota?.trim() || undefined })
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+
+    if (condicion === 'ok') {
+      window.toast('Recepción OK: producto reingresado');
+    } else {
+      const aj = data.ajuste_stock || {};
+      const u = Number(aj.unidades_ajustadas) || 0;
+      const falt = Number(aj.faltante) || 0;
+      let msg = u > 0 ? `Marcado no disponible: −${u}u de stock (FIFO)` : 'Marcado no disponible';
+      if (falt > 0) msg += ` · ⚠ ${falt}u sin lote para descontar`;
+      window.toast(msg, falt > 0 ? 'error' : undefined);
+    }
+    await loadVentasML();
+  } catch (e) {
+    window.toast('Error al registrar la recepción: ' + e.message, 'error');
   }
 }
 
