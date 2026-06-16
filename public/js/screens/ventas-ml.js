@@ -25,6 +25,7 @@ let MODO = 'dia';            // dia | mes
 let FECHA = '';              // YYYY-MM-DD (modo día)
 let MES = '';                // YYYY-MM (modo mes)
 let FILTRO = 'todas';        // todas | por_cobrar | cobradas | conciliadas | canceladas | devueltas
+let SOLO_PEND_CANC = true;   // en el chip Canceladas, mostrar solo las pendientes (se van limpiando)
 let COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', com: '', envio: '', imp: '', fin: '', cobrar: '', envest: '', estado: '' }; // filtros por columna
 let BONIF_MAP_CUR = {};      // bonifs del período actual (para el repintado parcial de filtros)
 
@@ -154,6 +155,28 @@ function clase(v) {
   if (estaConciliada(v)) return 'conciliadas';
   if (matchCobros(v).length > 0) return 'cobradas';
   return 'por_cobrar';
+}
+
+// ¿La cancelada tiene movimientos del AS (cobro o devolución) SIN vincular a algo?
+// Mira las dos categorías por el/los N° de operación de la venta. Si no hay
+// ninguna línea, no hay nada pendiente. Esto evita marcar "resuelta" mientras
+// quede plata del extracto suelta (principio: todo movimiento relacionado).
+function cancMovPend(v) {
+  const pids = new Set([v.mp_payment_id, ...String(v.mp_payment_ids || '').split(',')]
+    .map(s => String(s || '').trim()).filter(Boolean));
+  const cobroPend = matchCobros(v).some(c => !VINC_MOV_USADOS.has(c.id));
+  const devPend = DEVOLS.some(d => pids.has(String(d.referencia || '').split('|')[1]) && !MOV_VINCULADOS.has(d.id));
+  return cobroPend || devPend;
+}
+
+// Una cancelada está PENDIENTE si le falta resolver alguno de los dos ejes:
+//  - plata: tiene movimientos del AS (cobro o devolución) sin vincular (cancMovPend)
+//  - stock: salió del depósito (despachado/entregado) y no tiene recepción
+function cancPendiente(v) {
+  if (v.ml_status !== 'cancelled') return false;
+  const salio = v.estado_envio === 'despachado' || v.estado_envio === 'entregado';
+  const stockPend = salio && !v.recepcion_condicion;
+  return stockPend || cancMovPend(v);
 }
 const ESTADO_LBL = {
   canceladas:  { txt: 'Cancelada',  cls: 'canc' },
@@ -308,12 +331,13 @@ function renderVentas() {
 
   const cont = { todas: base.length, por_cobrar: 0, cobradas: 0, conciliadas: 0, canceladas: 0, devueltas: 0 };
   base.forEach(v => { cont[clase(v)]++; });
+  const pendCancN = base.reduce((n, v) => n + (cancPendiente(v) ? 1 : 0), 0);
 
   const esDevueltas = FILTRO === 'devueltas';
   const perDev = bundlesPeriodo();   // bundles de devolución del período (por fecha de línea del AS)
   if (perDev) cont.devueltas = perDev.filter(b => b.estado === 'pendiente' || b.estado === 'parcial').length;
 
-  const visibles = FILTRO === 'todas' ? base : base.filter(v => clase(v) === FILTRO);
+  const visibles = ventasVisiblesBase();
   const totCobrar = base.reduce((s, v) => s + (Number(v.por_cobrar) || 0), 0);
 
   // ── Filtros por columna (estilo Excel) ──
@@ -382,6 +406,7 @@ function renderVentas() {
       ${hayVentas ? modoHTML : ''}
       ${navHTML}
       ${(!esDevueltas && conciliablesN > 0) ? `<button class="btn btn-conc" id="vml-conc-todas">✓ Conciliar todas (${conciliablesN})</button>` : ''}
+      ${(hayVentas && FILTRO === 'canceladas') ? `<label class="vml-pendchk"><input type="checkbox" id="vml-solo-pend" ${SOLO_PEND_CANC ? 'checked' : ''}> Solo pendientes (${pendCancN})</label>` : ''}
     </div>
 
     ${hayVentas ? `
@@ -440,6 +465,8 @@ function renderVentas() {
     if (inpF) inpF.addEventListener('change', e => { FECHA = e.target.value; render(); });
     if (inpM) inpM.addEventListener('change', e => { MES = e.target.value; render(); });
     root.querySelectorAll('.pill').forEach(p => p.addEventListener('click', () => { FILTRO = p.dataset.f; render(); }));
+    const soloPend = document.getElementById('vml-solo-pend');
+    if (soloPend) soloPend.addEventListener('change', () => { SOLO_PEND_CANC = soloPend.checked; render(); });
     if (esDevueltas) {
       root.querySelectorAll('.vml-tabla-dev').forEach(t => t.addEventListener('click', onDevClick));
     } else {
@@ -470,16 +497,22 @@ function celdaMonto(valor) {
 }
 
 function cobroCellInner(v, bonifMap) {
-  // Canceladas que SALIERON del depósito (despachado/entregado) → la recepción
-  // se registra DESDE el detalle (abrir la fila), para revisar la plata antes de
-  // decidir. `cancelled` ≠ "no salió": la unidad salió pero la venta cancelada no
-  // consumió FIFO, así que ADARA la sobrestima hasta saber si volvió. Ver CANC2.
-  if (v.ml_status === 'cancelled' && (v.estado_envio === 'despachado' || v.estado_envio === 'entregado')) {
-    if (v.recepcion_condicion) {
-      const lbl = v.recepcion_condicion === 'ok' ? '📦 reingresado' : '❌ no disp.';
-      return `<span class="vml-rev" title="Recepción ya registrada (${esc(v.recepcion_condicion)})">${lbl}</span>`;
+  // Cancelada: dos ejes a resolver — plata (movimientos del AS vinculados) y, si
+  // salió del depósito, stock (recepción). La acción se hace desde el detalle.
+  // `cancelled` ≠ "no salió"; las despachadas/entregadas pueden sobrestimar stock
+  // hasta saber si el producto volvió. Ver CANC2.
+  if (v.ml_status === 'cancelled') {
+    const salio = v.estado_envio === 'despachado' || v.estado_envio === 'entregado';
+    const stockPend = salio && !v.recepcion_condicion;
+    const movPend = cancMovPend(v);
+    if (!stockPend && !movPend) {
+      const r = v.recepcion_condicion ? (v.recepcion_condicion === 'ok' ? ' · 📦 reingresado' : ' · ❌ no disp.') : '';
+      return `<span class="vml-conc">✓ resuelta${r}</span>`;
     }
-    return `<span class="vml-rec-pend" title="Salió del depósito y se canceló: abrí el detalle para registrar si el producto volvió">⚠ revisar recepción</span>`;
+    const falta = [];
+    if (movPend)   falta.push('conciliar mov.');
+    if (stockPend) falta.push('revisar recepción');
+    return `<span class="vml-rec-pend" title="Abrí el detalle para resolver">⚠ ${falta.join(' · ')}</span>`;
   }
   if (estaConciliada(v)) {
     const n = (VINC_BY_VENTA[v.id] || []).length;
@@ -599,7 +632,9 @@ function filaHTML(v, esMes, bonifMap) {
 // Base del período tras el pill de estado (sin filtros de columna).
 function ventasVisiblesBase() {
   const b = conjuntoActual();
-  return FILTRO === 'todas' ? b : b.filter(v => clase(v) === FILTRO);
+  let r = FILTRO === 'todas' ? b : b.filter(v => clase(v) === FILTRO);
+  if (FILTRO === 'canceladas' && SOLO_PEND_CANC) r = r.filter(cancPendiente);
+  return r;
 }
 
 // Filtro por columna (estilo Excel) de la tabla de ventas.
@@ -702,23 +737,40 @@ async function openVentaDetalle(ventaId) {
     const v = VENTAS.find(x => String(x.id) === String(ventaId));
     let actionsHTML = '', wire = null;
     if (v) {
-      const salioCancelada = v.ml_status === 'cancelled'
-        && (v.estado_envio === 'despachado' || v.estado_envio === 'entregado')
-        && !v.recepcion_condicion;
-      if (conciliable(v, asignarBonifs([v]))) {
+      const wfns = [];
+      const onClick = (id, fn) => wfns.push(() => overlay.querySelector('#' + id).addEventListener('click', () => actuar(fn)));
+
+      if (v.ml_status === 'cancelled') {
+        const acc = [];
+        const salio = v.estado_envio === 'despachado' || v.estado_envio === 'entregado';
+        const movPend = cancMovPend(v);
+        const stockPend = salio && !v.recepcion_condicion;
+        // Eje plata: vincular el bundle (cobro + devoluciones) por N° de operación.
+        if (movPend) {
+          acc.push(`<button class="btn btn-primary" id="vd-concmov" title="Vincula el cobro y la devolución (N° de operación) a esta venta">✓ Conciliar movimientos</button>`);
+          onClick('vd-concmov', () => conciliarMovimientos(ventaId));
+        }
+        // Eje stock: solo si salió del depósito y no tiene recepción.
+        if (stockPend) {
+          acc.push(`<button class="btn ${movPend ? 'btn-ghost' : 'btn-primary'}" id="vd-rec-ok" title="Volvió y es vendible — no cambia el stock">📦 OK stock</button>`);
+          acc.push(`<button class="btn btn-ghost" id="vd-rec-no" title="No volvió → pérdida: descuenta stock">❌ No disp.</button>`);
+          onClick('vd-rec-ok', () => recepcionCancelada(ventaId, 'ok'));
+          onClick('vd-rec-no', () => recepcionCancelada(ventaId, 'no_disponible'));
+        }
+        // Ya resuelta pero con movimientos vinculados → permitir deshacer.
+        if (!acc.length && estaConciliada(v)) {
+          acc.push(`<button class="btn btn-ghost" id="vd-desv">Deshacer vínculos</button>`);
+          onClick('vd-desv', () => desvincular(ventaId));
+        }
+        actionsHTML = acc.join('');
+      } else if (conciliable(v, asignarBonifs([v]))) {
         actionsHTML = `<button class="btn btn-primary" id="vd-conc">✓ Conciliar</button>`;
-        wire = () => overlay.querySelector('#vd-conc').addEventListener('click', () => actuar(() => conciliar(ventaId)));
-      } else if (salioCancelada) {
-        actionsHTML = `<button class="btn btn-primary" id="vd-rec-ok" title="Volvió y es vendible — no cambia el stock">📦 OK stock</button>`
-          + `<button class="btn btn-ghost" id="vd-rec-no" title="No volvió → pérdida: descuenta stock">❌ No disp.</button>`;
-        wire = () => {
-          overlay.querySelector('#vd-rec-ok').addEventListener('click', () => actuar(() => recepcionCancelada(ventaId, 'ok')));
-          overlay.querySelector('#vd-rec-no').addEventListener('click', () => actuar(() => recepcionCancelada(ventaId, 'no_disponible')));
-        };
+        onClick('vd-conc', () => conciliar(ventaId));
       } else if (estaConciliada(v)) {
         actionsHTML = `<button class="btn btn-ghost" id="vd-desv">Deshacer conciliación</button>`;
-        wire = () => overlay.querySelector('#vd-desv').addEventListener('click', () => actuar(() => desvincular(ventaId)));
+        onClick('vd-desv', () => desvincular(ventaId));
       }
+      if (wfns.length) wire = () => wfns.forEach(f => f());
     }
     pintar(ventaDetalleHTML(data), actionsHTML, wire);
   } catch (e) {
@@ -864,6 +916,25 @@ async function recepcionCancelada(ventaId, condicion) {
     await loadVentasML();
   } catch (e) {
     window.toast('Error al registrar la recepción: ' + e.message, 'error');
+  }
+}
+
+// Concilia el bundle de movimientos del AS de una cancelada (cobro + devoluciones)
+// vinculándolos a la venta por el N° de operación. Objetivo: que ninguna línea del
+// extracto quede sin conciliar. No la mueve a "Conciliados" (sigue siendo cancelada);
+// queda como "✓ resuelta" en Canceladas.
+async function conciliarMovimientos(ventaId) {
+  window.toast('Conciliando movimientos…');
+  try {
+    const r = await fetch('/venta/' + encodeURIComponent(ventaId) + '/conciliar-movimientos', { method: 'POST' });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+    const n = data.vinculados || 0;
+    const neto = Number(data.neto) || 0;
+    window.toast(`Movimientos conciliados (${n} línea${n === 1 ? '' : 's'} · neto ${neto < 0 ? '−' : ''}${money(neto)})`);
+    await loadVentasML();
+  } catch (e) {
+    window.toast('Error al conciliar movimientos: ' + e.message, 'error');
   }
 }
 
@@ -1286,6 +1357,8 @@ function inyectarEstilo() {
     .vml-conc{color:#0F6E56;font-weight:600;margin-right:6px}
     .vml-rev{font-size:12px;color:#92500A;background:#FAF1E1;border-radius:6px;padding:2px 8px}
     .vml-rec-pend{font-size:12px;font-weight:600;color:#9A3412;background:#FEEFE6;border:1px solid #F5C9AE;border-radius:6px;padding:2px 8px;white-space:nowrap}
+    .vml-pendchk{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:#57534E;cursor:pointer;user-select:none}
+    .vml-pendchk input{cursor:pointer}
     .vml-mini{padding:4px 10px;font-size:13px}
     .vml-x{border:0;background:transparent;color:#A8A29E;cursor:pointer;font-size:13px;padding:0 2px}
     .vml-x:hover{color:#B91C1C}
