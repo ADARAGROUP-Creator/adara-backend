@@ -168,8 +168,8 @@ export async function loadVentasML() {
   root.innerHTML = `<div class="loading">Cargando ventas de ML…</div>`;
   DEV_BUNDLES = null;   // invalidar cache de bundles de devolución → se recarga al abrir la solapa
   try {
-    VENTAS = await sbGet('ventas_ml', 'order=fecha.asc,hora_venta.asc');
-    const cobros = await sbGet('movimientos', 'categoria=eq.cobro_venta&order=fecha.asc');
+    VENTAS = await sbGet('ventas_ml', 'order=fecha.asc,hora_venta.asc,id.asc');
+    const cobros = await sbGet('movimientos', 'categoria=eq.cobro_venta&order=fecha.asc,id.asc');
     COBROS_BY_REF = {};
     COBROS_BY_ID = {};
     BONIFS = [];
@@ -186,7 +186,7 @@ export async function loadVentasML() {
     SHIP_BY_VENTA = {};
     try {
       const retEnvio = await sbGet('retenciones',
-        'transaction_type=eq.SETTLEMENT_SHIPPING&select=venta_id,order_id,pack_id,mp_source_id,monto');
+        'transaction_type=eq.SETTLEMENT_SHIPPING&select=venta_id,order_id,pack_id,mp_source_id,monto&order=id.asc');
       const addShip = (pref, val, row) => {
         if (val == null) return;
         const t = String(val).trim();
@@ -213,7 +213,7 @@ export async function loadVentasML() {
     await cargarDevoluciones();
     const DEV_IDS = new Set(DEVOLS.map(d => d.id));
 
-    const vinc = await sbGet('vinculos', 'op_tipo=eq.venta_ml');
+    const vinc = await sbGet('vinculos', 'op_tipo=eq.venta_ml&order=id.asc');
     VINC_BY_VENTA = {};
     VINC_MOV_USADOS = new Set();
     MOV_VINCULADOS = new Set();
@@ -253,7 +253,7 @@ async function cargarDevoluciones() {
   const inFilter = `(${DEV_CATS.join(',')})`;
   // 1) Cajón nuevo
   try {
-    const nuevos = await sbGet('movimientos', `categoria=in.${inFilter}&order=fecha.asc`);
+    const nuevos = await sbGet('movimientos', `categoria=in.${inFilter}&order=fecha.asc,id.asc`);
     if (nuevos.length) {
       DEV_FUENTE = 'movimientos';
       DEVOLS = nuevos.map(m => ({
@@ -266,7 +266,7 @@ async function cargarDevoluciones() {
   } catch (e) { console.warn('Devol (movimientos):', e.message); }
   // 2) Cajón viejo (extracto MP), por si todavía no se migraron
   try {
-    const viejos = await sbGet('movimientos_mp', `categoria=in.${inFilter}&order=fecha.asc`);
+    const viejos = await sbGet('movimientos_mp', `categoria=in.${inFilter}&order=fecha.asc,id.asc`);
     if (viejos.length) {
       DEV_FUENTE = 'movimientos_mp';
       DEVOLS = viejos.map(m => ({
