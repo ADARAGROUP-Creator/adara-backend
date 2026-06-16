@@ -3753,6 +3753,50 @@ app.post('/devoluciones/vincular', async (req, res) => {
   }
 });
 
+// Concilia los movimientos del AS de una venta (típicamente CANCELADA): vincula
+// TODO el bundle (cobro + devoluciones) por el N° de operación (mp_payment_id,
+// entre pipes), para que ninguna línea del extracto quede "sin conciliar". A
+// diferencia de /devoluciones/vincular (solo líneas categoría 'devolucion'), acá
+// se incluye la línea de cobro. Solo marca devuelta si el neto es pérdida real
+// (< 0); neto ≈ 0 = cobro + reintegro que se cancelan. Ver CANC2.
+app.post('/venta/:id/conciliar-movimientos', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const vs = await sbGet('ventas_ml', `id=eq.${id}&select=id,mp_payment_id,mp_payment_ids&limit=1`);
+    const venta = vs[0];
+    if (!venta) return res.status(404).json({ error: 'Venta no encontrada' });
+
+    const pids = [venta.mp_payment_id, ...String(venta.mp_payment_ids || '').split(',')]
+      .map(s => String(s || '').trim()).filter(Boolean);
+    if (!pids.length) return res.status(400).json({ error: 'La venta no tiene N° de operación (mp_payment_id) para vincular.' });
+
+    const movById = new Map();
+    for (const pid of [...new Set(pids)]) {
+      const rows = await sbGet('movimientos',
+        `referencia_externa=like.*%7C${pid}%7C*&select=id,monto,categoria,referencia_externa`);
+      rows.forEach(m => movById.set(m.id, m));
+    }
+    const lineas = [...movById.values()];
+    if (!lineas.length) return res.status(404).json({ error: 'No hay movimientos del AS para esta operación (¿falta cargar el extracto del mes?).' });
+
+    const vinculos = lineas
+      .map(l => ({ movimiento_id: l.id, op_tipo: 'venta_ml', op_id: id, monto: _r2(Math.abs(Number(l.monto) || 0)) }))
+      .filter(v => v.monto > 0);
+    if (vinculos.length) await sbUpsert('vinculos', vinculos, 'movimiento_id,op_tipo,op_id');
+
+    const neto = _r2(lineas.reduce((s, l) => s + (Number(l.monto) || 0), 0));
+    let marcada = false;
+    if (neto < -0.5) {                 // pérdida real → marca devuelta (O10)
+      await sbPatch('ventas_ml', `id=eq.${id}`, { devuelta: true, monto_reembolso: Math.abs(neto) });
+      marcada = true;
+    }
+    res.json({ ok: true, vinculados: vinculos.length, lineas: lineas.length, neto, marcada_devuelta: marcada });
+  } catch (e) {
+    console.error('conciliar-movimientos:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Detalle completo de una venta: junta toda su "vida de plata" en una llamada.
 // Devuelve { venta, cobros[], devoluciones[], retenciones[] }:
 //   cobros        = movimientos categoria 'cobro_venta' vinculados a la venta
