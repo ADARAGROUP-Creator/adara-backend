@@ -694,7 +694,7 @@ function ventaDetalleHTML({ venta, cobros, devoluciones, retenciones }) {
     </div>`;
   const lineaRet = r => `<div class="vml-dev-linea">
       <span class="vml-det-fecha">${r.fecha ? esc(ddmm(r.fecha)) : '—'}</span>
-      <span class="vml-dev-ldesc">${esc([r.tipo, r.jurisdiccion].filter(Boolean).join(' · ') || r.detail || '—')}</span>
+      <span class="vml-dev-ldesc">${esc([r.tipo, r.jurisdiccion].filter(Boolean).join(' · ') || r.detail || '—')}${r.mp_source_id ? ` <span class="vml-det-num">${esc(String(r.mp_source_id))}</span>` : ''}</span>
       <span class="vml-mono ${r.monto < 0 ? 'vml-neg' : 'vml-pos'}">${r.monto < 0 ? '−' : ''}${money(r.monto)}</span>
     </div>`;
   const bloque = (titulo, total, rows, vacio) => `
