@@ -838,6 +838,36 @@ function ventaDetalleHTML({ venta, cobros, devoluciones, retenciones }) {
     ${totalLinea}`;
 }
 
+// Refresco liviano tras una acción: re-baja SOLO los vínculos (las ventas, cobros,
+// retenciones y devoluciones no cambian) y repinta. Mucho más rápido que loadVentasML.
+async function refrescarVinculos() {
+  try {
+    const DEV_IDS = new Set(DEVOLS.map(d => d.id));
+    const vinc = await sbGet('vinculos', 'op_tipo=eq.venta_ml&order=id.asc');
+    VINC_BY_VENTA = {}; VINC_MOV_USADOS = new Set(); MOV_VINCULADOS = new Set(); DEV_LINK_BY_MOV = new Map();
+    for (const v of vinc) {
+      if (DEV_IDS.has(v.movimiento_id)) { MOV_VINCULADOS.add(v.movimiento_id); DEV_LINK_BY_MOV.set(v.movimiento_id, v); }
+      else { (VINC_BY_VENTA[v.op_id] = VINC_BY_VENTA[v.op_id] || []).push(v); VINC_MOV_USADOS.add(v.movimiento_id); }
+    }
+    DEV_BUNDLES = null;
+    render();
+  } catch (e) {
+    window.toast('No se pudo refrescar: ' + e.message, 'error');
+  }
+}
+
+// Marca localmente (sin re-fetch) los movimientos de una venta como vinculados,
+// para repintar al instante. Se re-sincroniza con el server al recargar la pantalla.
+function vincularLocal(ventaId, cobroIds = [], devolIds = []) {
+  for (const id of cobroIds) {
+    if (id == null) continue;
+    (VINC_BY_VENTA[ventaId] = VINC_BY_VENTA[ventaId] || []).push({ movimiento_id: id, op_id: ventaId, op_tipo: 'venta_ml' });
+    VINC_MOV_USADOS.add(id);
+  }
+  for (const id of devolIds) if (id != null) MOV_VINCULADOS.add(id);
+  DEV_BUNDLES = null;
+}
+
 // Vincula el pago principal y, si hace falta para llegar al por_cobrar, también
 // la bonificación de envío. Cada vínculo imputa el monto de su propio movimiento.
 async function conciliar(ventaId) {
@@ -870,7 +900,8 @@ async function conciliar(ventaId) {
       if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
     }
     window.toast(conBonif ? 'Venta conciliada (cobros + bonificación)' : (cobros.length > 1 ? 'Venta conciliada (varios cobros)' : 'Venta conciliada'));
-    await loadVentasML();
+    vincularLocal(v.id, aVincular.map(x => x.id));
+    render();
   } catch (e) {
     window.toast('Error al conciliar: ' + e.message, 'error');
   }
@@ -913,7 +944,9 @@ async function recepcionCancelada(ventaId, condicion) {
       if (falt > 0) msg += ` · ⚠ ${falt}u sin lote para descontar`;
       window.toast(msg, falt > 0 ? 'error' : undefined);
     }
-    await loadVentasML();
+    if (v) v.recepcion_condicion = condicion;   // update local, sin re-fetch
+    DEV_BUNDLES = null;
+    render();
   } catch (e) {
     window.toast('Error al registrar la recepción: ' + e.message, 'error');
   }
@@ -932,17 +965,33 @@ async function conciliarMovimientos(ventaId) {
     const n = data.vinculados || 0;
     const neto = Number(data.neto) || 0;
     window.toast(`Movimientos conciliados (${n} línea${n === 1 ? '' : 's'} · neto ${neto < 0 ? '−' : ''}${money(neto)})`);
-    await loadVentasML();
+    // Update local sin re-fetch: marcar el bundle (cobro + devoluciones) de la
+    // venta como vinculado, según su(s) N° de operación.
+    const v = VENTAS.find(x => String(x.id) === String(ventaId));
+    if (v) {
+      const pids = new Set([v.mp_payment_id, ...String(v.mp_payment_ids || '').split(',')]
+        .map(s => String(s || '').trim()).filter(Boolean));
+      const cobroIds = [...pids].map(pid => COBROS_BY_REF[pid]?.id).filter(x => x != null);
+      const devolIds = DEVOLS.filter(d => pids.has(String(d.referencia || '').split('|')[1])).map(d => d.id);
+      vincularLocal(v.id, cobroIds, devolIds);
+      if (data.marcada_devuelta) v.devuelta = true;
+    }
+    render();
   } catch (e) {
     window.toast('Error al conciliar movimientos: ' + e.message, 'error');
   }
 }
 
-// Deshace TODOS los vínculos de la venta (pago y, si corresponde, bonificación).
+// Deshace TODOS los vínculos de la venta (cobro, bonificación y, en canceladas,
+// las líneas de devolución del bundle). Trae los vínculos frescos del server
+// (con su id) por si alguno se marcó localmente sin id.
 async function desvincular(ventaId) {
-  const vincs = VINC_BY_VENTA[ventaId] || [];
-  if (!vincs.length) return;
-  if (!confirm('¿Deshacer la conciliación de esta venta? El cobro y la venta vuelven a quedar pendientes.')) return;
+  let vincs;
+  try {
+    vincs = await sbGet('vinculos', `op_tipo=eq.venta_ml&op_id=eq.${ventaId}&select=id`);
+  } catch (e) { window.toast('Error: ' + e.message, 'error'); return; }
+  if (!vincs.length) { window.toast('No hay vínculos para deshacer'); return; }
+  if (!confirm('¿Deshacer la conciliación de esta venta? Los movimientos vuelven a quedar sin vincular.')) return;
   try {
     for (const vc of vincs) {
       const r = await fetch('/vincular/' + vc.id, { method: 'DELETE' });
@@ -950,7 +999,7 @@ async function desvincular(ventaId) {
       if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
     }
     window.toast('Conciliación deshecha');
-    await loadVentasML();
+    await refrescarVinculos();
   } catch (e) {
     window.toast('Error: ' + e.message, 'error');
   }
@@ -1005,7 +1054,7 @@ async function conciliarTodas() {
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
     window.toast(`Listo: ${nVentas} ventas conciliadas`);
-    await loadVentasML();
+    await refrescarVinculos();
   } catch (e) {
     window.toast('Error al conciliar todas: ' + e.message, 'error');
   }
@@ -1261,7 +1310,7 @@ async function vincularBundle(opId, ventaId, btn) {
     if (!r.ok || !data.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
     window.toast(`Bundle vinculado: ${data.vinculados} líneas${data.marcada_devuelta ? ' · venta marcada devuelta' : ''}`);
     DEV_BUNDLES = null;          // invalidar cache → recargar resolver
-    await loadVentasML();
+    await refrescarVinculos();
   } catch (e) {
     if (btn) btn.disabled = false;
     window.toast('Error al vincular: ' + e.message, 'error');
@@ -1285,7 +1334,7 @@ async function desvincularBundle(opId) {
     }
     window.toast('Bundle desvinculado');
     DEV_BUNDLES = null;
-    await loadVentasML();
+    await refrescarVinculos();
   } catch (e) {
     window.toast('Error al desvincular: ' + e.message, 'error');
   }
@@ -1312,6 +1361,13 @@ function inyectarEstilo() {
     .vml-row-click{cursor:pointer}
     .vml-row-click:hover td{background:#FAF7F2}
     .vml-detalle-modal{max-width:560px;width:92vw}
+    .vml-detalle-modal .modal-actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;align-items:center;margin-top:18px;padding-top:14px;border-top:1px solid #EFEAE3}
+    .vml-detalle-modal .modal-actions .btn{border-radius:9px;padding:9px 16px;font-weight:600;font-size:13px;transition:filter .12s,background .12s}
+    .vml-detalle-modal .modal-actions .btn:hover{filter:brightness(.96)}
+    #vd-rec-ok{background:#0F6E56;border:1px solid #0F6E56;color:#fff}
+    #vd-rec-no{background:#fff;border:1px solid #E7B7B0;color:#B91C1C}
+    #vd-rec-no:hover{background:#FBEDEB;filter:none}
+    #vd-conc,#vd-concmov{background:#0C447C;border:1px solid #0C447C;color:#fff}
     .vml-det-cab{margin:10px 0 4px}
     .vml-det-bloque{margin-top:14px;border-top:1px solid #EFEAE3;padding-top:10px}
     .vml-det-h{display:flex;justify-content:space-between;align-items:baseline;font-size:14px;margin-bottom:6px}
@@ -1359,7 +1415,7 @@ function inyectarEstilo() {
     .vml-rec-pend{font-size:12px;font-weight:600;color:#9A3412;background:#FEEFE6;border:1px solid #F5C9AE;border-radius:6px;padding:2px 8px;white-space:nowrap}
     .vml-pendchk{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:#57534E;cursor:pointer;user-select:none}
     .vml-pendchk input{cursor:pointer}
-    .vml-mini{padding:4px 10px;font-size:13px}
+    .vml-mini{padding:5px 12px;font-size:13px;border-radius:8px;font-weight:600}
     .vml-x{border:0;background:transparent;color:#A8A29E;cursor:pointer;font-size:13px;padding:0 2px}
     .vml-x:hover{color:#B91C1C}
     .vml-toggle{border:0;background:transparent;color:#0C447C;cursor:pointer;font-size:12px;padding:0 4px;margin-left:4px}
