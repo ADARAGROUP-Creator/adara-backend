@@ -1145,7 +1145,7 @@ app.post('/ml/recepcion', async (req, res) => {
   try {
     const { venta_id, condicion, nota } = req.body;
     if (!venta_id) return res.status(400).json({ error: 'Falta venta_id' });
-    if (!['ok', 'no_disponible'].includes(condicion)) return res.status(400).json({ error: 'condicion debe ser ok o no_disponible' });
+    if (!['ok', 'no_disponible', 'reacondicionar'].includes(condicion)) return res.status(400).json({ error: 'condicion debe ser ok, reacondicionar o no_disponible' });
     if (condicion === 'no_disponible' && !nota?.trim()) return res.status(400).json({ error: 'Nota obligatoria para producto no disponible' });
 
     // Traer venta
@@ -1160,7 +1160,7 @@ app.post('/ml/recepcion', async (req, res) => {
     }
 
     const hoy = new Date().toISOString().split('T')[0];
-    const nuevoClaimStatus = condicion === 'ok' ? 'reingresado' : 'perdida';
+    const nuevoClaimStatus = condicion === 'ok' ? 'reingresado' : (condicion === 'reacondicionar' ? 'reacondicionar' : 'perdida');
 
     // 1. Actualizar ventas_ml
     await sbPatch('ventas_ml', `id=eq.${venta_id}`, {
@@ -1195,7 +1195,7 @@ app.post('/ml/recepcion', async (req, res) => {
     //       - devolución que SÍ consumió → no-op (la pérdida ya está en el CMV).
     //    Fechado a `hoy` (= recepcion_fecha); la plata se imputa aparte al mes del
     //    movimiento MP (O10). Ver ADARA-COSTEO-FIFO.md / ADARA-STOCK.md.
-    let reversoStock = null, ajusteStock = null, stockActualizado = false;
+    let reversoStock = null, ajusteStock = null, reacStock = null, stockActualizado = false;
     if (condicion === 'ok') {
       if (venta.ml_order_id) {
         try {
@@ -1206,6 +1206,23 @@ app.post('/ml/recepcion', async (req, res) => {
         } catch (e) {
           console.warn('  → Reverso FIFO falló (no bloquea la recepción):', e.message);
           reversoStock = { error: e.message };
+        }
+      }
+    } else if (condicion === 'reacondicionar') {
+      // El producto volvió pero NO sano → fn_devolucion_a_reacondicionar:
+      //   - devolución que consumió FIFO → revierte CMV + mueve la unidad a depósito REAC.
+      //   - cancelada despachada que NO consumió → mueve de stock vendible (FIFO) a REAC.
+      // En ambos la unidad queda en REAC con su costo real (recuperable vía botón
+      // "pasar a venta"). Ver ADARA-STOCK.md / ADARA-CANCELACIONES-DEVOLUCIONES.md.
+      if (venta.ml_order_id) {
+        try {
+          const rc = await sbRpc('fn_devolucion_a_reacondicionar', { p_ml_order_id: venta.ml_order_id, p_fecha: hoy });
+          reacStock = Array.isArray(rc) ? rc[0] : rc;
+          stockActualizado = (reacStock?.unidades_a_reac || 0) > 0;
+          if (stockActualizado) console.log(`  → Reacondicionar order ${venta.ml_order_id}: ${reacStock.unidades_a_reac}u a depósito REAC`);
+        } catch (e) {
+          console.warn('  → Reacondicionar falló (no bloquea la recepción):', e.message);
+          reacStock = { error: e.message };
         }
       }
     } else { // no_disponible
@@ -1221,7 +1238,32 @@ app.post('/ml/recepcion', async (req, res) => {
       }
     }
 
-    res.json({ ok: true, claim_status: nuevoClaimStatus, stock_actualizado: stockActualizado, reverso_stock: reversoStock, ajuste_stock: ajusteStock });
+    res.json({ ok: true, claim_status: nuevoClaimStatus, stock_actualizado: stockActualizado, reverso_stock: reversoStock, reac_stock: reacStock, ajuste_stock: ajusteStock });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── REACONDICIONADO → DEPÓSITO DE VENTA (botón "Pasar a venta") ─────────
+// Mueve unidades de un lote en depósito REAC al depósito de venta (default DEP),
+// reusando un lote destino mismo sku/compra/costo si existe. La unidad vuelve a
+// estar disponible/recomprable. body: { lote_id, unidades?, deposito? }.
+// unidades omitido = mueve todo el lote. Ver ADARA-STOCK.md.
+app.post('/reacondicionar/a-venta', async (req, res) => {
+  try {
+    const { lote_id, unidades, deposito } = req.body;
+    if (!lote_id) return res.status(400).json({ error: 'Falta lote_id' });
+    const hoy = new Date().toISOString().split('T')[0];
+    const r = await sbRpc('fn_reacondicionado_a_venta', {
+      p_lote_id: lote_id,
+      p_unidades: (unidades !== undefined && unidades !== null && unidades !== '') ? Number(unidades) : null,
+      p_deposito: deposito || 'DEP',
+      p_fecha: hoy,
+    });
+    const out = Array.isArray(r) ? r[0] : r;
+    if (!out || !(out.movidas > 0)) {
+      return res.status(400).json({ error: 'No se movió ninguna unidad (lote vacío o no es REAC).', ...(out || {}) });
+    }
+    console.log(`  → Reacondicionado→venta lote ${lote_id}: ${out.movidas}u → ${deposito || 'DEP'} (lote destino ${out.lote_destino})`);
+    res.json({ ok: true, ...out });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
