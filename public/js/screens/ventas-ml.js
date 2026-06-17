@@ -506,7 +506,7 @@ function cobroCellInner(v, bonifMap) {
     const stockPend = salio && !v.recepcion_condicion;
     const movPend = cancMovPend(v);
     if (!stockPend && !movPend) {
-      const r = v.recepcion_condicion ? (v.recepcion_condicion === 'ok' ? ' · 📦 reingresado' : ' · ❌ no disp.') : '';
+      const r = v.recepcion_condicion ? (v.recepcion_condicion === 'ok' ? ' · 📦 reingresado' : v.recepcion_condicion === 'reacondicionar' ? ' · 🔧 reacondicionar' : ' · ❌ no disp.') : '';
       return `<span class="vml-conc">✓ resuelta${r}</span>`;
     }
     const falta = [];
@@ -753,8 +753,10 @@ async function openVentaDetalle(ventaId) {
         // Eje stock: solo si salió del depósito y no tiene recepción.
         if (stockPend) {
           acc.push(`<button class="btn ${movPend ? 'btn-ghost' : 'btn-primary'}" id="vd-rec-ok" title="Volvió y es vendible — no cambia el stock">📦 OK stock</button>`);
+          acc.push(`<button class="btn btn-ghost" id="vd-rec-reac" title="Volvió pero no sano → va al depósito Reacondicionar">🔧 Reacondicionar</button>`);
           acc.push(`<button class="btn btn-ghost" id="vd-rec-no" title="No volvió → pérdida: descuenta stock">❌ No disp.</button>`);
           onClick('vd-rec-ok', () => recepcionCancelada(ventaId, 'ok'));
+          onClick('vd-rec-reac', () => recepcionCancelada(ventaId, 'reacondicionar'));
           onClick('vd-rec-no', () => recepcionCancelada(ventaId, 'no_disponible'));
         }
         // Ya resuelta pero con movimientos vinculados → permitir deshacer.
@@ -921,6 +923,9 @@ async function recepcionCancelada(ventaId, condicion) {
     nota = prompt(`El producto NO volvió (pérdida). Se descontará del stock por FIFO.\n\n${prod}\n\nNota (obligatoria):`);
     if (nota === null) return;                 // canceló el prompt
     if (!nota.trim()) { window.toast('La nota es obligatoria', 'error'); return; }
+  } else if (condicion === 'reacondicionar') {
+    nota = prompt(`El producto volvió pero NO sano. Va al depósito Reacondicionar (recuperable con "Pasar a venta").\n\n${prod}\n\nNota (opcional, ej. qué tiene):`);
+    if (nota === null) return;                 // canceló el prompt (nota no obligatoria)
   } else {
     if (!confirm(`Confirmás que el producto VOLVIÓ y es vendible?\n\n${prod}\n\nNo modifica el stock (ya estaba contado).`)) return;
   }
@@ -936,6 +941,10 @@ async function recepcionCancelada(ventaId, condicion) {
 
     if (condicion === 'ok') {
       window.toast('Recepción OK: producto reingresado');
+    } else if (condicion === 'reacondicionar') {
+      const rc = data.reac_stock || {};
+      const u = Number(rc.unidades_a_reac) || 0;
+      window.toast(u > 0 ? `A reacondicionar: ${u}u al depósito REAC` : 'Marcado a reacondicionar (sin stock que mover)');
     } else {
       const aj = data.ajuste_stock || {};
       const u = Number(aj.unidades_ajustadas) || 0;
@@ -1367,6 +1376,8 @@ function inyectarEstilo() {
     #vd-rec-ok{background:#0F6E56;border:1px solid #0F6E56;color:#fff}
     #vd-rec-no{background:#fff;border:1px solid #E7B7B0;color:#B91C1C}
     #vd-rec-no:hover{background:#FBEDEB;filter:none}
+    #vd-rec-reac{background:#fff;border:1px solid #E3C48A;color:#9A6B00}
+    #vd-rec-reac:hover{background:#FBF3DF;filter:none}
     #vd-conc,#vd-concmov{background:#0C447C;border:1px solid #0C447C;color:#fff}
     .vml-det-cab{margin:10px 0 4px}
     .vml-det-bloque{margin-top:14px;border-top:1px solid #EFEAE3;padding-top:10px}
