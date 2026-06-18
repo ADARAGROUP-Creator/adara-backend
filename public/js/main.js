@@ -8,6 +8,7 @@ import { loadGastos } from './screens/gastos.js';
 import { loadConciliacion } from './screens/conciliacion.js';
 import { loadCuadre } from './screens/cuadre.js';
 import { loadCompras } from './screens/compras.js';
+import { loadImportacionesSim } from './screens/importaciones-sim.js';
 import { loadPSI } from './screens/psi.js';
 import { loadCosteo } from './screens/costeo.js';
 import { loadResultado } from './screens/resultado.js';
@@ -23,6 +24,7 @@ const screens = {
   cuadre: { fn: loadCuadre, title: 'Cuadre', sub: 'Control de conciliación: semáforo por cuenta y cola priorizada' },
   gastos: { fn: loadGastos, title: 'Gastos', sub: 'Gastos operativos' },
   compras: { fn: loadCompras, title: 'Compras', sub: 'Facturas de mercadería y cuenta corriente' },
+  importaciones_sim: { fn: loadImportacionesSim, title: 'Simulador Importaciones', sub: 'Costo puesto en Argentina (what-if), no crea stock' },
   psi: { fn: loadPSI, title: 'PSI Recompra', sub: 'Planificación de recompra por SKU' },
   costeo: { fn: loadCosteo, title: 'Inventario', sub: 'Valor del stock y productos sin costo' },
   resultado: { fn: loadResultado, title: 'Resultado', sub: 'Estado de resultado mensual por línea' },
