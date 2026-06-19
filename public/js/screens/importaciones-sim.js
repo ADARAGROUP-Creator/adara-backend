@@ -29,10 +29,10 @@ let PAGOS = [];            // { concepto, monto, moneda, tc }
 let _prevBolson = 0;
 
 function blankParams() {
-  return { tc: '', flete_declarado_usd: '', flete_real_usd: '', seguro_pct: '', despachante_pct: '', iibb_pct: '', ganancias_pct: '' };
+  return { tc: '', flete_declarado_usd: '', flete_real_usd: '', seguro_pct: '', seguro_monto: '', despachante_pct: '', despachante_monto: '', iibb_pct: '', ganancias_pct: '' };
 }
 function blankProd() {
-  return { nombre: '', fob_decl_u: '', fob_real_u: '', cantidad: '', peso_u: '', derechos_pct: '', estadistica_pct: '', iva_pct: 21, fijo_asignado: 0, _open: false };
+  return { nombre: '', fob_decl_u: '', fob_real_u: '', cantidad: '', peso_u: '', derechos_pct: '', estadistica_pct: '', imp_internos_pct: '', iva_pct: 21, fijo_asignado: 0, _open: false };
 }
 function blankPago() {
   return { concepto: '', monto: '', moneda: 'USD', tc: num(P.tc) > 0 ? P.tc : '' };
@@ -54,10 +54,13 @@ function calc() {
   const fleteDecl = num(P.flete_declarado_usd);
   const fleteReal = num(P.flete_real_usd);
   const segPct = num(P.seguro_pct) / 100;
+  const segMonto = num(P.seguro_monto);
   const despPct = num(P.despachante_pct) / 100;
+  const despMonto = num(P.despachante_monto);
   const iibbPct = num(P.iibb_pct) / 100;
   const ganPct = num(P.ganancias_pct) / 100;
-  const bolson = bolsonActual();
+  const bolsonManual = bolsonActual();
+  const fleteDiff = fleteReal - fleteDecl;   // (real − declarado) → va al bolsón de fijos
 
   const rows = PRODS.map(p => {
     const cant = num(p.cantidad);
@@ -65,32 +68,52 @@ function calc() {
   });
   const sPeso = rows.reduce((s, r) => s + r.pesoT, 0);
   const sFob = rows.reduce((s, r) => s + r.fobDeclT, 0);
-  const seguroTotal = segPct * (sFob + fleteDecl);
+  const fobRealTot = rows.reduce((s, r) => s + r.fobRealT, 0);
+  // Seguro: si hay monto cargado pisa el %. Se prorratea por FOB.
+  const seguroTotal = segMonto > 0 ? segMonto : segPct * (sFob + fleteDecl);
 
+  // CIF usa SIEMPRE el flete DECLARADO (base aduanera).
   rows.forEach(r => {
     r.fleteDeclShare = fleteDecl * safeDiv(r.pesoT, sPeso);
     r.seguro = seguroTotal * safeDiv(r.fobDeclT, sFob);
     r.cif = r.fobDeclT + r.fleteDeclShare + r.seguro;
   });
   const sCif = rows.reduce((s, r) => s + r.cif, 0);
+  // Despachante: si hay monto cargado pisa el %. NO entra al CIF → va al bolsón de fijos.
+  const despTotal = despMonto > 0 ? despMonto : despPct * sCif;
+
+  // Bolsón EFECTIVO = fijos manuales + diferencia de flete + despachante.
+  // Se reparte entre productos por fijo_asignado (como el usuario lo marca).
+  const bolson = bolsonManual + fleteDiff + despTotal;
 
   rows.forEach(r => {
     const p = r.p;
     r.derechos = r.cif * num(p.derechos_pct) / 100;
     r.estadistica = r.cif * num(p.estadistica_pct) / 100;
-    r.baseIva = r.cif + r.derechos + r.estadistica;
+    r.impInternos = r.cif * num(p.imp_internos_pct) / 100;       // se trata como derechos
+    r.baseIva = r.cif + r.derechos + r.estadistica + r.impInternos;
     r.iva = r.baseIva * num(p.iva_pct) / 100;
     r.iibb = r.baseIva * iibbPct;
     r.ganancias = r.baseIva * ganPct;
-    r.fleteReal = fleteReal * safeDiv(r.pesoT, sPeso);
-    r.despachante = despPct * r.cif;                 // (despPct·ΣCIF)·(CIF_i/ΣCIF) = despPct·CIF_i
+    // El COSTO de flete usa el DECLARADO (por peso); la diferencia ya está en el bolsón.
+    r.fleteCosto = r.fleteDeclShare;
     r.fijo = FIJOS_MODO === 'pct' ? num(p.fijo_asignado) / 100 * bolson : num(p.fijo_asignado);
     r.noDeclarado = (num(p.fob_real_u) - num(p.fob_decl_u)) * r.cant;
-    r.costoUsd = r.fobRealT + r.fleteReal + r.seguro + r.derechos + r.estadistica + r.despachante + r.fijo;
+    // Despachante NO es línea propia del costo: vive dentro de r.fijo (bolsón).
+    r.costoUsd = r.fobRealT + r.fleteCosto + r.seguro + r.derechos + r.estadistica + r.impInternos + r.fijo;
     r.creditoUsd = r.iva + r.iibb + r.ganancias;
     r.costoUnitUsd = safeDiv(r.costoUsd, r.cant);
     r.costoUnitArs = r.costoUnitUsd * tc;
   });
+
+  const derechosTot = rows.reduce((s, r) => s + r.derechos, 0);
+  const estadTot = rows.reduce((s, r) => s + r.estadistica, 0);
+  const impIntTot = rows.reduce((s, r) => s + r.impInternos, 0);
+  const ivaTot = rows.reduce((s, r) => s + r.iva, 0);
+  const iibbTot = rows.reduce((s, r) => s + r.iibb, 0);
+  const ganTot = rows.reduce((s, r) => s + r.ganancias, 0);
+  const baseIvaTot = sCif + derechosTot + estadTot + impIntTot;
+  const tributosTot = derechosTot + estadTot + impIntTot + ivaTot + iibbTot + ganTot;
 
   const costoTotUsd = rows.reduce((s, r) => s + r.costoUsd, 0);
   const credTotUsd = rows.reduce((s, r) => s + r.creditoUsd, 0);
@@ -106,18 +129,22 @@ function calc() {
   const esperado = costoTotUsd + credTotUsd;
 
   return {
-    tc, bolson, sPeso, sFob, sCif, rows, pagosRows,
+    tc, bolson, bolsonManual, fleteDiff, sPeso, sFob, fobRealTot, sCif, seguroTotal, despTotal, rows, pagosRows,
+    derechosTot, estadTot, impIntTot, ivaTot, iibbTot, ganTot, baseIvaTot, tributosTot,
     costoTotUsd, credTotUsd, costoTotArs: costoTotUsd * tc, credTotArs: credTotUsd * tc,
     pagosUsd, esperado, diff: pagosUsd - esperado
   };
 }
+
+// Bolsón efectivo (manual + diferencia de flete + despachante). Lo usa el reparto.
+function bolsonEfectivo() { return calc().bolson; }
 
 // ── Reparto de fijos ────────────────────────────────────────────────────
 function baseCriterio(p) {
   return FIJOS_CRIT === 'kg' ? num(p.peso_u) * num(p.cantidad) : num(p.fob_decl_u) * num(p.cantidad);
 }
 function precargarFijos() {
-  const bolson = bolsonActual();
+  const bolson = bolsonEfectivo();
   const base = PRODS.map(baseCriterio);
   const tot = base.reduce((a, b) => a + b, 0);
   PRODS.forEach((p, i) => {
@@ -127,7 +154,7 @@ function precargarFijos() {
   _prevBolson = bolson;
 }
 function onBolsonChanged() {
-  const nb = bolsonActual();
+  const nb = bolsonEfectivo();
   if (FIJOS_MODO === 'monto' && _prevBolson > 0 && nb !== _prevBolson) {
     const ratio = nb / _prevBolson;
     PRODS.forEach(p => { p.fijo_asignado = round2(num(p.fijo_asignado) * ratio); });
@@ -136,7 +163,7 @@ function onBolsonChanged() {
 }
 function switchModo(nuevo) {
   if (nuevo === FIJOS_MODO) return;
-  const bolson = bolsonActual();
+  const bolson = bolsonEfectivo();
   PRODS.forEach(p => {
     p.fijo_asignado = round2(nuevo === 'monto'
       ? num(p.fijo_asignado) / 100 * bolson           // pct → monto
@@ -146,7 +173,7 @@ function switchModo(nuevo) {
   _prevBolson = bolson;
 }
 function repartirResto() {
-  const bolson = bolsonActual();
+  const bolson = bolsonEfectivo();
   const ceros = PRODS.filter(p => num(p.fijo_asignado) === 0);
   if (!ceros.length) { window.toast('No hay productos en cero para repartir', 'error'); return; }
   const asignado = PRODS.reduce((s, p) => s + num(p.fijo_asignado), 0);
@@ -184,7 +211,9 @@ function buildDatos() {
     v: 1,
     params: {
       tc: num(P.tc), flete_declarado_usd: num(P.flete_declarado_usd), flete_real_usd: num(P.flete_real_usd),
-      seguro_pct: num(P.seguro_pct), despachante_pct: num(P.despachante_pct), iibb_pct: num(P.iibb_pct), ganancias_pct: num(P.ganancias_pct)
+      seguro_pct: num(P.seguro_pct), seguro_monto: num(P.seguro_monto),
+      despachante_pct: num(P.despachante_pct), despachante_monto: num(P.despachante_monto),
+      iibb_pct: num(P.iibb_pct), ganancias_pct: num(P.ganancias_pct)
     },
     fijos: FIJOS.map(f => ({ concepto: f.concepto || '', monto_usd: num(f.monto_usd) })),
     fijos_modo: FIJOS_MODO,
@@ -192,7 +221,8 @@ function buildDatos() {
     productos: PRODS.map(p => ({
       nombre: p.nombre || '', fob_decl_u: num(p.fob_decl_u), fob_real_u: num(p.fob_real_u),
       cantidad: num(p.cantidad), peso_u: num(p.peso_u), derechos_pct: num(p.derechos_pct),
-      estadistica_pct: num(p.estadistica_pct), iva_pct: num(p.iva_pct), fijo_asignado: num(p.fijo_asignado)
+      estadistica_pct: num(p.estadistica_pct), imp_internos_pct: num(p.imp_internos_pct),
+      iva_pct: num(p.iva_pct), fijo_asignado: num(p.fijo_asignado)
     })),
     pagos: PAGOS.map(pg => ({ concepto: pg.concepto || '', monto: num(pg.monto), moneda: pg.moneda === 'ARS' ? 'ARS' : 'USD', tc: num(pg.tc) }))
   };
@@ -202,7 +232,9 @@ function loadDatos(d) {
   const pa = d.params || {};
   P = {
     tc: pa.tc ?? '', flete_declarado_usd: pa.flete_declarado_usd ?? '', flete_real_usd: pa.flete_real_usd ?? '',
-    seguro_pct: pa.seguro_pct ?? '', despachante_pct: pa.despachante_pct ?? '', iibb_pct: pa.iibb_pct ?? '', ganancias_pct: pa.ganancias_pct ?? ''
+    seguro_pct: pa.seguro_pct ?? '', seguro_monto: pa.seguro_monto ?? '',
+    despachante_pct: pa.despachante_pct ?? '', despachante_monto: pa.despachante_monto ?? '',
+    iibb_pct: pa.iibb_pct ?? '', ganancias_pct: pa.ganancias_pct ?? ''
   };
   FIJOS = (d.fijos || []).map(f => ({ concepto: f.concepto || '', monto_usd: f.monto_usd ?? '' }));
   FIJOS_MODO = d.fijos_modo === 'monto' ? 'monto' : 'pct';
@@ -215,7 +247,7 @@ function loadDatos(d) {
     moneda: pg.moneda === 'ARS' ? 'ARS' : 'USD',
     tc: (pg.tc ?? '') === '' || num(pg.tc) === 0 ? (pa.tc ?? '') : pg.tc
   }));
-  _prevBolson = bolsonActual();
+  _prevBolson = bolsonEfectivo();
 }
 
 async function guardar() {
@@ -325,7 +357,7 @@ function render() {
 
 function renderBody() {
   const body = document.getElementById('imp-body');
-  body.innerHTML = paramsCard() + fijosCard() + prodsSection() + totalesCard() + pagosCard();
+  body.innerHTML = paramsCard() + fijosCard() + prodsSection() + totalesCard() + tablaTotalCard() + pagosCard();
   bindDelegation(body);
   paint();
 }
@@ -333,26 +365,40 @@ function renderBody() {
 function paramsCard() {
   const f = (lbl, fld, hint = '') => field(lbl, inpNum('param', 0, fld, P[fld]), hint);
   return `<div class="card imp-card">
-    <div class="card-title">Parámetros generales</div>
+    <div class="card-title">Detalles generales</div>
     <div class="imp-params">
       ${f('TC ($/USD)', 'tc', 'congela el costo en ARS')}
       ${f('Flete declarado (USD)', 'flete_declarado_usd', 'va al CIF · por peso')}
       ${f('Flete real (USD)', 'flete_real_usd', 'costo real · por peso')}
       ${f('Seguro %', 'seguro_pct', 'sobre FOB+flete decl.')}
+      ${f('Seguro $ (USD)', 'seguro_monto', 'si lo cargás, pisa el %')}
       ${f('Despachante %', 'despachante_pct', 'sobre el CIF')}
+      ${f('Despachante $ (USD)', 'despachante_monto', 'si lo cargás, pisa el %')}
       ${f('IIBB percep. %', 'iibb_pct', 'crédito fiscal')}
       ${f('Ganancias percep. %', 'ganancias_pct', 'crédito fiscal')}
     </div>
+    <div class="imp-bases" id="imp-bases"></div>
   </div>`;
 }
 
 function fijosCard() {
-  const filas = FIJOS.map((f, i) => `
+  const filasManual = FIJOS.length ? FIJOS.map((f, i) => `
     <div class="imp-fijo-item">
       ${inp('fijo', i, 'concepto', f.concepto, 'placeholder="Concepto (TCA, SEDI, transporte…)"')}
       ${inpNum('fijo', i, 'monto_usd', f.monto_usd, 'placeholder="USD"')}
       <button class="imp-del" data-act="delfijo" data-i="${i}" title="Eliminar">✕</button>
-    </div>`).join('') || `<div class="imp-muted imp-empty">Sin conceptos fijos. Sumá uno con “+ Concepto”.</div>`;
+    </div>`).join('') : `<div class="imp-muted imp-empty">Sin conceptos fijos manuales. Sumá uno con “+ Concepto”.</div>`;
+  const filasAuto = `
+    <div class="imp-fijo-item imp-fijo-auto">
+      <span class="imp-fijo-autolbl">Diferencia flete (real − decl.) <span class="imp-auto-badge">auto</span></span>
+      <b class="imp-mono imp-fijo-automonto" id="imp-fijo-fletediff">—</b>
+      <span></span>
+    </div>
+    <div class="imp-fijo-item imp-fijo-auto">
+      <span class="imp-fijo-autolbl">Despachante <span class="imp-auto-badge">auto</span></span>
+      <b class="imp-mono imp-fijo-automonto" id="imp-fijo-despachante">—</b>
+      <span></span>
+    </div>`;
   const pill = (val, lbl, act) => `<button class="imp-pill" data-act="${act}" data-val="${val}">${lbl}</button>`;
   return `<div class="card imp-card">
     <div class="card-title">Costos fijos (bolsón)</div>
@@ -364,7 +410,8 @@ function fijosCard() {
       <div class="grow"></div>
       <button class="btn btn-ghost imp-mini" data-act="addfijo">+ Concepto</button>
     </div>
-    <div class="imp-fijos">${filas}</div>
+    <div class="imp-fijos">${filasManual}${filasAuto}</div>
+    <div class="imp-fijos-nota">La diferencia de flete y el despachante se cargan solos al bolsón (no entran al CIF) y se reparten por producto como marques abajo. Acordate de Precargar para repartir el 100%.</div>
     <div class="imp-reparto">
       <span>Bolsón total: <b id="imp-bolson" class="imp-mono"></b></span>
       <span id="imp-reparto-ind" class="imp-mono"></span>
@@ -398,6 +445,7 @@ function prodCard(p, i) {
       ${fnum('fob_real_u', 'FOB real u (USD)')}
       ${fnum('derechos_pct', 'Derechos %')}
       ${fnum('estadistica_pct', 'Estadística %')}
+      ${fnum('imp_internos_pct', 'Imp. int. %')}
       ${fnum('iva_pct', 'IVA %')}
       ${field(`<span class="imp-fijo-lbl">Fijo ${FIJOS_MODO === 'pct' ? '%' : '$'}</span>`,
         `<input class="imp-in" id="prodfijo-${i}" data-k="prod" data-i="${i}" data-f="fijo_asignado" type="number" step="any" inputmode="decimal" value="${esc(p.fijo_asignado)}">`)}
@@ -424,6 +472,17 @@ function totalesCard() {
       <div class="imp-tot-val"><b id="imp-tot-cred-usd" class="imp-mono"></b></div>
       <div class="imp-tot-sub imp-mono" id="imp-tot-cred-ars"></div>
     </div>
+  </div>`;
+}
+
+function tablaTotalCard() {
+  return `<div class="card imp-card">
+    <div class="card-title">Tabla total del despacho</div>
+    <div class="imp-tt-legend"><span class="imp-tt-dot imp-tt-cap"></span>capitaliza al costo · <span class="imp-tt-dot imp-tt-cred"></span>crédito fiscal (Posición Fiscal) · resto = base</div>
+    <div class="table-wrap"><table class="t imp-tt">
+      <thead><tr><th>Concepto</th><th style="text-align:right">USD</th><th style="text-align:right">ARS</th></tr></thead>
+      <tbody id="imp-tt-body"></tbody>
+    </table></div>
   </div>`;
 }
 
@@ -458,7 +517,22 @@ function paint() {
   const c = calc();
   const set = (id, txt) => { const el = document.getElementById(id); if (el) el.textContent = txt; };
 
+  // Tira de bases calculadas (detalles generales)
+  const bases = document.getElementById('imp-bases');
+  if (bases) {
+    const chip = (lbl, val) => `<div class="imp-base"><span class="imp-base-lbl">${lbl}</span><b class="imp-mono">${val}</b></div>`;
+    bases.innerHTML =
+      chip('Σ FOB declarado', usd(c.sFob)) +
+      chip('Σ FOB real', usd(c.fobRealTot)) +
+      chip('Σ Peso', c.sPeso.toLocaleString('es-AR', { maximumFractionDigits: 3 }) + ' kg') +
+      chip('CIF total', usd(c.sCif)) +
+      chip('Seguro total', usd(c.seguroTotal)) +
+      chip('Despachante total', usd(c.despTotal));
+  }
+
   set('imp-bolson', usd(c.bolson));
+  set('imp-fijo-fletediff', usd(c.fleteDiff));
+  set('imp-fijo-despachante', usd(c.despTotal));
   const asignado = PRODS.reduce((s, p) => s + num(p.fijo_asignado), 0);
   const ind = document.getElementById('imp-reparto-ind');
   if (ind) {
@@ -487,6 +561,22 @@ function paint() {
   set('imp-tot-costo-ars', ars(c.costoTotArs));
   set('imp-tot-cred-usd', usd(c.credTotUsd));
   set('imp-tot-cred-ars', ars(c.credTotArs));
+
+  // Tabla total del despacho
+  const ttBody = document.getElementById('imp-tt-body');
+  if (ttBody) {
+    const tt = (lbl, v, cls = '') => `<tr class="${cls}"><td>${lbl}</td><td class="imp-mono" style="text-align:right">${usd(v)}</td><td class="imp-mono" style="text-align:right">${ars(v * c.tc)}</td></tr>`;
+    ttBody.innerHTML =
+      tt('Total CIF', c.sCif, 'imp-tt-baserow') +
+      tt('Derechos', c.derechosTot, 'imp-tt-caprow') +
+      tt('Estadística', c.estadTot, 'imp-tt-caprow') +
+      tt('Imp. internos', c.impIntTot, 'imp-tt-caprow') +
+      tt('Base de IVA', c.baseIvaTot, 'imp-tt-baserow') +
+      tt('IVA', c.ivaTot, 'imp-tt-credrow') +
+      tt('IIBB percepción', c.iibbTot, 'imp-tt-credrow') +
+      tt('Ganancias percepción', c.ganTot, 'imp-tt-credrow') +
+      tt('Total tributos del despacho', c.tributosTot, 'imp-tt-totalrow');
+  }
 
   c.pagosRows.forEach((pr, i) => {
     const el = document.getElementById(`pago-usd-${i}`);
@@ -521,12 +611,12 @@ function detalleHTML(r, tc) {
       <div class="imp-dt-wrap"><table class="imp-dt">${head}<tbody>
         ${line('FOB declarado', r.fobDeclT)}
         ${line('No declarado (subfact.)', r.noDeclarado)}
-        ${line('Flete real (por peso)', r.fleteReal)}
+        ${line('Flete declarado (por peso)', r.fleteCosto)}
         ${line('Seguro', r.seguro)}
         ${line('Derechos', r.derechos)}
         ${line('Estadística', r.estadistica)}
-        ${line('Despachante', r.despachante)}
-        ${line('Fijos', r.fijo)}
+        ${line('Imp. internos', r.impInternos)}
+        ${line('Fijos (incl. flete-dif. + despachante)', r.fijo)}
         ${line('Costo s/IVA', r.costoUsd, true)}
       </tbody></table></div>
     </div>
@@ -560,7 +650,13 @@ function bindDelegation(body) {
     const t = e.target;
     if (!t.dataset || !t.dataset.k) return;
     const k = t.dataset.k, i = +t.dataset.i, f = t.dataset.f, v = t.value;
-    if (k === 'param') P[f] = v;
+    if (k === 'param') {
+      P[f] = v;
+      // Estos parámetros mueven el bolsón efectivo (flete-diff + despachante).
+      if (['flete_declarado_usd', 'flete_real_usd', 'despachante_pct', 'despachante_monto'].includes(f)) {
+        onBolsonChanged(); syncProdFijoInputs();
+      }
+    }
     else if (k === 'fijo') { FIJOS[i][f] = v; if (f === 'monto_usd') { onBolsonChanged(); syncProdFijoInputs(); } }
     else if (k === 'prod') PRODS[i][f] = v;
     else if (k === 'pago') {
@@ -632,6 +728,23 @@ function inyectarEstilo() {
     .imp-flbl,.imp-fijo-lbl{font-weight:500}
     .imp-field small{color:#A8A29E;font-size:11px;line-height:1.3}
 
+    /* Bases calculadas (detalles generales) */
+    .imp-bases{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px;padding-top:14px;border-top:1px solid #F0EEEC}
+    .imp-base{display:flex;flex-direction:column;gap:2px;background:#FAFAF9;border:1px solid #EFEDEB;border-radius:8px;padding:8px 12px;min-width:130px}
+    .imp-base-lbl{font-size:11px;color:#A8A29E;text-transform:uppercase;letter-spacing:.03em}
+    .imp-base b{font-size:14px;color:#1C1917}
+
+    /* Tabla total del despacho */
+    .imp-tt-legend{font-size:12px;color:#78716C;margin-bottom:10px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+    .imp-tt-dot{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:2px}
+    .imp-tt-cap{background:#EBD9BC}
+    .imp-tt-cred{background:#CFE0F1}
+    #imp-body table.imp-tt tbody td{font-size:14px}
+    .imp-tt-caprow td:first-child{border-left:3px solid #EBD9BC}
+    .imp-tt-credrow td:first-child{border-left:3px solid #CFE0F1}
+    .imp-tt-baserow td{background:#FAFAF9;color:#57534E;font-weight:600}
+    .imp-tt-totalrow td{background:#F5F4F2;font-weight:700;font-size:15px!important;border-top:2px solid #E7E5E4}
+
     /* Fijos */
     .imp-toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
     .imp-toolbar .grow{flex:1}
@@ -645,6 +758,11 @@ function inyectarEstilo() {
     .imp-del{border:1px solid #E7E5E4;background:#fff;color:#A8A29E;cursor:pointer;font-size:13px;width:32px;height:32px;border-radius:8px;flex:none}
     .imp-del:hover{color:#B91C1C;border-color:#F0C9C2}
     .imp-fijo-item{display:grid;grid-template-columns:1fr 150px 32px;gap:10px;margin-bottom:10px;align-items:center}
+    .imp-fijo-auto{background:#FAFAF9;border:1px dashed #E0DDDA;border-radius:8px;padding:8px 10px}
+    .imp-fijo-autolbl{font-size:13px;color:#57534E;display:flex;align-items:center;gap:8px}
+    .imp-auto-badge{font-size:10px;text-transform:uppercase;letter-spacing:.04em;background:#EFEDEB;color:#857F79;padding:1px 6px;border-radius:5px}
+    .imp-fijo-automonto{text-align:right;color:#1C1917}
+    .imp-fijos-nota{font-size:12px;color:#A8A29E;margin:6px 2px 0;line-height:1.4}
     .imp-reparto{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;border-top:1px solid #E7E5E4;margin-top:12px;padding-top:12px;font-size:14px}
     .imp-ok{color:#0F6E56;font-weight:600}
     .imp-warn{color:#854F0B;font-weight:600}
