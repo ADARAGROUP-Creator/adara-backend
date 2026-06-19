@@ -29,10 +29,10 @@ let PAGOS = [];            // { concepto, monto, moneda, tc }
 let _prevBolson = 0;
 
 function blankParams() {
-  return { tc: '', flete_declarado_usd: '', flete_real_usd: '', seguro_pct: '', seguro_monto: '', despachante_pct: '', despachante_monto: '', iibb_pct: '', ganancias_pct: '' };
+  return { tc: '', flete_declarado_usd: '', flete_real_usd: '', seguro_pct: '', seguro_monto: '', despachante_pct: '', despachante_monto: '', iibb_pct: '', ganancias_pct: '', coima_pct: '' };
 }
 function blankProd() {
-  return { nombre: '', fob_decl_u: '', fob_real_u: '', cantidad: '', peso_u: '', derechos_pct: '', estadistica_pct: '', imp_internos_pct: '', iva_pct: 21, fijo_asignado: 0, _open: false };
+  return { nombre: '', fob_decl_u: '', fob_real_u: '', cantidad: '', peso_u: '', derechos_pct: '', estadistica_pct: '', imp_internos_pct: '', derechos_pct_real: '', estadistica_pct_real: '', iva_pct: 21, fijo_asignado: 0, _open: false };
 }
 function blankPago() {
   return { concepto: '', monto: '', moneda: 'USD', tc: num(P.tc) > 0 ? P.tc : '' };
@@ -59,8 +59,11 @@ function calc() {
   const despMonto = num(P.despachante_monto);
   const iibbPct = num(P.iibb_pct) / 100;
   const ganPct = num(P.ganancias_pct) / 100;
+  const coimaPct = num(P.coima_pct) / 100;
   const bolsonManual = bolsonActual();
   const fleteDiff = fleteReal - fleteDecl;   // (real − declarado) → va al bolsón de fijos
+  // tasa real opcional: vacía ⇒ igual a la declarada (no hay reclasificación → sin coima)
+  const realOr = (real, decl) => (real === '' || real === null || real === undefined) ? num(decl) : num(real);
 
   const rows = PRODS.map(p => {
     const cant = num(p.cantidad);
@@ -95,12 +98,17 @@ function calc() {
     r.iva = r.baseIva * num(p.iva_pct) / 100;
     r.iibb = r.baseIva * iibbPct;
     r.ganancias = r.baseIva * ganPct;
+    // Reclasificación de posición: ahorro = (real − declarado) de derechos+estad; coima = % del ahorro.
+    r.derReal = r.cif * realOr(p.derechos_pct_real, p.derechos_pct) / 100;
+    r.estReal = r.cif * realOr(p.estadistica_pct_real, p.estadistica_pct) / 100;
+    r.ahorro = (r.derReal - r.derechos) + (r.estReal - r.estadistica);
+    r.coima = r.ahorro * coimaPct;                                // capitaliza, SIN crédito
     // El COSTO de flete usa el DECLARADO (por peso); la diferencia ya está en el bolsón.
     r.fleteCosto = r.fleteDeclShare;
     r.fijo = FIJOS_MODO === 'pct' ? num(p.fijo_asignado) / 100 * bolson : num(p.fijo_asignado);
     r.noDeclarado = (num(p.fob_real_u) - num(p.fob_decl_u)) * r.cant;
     // Despachante NO es línea propia del costo: vive dentro de r.fijo (bolsón).
-    r.costoUsd = r.fobRealT + r.fleteCosto + r.seguro + r.derechos + r.estadistica + r.impInternos + r.fijo;
+    r.costoUsd = r.fobRealT + r.fleteCosto + r.seguro + r.derechos + r.estadistica + r.impInternos + r.coima + r.fijo;
     r.creditoUsd = r.iva + r.iibb + r.ganancias;
     r.costoUnitUsd = safeDiv(r.costoUsd, r.cant);
     r.costoUnitArs = r.costoUnitUsd * tc;
@@ -112,6 +120,8 @@ function calc() {
   const ivaTot = rows.reduce((s, r) => s + r.iva, 0);
   const iibbTot = rows.reduce((s, r) => s + r.iibb, 0);
   const ganTot = rows.reduce((s, r) => s + r.ganancias, 0);
+  const ahorroTot = rows.reduce((s, r) => s + r.ahorro, 0);
+  const coimaTot = rows.reduce((s, r) => s + r.coima, 0);
   const baseIvaTot = sCif + derechosTot + estadTot + impIntTot;
   const tributosTot = derechosTot + estadTot + impIntTot + ivaTot + iibbTot + ganTot;
 
@@ -131,6 +141,7 @@ function calc() {
   return {
     tc, bolson, bolsonManual, fleteDiff, sPeso, sFob, fobRealTot, sCif, seguroTotal, despTotal, rows, pagosRows,
     derechosTot, estadTot, impIntTot, ivaTot, iibbTot, ganTot, baseIvaTot, tributosTot,
+    ahorroTot, coimaTot, netoReclasif: ahorroTot - coimaTot,
     costoTotUsd, credTotUsd, costoTotArs: costoTotUsd * tc, credTotArs: credTotUsd * tc,
     pagosUsd, esperado, diff: pagosUsd - esperado
   };
@@ -213,7 +224,7 @@ function buildDatos() {
       tc: num(P.tc), flete_declarado_usd: num(P.flete_declarado_usd), flete_real_usd: num(P.flete_real_usd),
       seguro_pct: num(P.seguro_pct), seguro_monto: num(P.seguro_monto),
       despachante_pct: num(P.despachante_pct), despachante_monto: num(P.despachante_monto),
-      iibb_pct: num(P.iibb_pct), ganancias_pct: num(P.ganancias_pct)
+      iibb_pct: num(P.iibb_pct), ganancias_pct: num(P.ganancias_pct), coima_pct: num(P.coima_pct)
     },
     fijos: FIJOS.map(f => ({ concepto: f.concepto || '', monto_usd: num(f.monto_usd) })),
     fijos_modo: FIJOS_MODO,
@@ -222,6 +233,8 @@ function buildDatos() {
       nombre: p.nombre || '', fob_decl_u: num(p.fob_decl_u), fob_real_u: num(p.fob_real_u),
       cantidad: num(p.cantidad), peso_u: num(p.peso_u), derechos_pct: num(p.derechos_pct),
       estadistica_pct: num(p.estadistica_pct), imp_internos_pct: num(p.imp_internos_pct),
+      derechos_pct_real: p.derechos_pct_real === '' || p.derechos_pct_real == null ? null : num(p.derechos_pct_real),
+      estadistica_pct_real: p.estadistica_pct_real === '' || p.estadistica_pct_real == null ? null : num(p.estadistica_pct_real),
       iva_pct: num(p.iva_pct), fijo_asignado: num(p.fijo_asignado)
     })),
     pagos: PAGOS.map(pg => ({ concepto: pg.concepto || '', monto: num(pg.monto), moneda: pg.moneda === 'ARS' ? 'ARS' : 'USD', tc: num(pg.tc) }))
@@ -234,12 +247,12 @@ function loadDatos(d) {
     tc: pa.tc ?? '', flete_declarado_usd: pa.flete_declarado_usd ?? '', flete_real_usd: pa.flete_real_usd ?? '',
     seguro_pct: pa.seguro_pct ?? '', seguro_monto: pa.seguro_monto ?? '',
     despachante_pct: pa.despachante_pct ?? '', despachante_monto: pa.despachante_monto ?? '',
-    iibb_pct: pa.iibb_pct ?? '', ganancias_pct: pa.ganancias_pct ?? ''
+    iibb_pct: pa.iibb_pct ?? '', ganancias_pct: pa.ganancias_pct ?? '', coima_pct: pa.coima_pct ?? ''
   };
   FIJOS = (d.fijos || []).map(f => ({ concepto: f.concepto || '', monto_usd: f.monto_usd ?? '' }));
   FIJOS_MODO = d.fijos_modo === 'monto' ? 'monto' : 'pct';
   FIJOS_CRIT = d.fijos_criterio === 'fob' ? 'fob' : 'kg';
-  PRODS = (d.productos || []).map(p => ({ ...blankProd(), ...p, _open: false }));
+  PRODS = (d.productos || []).map(p => ({ ...blankProd(), ...p, derechos_pct_real: p.derechos_pct_real ?? '', estadistica_pct_real: p.estadistica_pct_real ?? '', _open: false }));
   if (!PRODS.length) PRODS = [blankProd()];
   // Compat: pagos viejos sin tc → toman el TC general guardado como fallback.
   PAGOS = (d.pagos || []).map(pg => ({
@@ -357,7 +370,7 @@ function render() {
 
 function renderBody() {
   const body = document.getElementById('imp-body');
-  body.innerHTML = paramsCard() + fijosCard() + prodsSection() + totalesCard() + tablaTotalCard() + pagosCard();
+  body.innerHTML = paramsCard() + fijosCard() + prodsSection() + totalesCard() + reclasifCard() + tablaTotalCard() + pagosCard();
   bindDelegation(body);
   paint();
 }
@@ -376,6 +389,7 @@ function paramsCard() {
       ${f('Despachante $ (USD)', 'despachante_monto', 'si lo cargás, pisa el %')}
       ${f('IIBB percep. %', 'iibb_pct', 'crédito fiscal')}
       ${f('Ganancias percep. %', 'ganancias_pct', 'crédito fiscal')}
+      ${f('Coima %', 'coima_pct', 'sobre derechos+estad. evitados')}
     </div>
     <div class="imp-bases" id="imp-bases"></div>
   </div>`;
@@ -428,7 +442,7 @@ function prodsSection() {
 }
 
 function prodCard(p, i) {
-  const fnum = (f, lbl) => field(lbl, inpNum('prod', i, f, p[f]));
+  const fnum = (f, lbl, hint = '') => field(lbl, inpNum('prod', i, f, p[f]), hint);
   return `<div class="card imp-prod" data-row="${i}">
     <div class="imp-prod-head">
       <input class="imp-in imp-prod-nombre" data-k="prod" data-i="${i}" data-f="nombre" value="${esc(p.nombre)}" placeholder="Nombre del producto">
@@ -446,6 +460,8 @@ function prodCard(p, i) {
       ${fnum('derechos_pct', 'Derechos %')}
       ${fnum('estadistica_pct', 'Estadística %')}
       ${fnum('imp_internos_pct', 'Imp. int. %')}
+      ${fnum('derechos_pct_real', 'Der. real %', 'opc. · posición real')}
+      ${fnum('estadistica_pct_real', 'Estad. real %', 'opc. · posición real')}
       ${fnum('iva_pct', 'IVA %')}
       ${field(`<span class="imp-fijo-lbl">Fijo ${FIJOS_MODO === 'pct' ? '%' : '$'}</span>`,
         `<input class="imp-in" id="prodfijo-${i}" data-k="prod" data-i="${i}" data-f="fijo_asignado" type="number" step="any" inputmode="decimal" value="${esc(p.fijo_asignado)}">`)}
@@ -472,6 +488,18 @@ function totalesCard() {
       <div class="imp-tot-val"><b id="imp-tot-cred-usd" class="imp-mono"></b></div>
       <div class="imp-tot-sub imp-mono" id="imp-tot-cred-ars"></div>
     </div>
+  </div>`;
+}
+
+function reclasifCard() {
+  return `<div class="card imp-card imp-reclasif" id="imp-reclasif" style="display:none">
+    <div class="card-title">Reclasificación de posición (coima)</div>
+    <div class="imp-reclasif-grid">
+      <div class="imp-reclasif-block"><span class="imp-reclasif-lbl">Ahorro derechos + estadística</span><b id="imp-ahorro" class="imp-mono"></b></div>
+      <div class="imp-reclasif-block imp-reclasif-coima"><span class="imp-reclasif-lbl">Coima (capitaliza, sin crédito)</span><b id="imp-coima" class="imp-mono"></b></div>
+      <div class="imp-reclasif-block imp-reclasif-neto"><span class="imp-reclasif-lbl">Neto a favor (ahorro − coima)</span><b id="imp-neto" class="imp-mono"></b></div>
+    </div>
+    <div class="imp-fijos-nota">El ahorro es lo que NO pagás de derechos+estadística al declarar otra posición (no es costo). La coima sí capitaliza al costo y es salida de caja: cargala también como pago en el cierre.</div>
   </div>`;
 }
 
@@ -562,6 +590,18 @@ function paint() {
   set('imp-tot-cred-usd', usd(c.credTotUsd));
   set('imp-tot-cred-ars', ars(c.credTotArs));
 
+  // Resumen de reclasificación (coima): se muestra solo si hay algo
+  const recl = document.getElementById('imp-reclasif');
+  if (recl) {
+    const hay = Math.abs(c.ahorroTot) > 0.005 || Math.abs(c.coimaTot) > 0.005;
+    recl.style.display = hay ? 'block' : 'none';
+    if (hay) {
+      set('imp-ahorro', usd(c.ahorroTot) + '  ·  ' + ars(c.ahorroTot * c.tc));
+      set('imp-coima', usd(c.coimaTot) + '  ·  ' + ars(c.coimaTot * c.tc));
+      set('imp-neto', usd(c.netoReclasif) + '  ·  ' + ars(c.netoReclasif * c.tc));
+    }
+  }
+
   // Tabla total del despacho
   const ttBody = document.getElementById('imp-tt-body');
   if (ttBody) {
@@ -616,6 +656,7 @@ function detalleHTML(r, tc) {
         ${line('Derechos', r.derechos)}
         ${line('Estadística', r.estadistica)}
         ${line('Imp. internos', r.impInternos)}
+        ${line('Coima clasificación', r.coima)}
         ${line('Fijos (incl. flete-dif. + despachante)', r.fijo)}
         ${line('Costo s/IVA', r.costoUsd, true)}
       </tbody></table></div>
@@ -727,6 +768,15 @@ function inyectarEstilo() {
     .imp-field{display:flex;flex-direction:column;gap:5px;font-size:13px;color:#44403C;min-width:0}
     .imp-flbl,.imp-fijo-lbl{font-weight:500}
     .imp-field small{color:#A8A29E;font-size:11px;line-height:1.3}
+
+    /* Reclasificación (coima) */
+    .imp-reclasif-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:4px}
+    .imp-reclasif-block{border:1px solid #EFEDEB;border-radius:10px;padding:14px 16px;background:#FAFAF9}
+    .imp-reclasif-lbl{font-size:12px;color:#78716C;display:block;margin-bottom:6px}
+    .imp-reclasif-block b{font-size:16px;color:#1C1917}
+    .imp-reclasif-coima{background:#FBF1E6;border-color:#EBCBA0}
+    .imp-reclasif-neto{background:#E1F5EE;border-color:#A7E0CC}
+    @media(max-width:720px){.imp-reclasif-grid{grid-template-columns:1fr}}
 
     /* Bases calculadas (detalles generales) */
     .imp-bases{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px;padding-top:14px;border-top:1px solid #F0EEEC}
