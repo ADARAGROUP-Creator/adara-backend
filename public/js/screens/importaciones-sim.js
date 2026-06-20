@@ -32,7 +32,7 @@ function blankParams() {
   return { tc: '', flete_declarado_usd: '', flete_real_usd: '', seguro_pct: '', seguro_monto: '', despachante_pct: '', despachante_monto: '', iibb_pct: '', ganancias_pct: '', coima_pct: '' };
 }
 function blankProd() {
-  return { nombre: '', fob_decl_u: '', fob_real_u: '', cantidad: '', peso_u: '', derechos_pct: '', estadistica_pct: '', imp_internos_pct: '', derechos_pct_real: '', estadistica_pct_real: '', iva_pct: 21, fijo_asignado: 0, _open: false };
+  return { nombre: '', fob_real_u: '', fob_decl_u: '', cantidad: '', peso_u: '', derechos_pct: '', derechos_pct_decl: '', estadistica_pct: '', estadistica_pct_decl: '', imp_internos_pct: '', iva_pct: 21, fijo_asignado: 0, declaro_distinto: false, _open: false };
 }
 function blankPago() {
   return { concepto: '', monto: '', moneda: 'USD', tc: num(P.tc) > 0 ? P.tc : '' };
@@ -62,12 +62,12 @@ function calc() {
   const coimaPct = num(P.coima_pct) / 100;
   const bolsonManual = bolsonActual();
   const fleteDiff = fleteReal - fleteDecl;   // (real − declarado) → va al bolsón de fijos
-  // tasa real opcional: vacía ⇒ igual a la declarada (no hay reclasificación → sin coima)
-  const realOr = (real, decl) => (real === '' || real === null || real === undefined) ? num(decl) : num(real);
+  // Override de declaración: vacío ⇒ usa el real (sin subfacturación / sin coima).
+  const eff = (ov, real) => (ov === '' || ov === null || ov === undefined) ? num(real) : num(ov);
 
   const rows = PRODS.map(p => {
     const cant = num(p.cantidad);
-    return { p, cant, pesoT: num(p.peso_u) * cant, fobDeclT: num(p.fob_decl_u) * cant, fobRealT: num(p.fob_real_u) * cant };
+    return { p, cant, pesoT: num(p.peso_u) * cant, fobDeclT: eff(p.fob_decl_u, p.fob_real_u) * cant, fobRealT: num(p.fob_real_u) * cant };
   });
   const sPeso = rows.reduce((s, r) => s + r.pesoT, 0);
   const sFob = rows.reduce((s, r) => s + r.fobDeclT, 0);
@@ -91,22 +91,23 @@ function calc() {
 
   rows.forEach(r => {
     const p = r.p;
-    r.derechos = r.cif * num(p.derechos_pct) / 100;
-    r.estadistica = r.cif * num(p.estadistica_pct) / 100;
+    // Tasas: el campo primario es el REAL; el declarado es override (vacío = real).
+    r.derechos = r.cif * eff(p.derechos_pct_decl, p.derechos_pct) / 100;       // lo que PAGÁS (declarado)
+    r.estadistica = r.cif * eff(p.estadistica_pct_decl, p.estadistica_pct) / 100;
     r.impInternos = r.cif * num(p.imp_internos_pct) / 100;       // se trata como derechos
     r.baseIva = r.cif + r.derechos + r.estadistica + r.impInternos;
     r.iva = r.baseIva * num(p.iva_pct) / 100;
     r.iibb = r.baseIva * iibbPct;
     r.ganancias = r.baseIva * ganPct;
-    // Reclasificación de posición: ahorro = (real − declarado) de derechos+estad; coima = % del ahorro.
-    r.derReal = r.cif * realOr(p.derechos_pct_real, p.derechos_pct) / 100;
-    r.estReal = r.cif * realOr(p.estadistica_pct_real, p.estadistica_pct) / 100;
+    // Reclasificación: ahorro = (real − declarado) de derechos+estad; coima = % del ahorro.
+    r.derReal = r.cif * num(p.derechos_pct) / 100;
+    r.estReal = r.cif * num(p.estadistica_pct) / 100;
     r.ahorro = (r.derReal - r.derechos) + (r.estReal - r.estadistica);
     r.coima = r.ahorro * coimaPct;                                // capitaliza, SIN crédito
     // El COSTO de flete usa el DECLARADO (por peso); la diferencia ya está en el bolsón.
     r.fleteCosto = r.fleteDeclShare;
     r.fijo = FIJOS_MODO === 'pct' ? num(p.fijo_asignado) / 100 * bolson : num(p.fijo_asignado);
-    r.noDeclarado = (num(p.fob_real_u) - num(p.fob_decl_u)) * r.cant;
+    r.noDeclarado = r.fobRealT - r.fobDeclT;
     // Despachante NO es línea propia del costo: vive dentro de r.fijo (bolsón).
     r.costoUsd = r.fobRealT + r.fleteCosto + r.seguro + r.derechos + r.estadistica + r.impInternos + r.coima + r.fijo;
     r.creditoUsd = r.iva + r.iibb + r.ganancias;
@@ -219,7 +220,7 @@ function nuevaSim(repaint = true) {
 // ── Serialización ───────────────────────────────────────────────────────
 function buildDatos() {
   return {
-    v: 1,
+    v: 2,
     params: {
       tc: num(P.tc), flete_declarado_usd: num(P.flete_declarado_usd), flete_real_usd: num(P.flete_real_usd),
       seguro_pct: num(P.seguro_pct), seguro_monto: num(P.seguro_monto),
@@ -229,14 +230,17 @@ function buildDatos() {
     fijos: FIJOS.map(f => ({ concepto: f.concepto || '', monto_usd: num(f.monto_usd) })),
     fijos_modo: FIJOS_MODO,
     fijos_criterio: FIJOS_CRIT,
-    productos: PRODS.map(p => ({
-      nombre: p.nombre || '', fob_decl_u: num(p.fob_decl_u), fob_real_u: num(p.fob_real_u),
-      cantidad: num(p.cantidad), peso_u: num(p.peso_u), derechos_pct: num(p.derechos_pct),
-      estadistica_pct: num(p.estadistica_pct), imp_internos_pct: num(p.imp_internos_pct),
-      derechos_pct_real: p.derechos_pct_real === '' || p.derechos_pct_real == null ? null : num(p.derechos_pct_real),
-      estadistica_pct_real: p.estadistica_pct_real === '' || p.estadistica_pct_real == null ? null : num(p.estadistica_pct_real),
-      iva_pct: num(p.iva_pct), fijo_asignado: num(p.fijo_asignado)
-    })),
+    productos: PRODS.map(p => {
+      const ov = x => (x === '' || x == null) ? null : num(x);
+      return {
+        nombre: p.nombre || '', fob_real_u: num(p.fob_real_u), fob_decl_u: ov(p.fob_decl_u),
+        cantidad: num(p.cantidad), peso_u: num(p.peso_u),
+        derechos_pct: num(p.derechos_pct), derechos_pct_decl: ov(p.derechos_pct_decl),
+        estadistica_pct: num(p.estadistica_pct), estadistica_pct_decl: ov(p.estadistica_pct_decl),
+        imp_internos_pct: num(p.imp_internos_pct), iva_pct: num(p.iva_pct),
+        fijo_asignado: num(p.fijo_asignado), declaro_distinto: !!p.declaro_distinto
+      };
+    }),
     pagos: PAGOS.map(pg => ({ concepto: pg.concepto || '', monto: num(pg.monto), moneda: pg.moneda === 'ARS' ? 'ARS' : 'USD', tc: num(pg.tc) }))
   };
 }
@@ -252,7 +256,7 @@ function loadDatos(d) {
   FIJOS = (d.fijos || []).map(f => ({ concepto: f.concepto || '', monto_usd: f.monto_usd ?? '' }));
   FIJOS_MODO = d.fijos_modo === 'monto' ? 'monto' : 'pct';
   FIJOS_CRIT = d.fijos_criterio === 'fob' ? 'fob' : 'kg';
-  PRODS = (d.productos || []).map(p => ({ ...blankProd(), ...p, derechos_pct_real: p.derechos_pct_real ?? '', estadistica_pct_real: p.estadistica_pct_real ?? '', _open: false }));
+  PRODS = (d.productos || []).map(p => num(d.v) >= 2 ? loadProdV2(p) : migrarProdV1(p));
   if (!PRODS.length) PRODS = [blankProd()];
   // Compat: pagos viejos sin tc → toman el TC general guardado como fallback.
   PAGOS = (d.pagos || []).map(pg => ({
@@ -261,6 +265,38 @@ function loadDatos(d) {
     tc: (pg.tc ?? '') === '' || num(pg.tc) === 0 ? (pa.tc ?? '') : pg.tc
   }));
   _prevBolson = bolsonEfectivo();
+}
+
+function loadProdV2(p) {
+  return {
+    ...blankProd(),
+    nombre: p.nombre || '', fob_real_u: p.fob_real_u ?? '', fob_decl_u: p.fob_decl_u ?? '',
+    cantidad: p.cantidad ?? '', peso_u: p.peso_u ?? '',
+    derechos_pct: p.derechos_pct ?? '', derechos_pct_decl: p.derechos_pct_decl ?? '',
+    estadistica_pct: p.estadistica_pct ?? '', estadistica_pct_decl: p.estadistica_pct_decl ?? '',
+    imp_internos_pct: p.imp_internos_pct ?? '', iva_pct: p.iva_pct ?? 21,
+    fijo_asignado: p.fijo_asignado ?? 0, declaro_distinto: !!p.declaro_distinto, _open: false
+  };
+}
+// Migración v1→v2: en v1 el campo primario era el DECLARADO y el real era opcional.
+// En v2 el primario es el REAL y el declarado es override. Preserva resultados.
+function migrarProdV1(p) {
+  const realDer = (p.derechos_pct_real == null || p.derechos_pct_real === '') ? num(p.derechos_pct) : num(p.derechos_pct_real);
+  const ovDer = num(p.derechos_pct) !== realDer ? num(p.derechos_pct) : '';
+  const realEst = (p.estadistica_pct_real == null || p.estadistica_pct_real === '') ? num(p.estadistica_pct) : num(p.estadistica_pct_real);
+  const ovEst = num(p.estadistica_pct) !== realEst ? num(p.estadistica_pct) : '';
+  const realFob = (p.fob_real_u == null || p.fob_real_u === '' || num(p.fob_real_u) === 0) ? num(p.fob_decl_u) : num(p.fob_real_u);
+  const ovFob = num(p.fob_decl_u) !== realFob ? num(p.fob_decl_u) : '';
+  return {
+    ...blankProd(),
+    nombre: p.nombre || '', fob_real_u: realFob || '', fob_decl_u: ovFob,
+    cantidad: p.cantidad ?? '', peso_u: p.peso_u ?? '',
+    derechos_pct: realDer || '', derechos_pct_decl: ovDer,
+    estadistica_pct: realEst || '', estadistica_pct_decl: ovEst,
+    imp_internos_pct: p.imp_internos_pct ?? '', iva_pct: p.iva_pct ?? 21,
+    fijo_asignado: p.fijo_asignado ?? 0,
+    declaro_distinto: ovDer !== '' || ovEst !== '' || ovFob !== '', _open: false
+  };
 }
 
 async function guardar() {
@@ -365,13 +401,14 @@ function render() {
   root.querySelector('#imp-listar').addEventListener('click', abrirListado);
   root.querySelector('#imp-guardar').addEventListener('click', guardar);
 
+  bindDelegation(document.getElementById('imp-body'));   // una sola vez por render
   renderBody();
 }
 
 function renderBody() {
   const body = document.getElementById('imp-body');
   body.innerHTML = paramsCard() + fijosCard() + prodsSection() + totalesCard() + reclasifCard() + tablaTotalCard() + pagosCard();
-  bindDelegation(body);
+  pintarPills();
   paint();
 }
 
@@ -443,8 +480,21 @@ function prodsSection() {
 
 function prodCard(p, i) {
   const fnum = (f, lbl, hint = '') => field(lbl, inpNum('prod', i, f, p[f]), hint);
+  const ivaVal = num(p.iva_pct);
+  const ivaSel = `<select class="imp-in imp-sel" data-k="prod" data-i="${i}" data-f="iva_pct">
+      <option value="21" ${ivaVal === 21 ? 'selected' : ''}>21 %</option>
+      <option value="10.5" ${ivaVal === 10.5 ? 'selected' : ''}>10,5 %</option>
+      ${ivaVal !== 21 && ivaVal !== 10.5 ? `<option value="${esc(p.iva_pct)}" selected>${esc(p.iva_pct)} %</option>` : ''}
+    </select>`;
+  const chk = `<label class="imp-chk"><input type="checkbox" data-k="prod" data-i="${i}" data-f="declaro_distinto" ${p.declaro_distinto ? 'checked' : ''}> Declaro distinto (subfacturación / reclasificación)</label>`;
+  const overrides = `<div class="imp-prod-override" style="display:${p.declaro_distinto ? 'grid' : 'none'}">
+      ${fnum('fob_decl_u', 'FOB declarado u', 'lo que declarás (≤ real)')}
+      ${fnum('derechos_pct_decl', 'Derechos declarado %', 'lo que pagás')}
+      ${fnum('estadistica_pct_decl', 'Estad. declarado %', 'lo que pagás')}
+    </div>`;
   return `<div class="card imp-prod" data-row="${i}">
     <div class="imp-prod-head">
+      <span class="imp-prod-num">${i + 1}</span>
       <input class="imp-in imp-prod-nombre" data-k="prod" data-i="${i}" data-f="nombre" value="${esc(p.nombre)}" placeholder="Nombre del producto">
       <div class="imp-prod-cost">
         <div class="imp-cost-usd"><span class="imp-cost-lbl">Costo unit.</span><b id="pu-usd-${i}" class="imp-mono"></b></div>
@@ -455,17 +505,16 @@ function prodCard(p, i) {
     <div class="imp-prod-grid">
       ${fnum('cantidad', 'Cantidad')}
       ${fnum('peso_u', 'Peso u (kg)')}
-      ${fnum('fob_decl_u', 'FOB decl. u (USD)')}
-      ${fnum('fob_real_u', 'FOB real u (USD)')}
+      ${fnum('fob_real_u', 'FOB u (USD)')}
       ${fnum('derechos_pct', 'Derechos %')}
       ${fnum('estadistica_pct', 'Estadística %')}
       ${fnum('imp_internos_pct', 'Imp. int. %')}
-      ${fnum('derechos_pct_real', 'Der. real %', 'opc. · posición real')}
-      ${fnum('estadistica_pct_real', 'Estad. real %', 'opc. · posición real')}
-      ${fnum('iva_pct', 'IVA %')}
+      ${field('IVA %', ivaSel)}
       ${field(`<span class="imp-fijo-lbl">Fijo ${FIJOS_MODO === 'pct' ? '%' : '$'}</span>`,
         `<input class="imp-in" id="prodfijo-${i}" data-k="prod" data-i="${i}" data-f="fijo_asignado" type="number" step="any" inputmode="decimal" value="${esc(p.fijo_asignado)}">`)}
     </div>
+    ${chk}
+    ${overrides}
     <div class="imp-prod-foot">
       <button class="imp-exp" data-act="exp" data-i="${i}">${p._open ? '▾ Ocultar detalle' : '▸ Ver detalle'}</button>
       <div class="imp-prod-tot">Costo total: <b id="pt-usd-${i}" class="imp-mono"></b></div>
@@ -699,7 +748,15 @@ function bindDelegation(body) {
       }
     }
     else if (k === 'fijo') { FIJOS[i][f] = v; if (f === 'monto_usd') { onBolsonChanged(); syncProdFijoInputs(); } }
-    else if (k === 'prod') PRODS[i][f] = v;
+    else if (k === 'prod') {
+      if (f === 'declaro_distinto') {
+        PRODS[i].declaro_distinto = t.checked;
+        if (!t.checked) { PRODS[i].fob_decl_u = ''; PRODS[i].derechos_pct_decl = ''; PRODS[i].estadistica_pct_decl = ''; }
+        renderBody();
+        return;
+      }
+      PRODS[i][f] = v;
+    }
     else if (k === 'pago') {
       PAGOS[i][f] = v;
       if (f === 'moneda') {
@@ -740,7 +797,6 @@ function bindDelegation(body) {
       case 'repartir': repartirResto(); syncProdFijoInputs(); paint(); break;
     }
   });
-  pintarPills();
 }
 
 // ── Estilo scopeado (imp-*) ──────────────────────────────────────────────
@@ -755,6 +811,12 @@ function inyectarEstilo() {
     .imp-in{width:100%;box-sizing:border-box;padding:9px 11px;border:1px solid #E7E5E4;border-radius:8px;font-size:14px;font-family:inherit;background:#fff;color:#1C1917}
     .imp-in:focus{outline:none;border-color:#D97706;box-shadow:0 0 0 3px rgba(217,118,6,.12)}
     .imp-in:disabled{background:#F5F5F4;color:#A8A29E}
+    .imp-in[type=number]::-webkit-inner-spin-button,.imp-in[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+    .imp-in[type=number]{-moz-appearance:textfield;appearance:textfield}
+    .imp-chk{display:flex;align-items:center;gap:8px;font-size:13px;color:#57534E;margin-top:14px;cursor:pointer}
+    .imp-chk input{width:16px;height:16px;accent-color:#D97706;cursor:pointer}
+    .imp-prod-override{grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:13px;margin-top:12px;padding:14px;background:#FBF4E9;border:1px dashed #EBD9BC;border-radius:10px}
+    .imp-prod-num{flex:none;width:26px;height:26px;border-radius:7px;background:#D97706;color:#fff;font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center}
 
     /* Topbar */
     .imp-topbar{display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap}
@@ -819,7 +881,7 @@ function inyectarEstilo() {
 
     /* Productos como tarjetas */
     .imp-prods-head{display:flex;justify-content:space-between;align-items:center;margin:4px 2px 12px}
-    .imp-prod{padding:16px 18px;margin-bottom:14px}
+    .imp-prod{padding:16px 18px;margin-bottom:14px;border-left:4px solid #D97706;background:#FFFDFB}
     .imp-prod-head{display:flex;align-items:center;gap:14px;margin-bottom:14px}
     .imp-prod-nombre{flex:1;font-size:15px;font-weight:500}
     .imp-prod-cost{text-align:right;flex:none;line-height:1.25}
