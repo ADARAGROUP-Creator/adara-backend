@@ -407,7 +407,7 @@ function render() {
 
 function renderBody() {
   const body = document.getElementById('imp-body');
-  body.innerHTML = paramsCard() + fijosCard() + prodsSection() + totalesCard() + reclasifCard() + tablaTotalCard() + pagosCard();
+  body.innerHTML = paramsCard() + fijosCard() + prodsSection() + resumenProductosCard() + totalesCard() + reclasifCard() + tablaTotalCard() + pagosCard();
   pintarPills();
   paint();
 }
@@ -525,6 +525,23 @@ function prodCard(p, i) {
   </div>`;
 }
 
+function resumenProductosCard() {
+  return `<div class="card imp-card">
+    <div class="card-title">Costo final por producto</div>
+    <div class="table-wrap"><table class="t imp-resumen">
+      <thead><tr>
+        <th>#</th><th>Producto</th>
+        <th style="text-align:right">Cant.</th>
+        <th style="text-align:right">Costo unit. USD</th>
+        <th style="text-align:right">Costo unit. ARS</th>
+        <th style="text-align:right">Costo total USD</th>
+        <th style="text-align:right">Costo total ARS</th>
+      </tr></thead>
+      <tbody id="imp-resumen-body"></tbody>
+    </table></div>
+  </div>`;
+}
+
 function totalesCard() {
   return `<div class="card imp-card imp-totales">
     <div class="imp-tot-block imp-tot-costo">
@@ -634,6 +651,26 @@ function paint() {
     }
   });
 
+  // Resumen de costo final por producto
+  const rb = document.getElementById('imp-resumen-body');
+  if (rb) {
+    rb.innerHTML = c.rows.map((r, i) => `
+      <tr>
+        <td class="imp-muted">${i + 1}</td>
+        <td>${esc(PRODS[i].nombre) || '<span class="imp-muted">(sin nombre)</span>'}</td>
+        <td class="imp-mono" style="text-align:right">${num(PRODS[i].cantidad).toLocaleString('es-AR')}</td>
+        <td class="imp-mono" style="text-align:right">${usd(r.costoUnitUsd)}</td>
+        <td class="imp-mono" style="text-align:right">${ars(r.costoUnitArs)}</td>
+        <td class="imp-mono" style="text-align:right">${usd(r.costoUsd)}</td>
+        <td class="imp-mono" style="text-align:right">${ars(r.costoUsd * c.tc)}</td>
+      </tr>`).join('') +
+      `<tr class="imp-resumen-tot">
+        <td></td><td>Total</td><td></td><td></td><td></td>
+        <td class="imp-mono" style="text-align:right">${usd(c.costoTotUsd)}</td>
+        <td class="imp-mono" style="text-align:right">${ars(c.costoTotArs)}</td>
+      </tr>`;
+  }
+
   set('imp-tot-costo-usd', usd(c.costoTotUsd));
   set('imp-tot-costo-ars', ars(c.costoTotArs));
   set('imp-tot-cred-usd', usd(c.credTotUsd));
@@ -693,34 +730,30 @@ function detalleHTML(r, tc) {
       <td class="imp-mono">${usd(u(totU))}</td><td class="imp-mono">${usd(totU)}</td>
       <td class="imp-mono">${ars(u(totU) * tc)}</td><td class="imp-mono">${ars(totU * tc)}</td>
     </tr>`;
-  const head = `<thead><tr><th></th><th>USD unit</th><th>USD total</th><th>ARS unit</th><th>ARS total</th></tr></thead>`;
-  return `<div class="imp-det-grid">
-    <div class="imp-det-col">
-      <div class="imp-det-h">Costo s/IVA (capitaliza al lote)</div>
-      <div class="imp-dt-wrap"><table class="imp-dt">${head}<tbody>
-        ${line('FOB declarado', r.fobDeclT)}
-        ${line('No declarado (subfact.)', r.noDeclarado)}
-        ${line('Flete declarado (por peso)', r.fleteCosto)}
-        ${line('Seguro', r.seguro)}
-        ${line('Derechos', r.derechos)}
-        ${line('Estadística', r.estadistica)}
-        ${line('Imp. internos', r.impInternos)}
-        ${line('Coima clasificación', r.coima)}
-        ${line('Fijos (incl. flete-dif. + despachante)', r.fijo)}
-        ${line('Costo s/IVA', r.costoUsd, true)}
-      </tbody></table></div>
-    </div>
-    <div class="imp-det-col">
-      <div class="imp-det-h">Crédito fiscal (NO es costo → Posición Fiscal)</div>
-      <div class="imp-dt-wrap"><table class="imp-dt">${head}<tbody>
-        ${line('IVA', r.iva)}
-        ${line('IIBB percepción', r.iibb)}
-        ${line('Ganancias percepción', r.ganancias)}
-        ${line('Crédito fiscal', r.creditoUsd, true)}
-      </tbody></table></div>
-      <div class="imp-det-cif">CIF del producto: <b class="imp-mono">${usd(r.cif)}</b></div>
-    </div>
-  </div>`;
+  const sec = (lbl, cls) => `<tr class="imp-dt-section ${cls}"><td colspan="5">${lbl}</td></tr>`;
+  return `<div class="imp-dt-wrap"><table class="imp-dt">
+    <thead><tr><th></th><th>USD unit</th><th>USD total</th><th>ARS unit</th><th>ARS total</th></tr></thead>
+    <tbody>
+      ${sec('Costo s/IVA (capitaliza al lote)', 'imp-dt-cap')}
+      ${line('FOB declarado', r.fobDeclT)}
+      ${line('No declarado (subfact.)', r.noDeclarado)}
+      ${line('Flete declarado (por peso)', r.fleteCosto)}
+      ${line('Seguro', r.seguro)}
+      ${line('Derechos', r.derechos)}
+      ${line('Estadística', r.estadistica)}
+      ${line('Imp. internos', r.impInternos)}
+      ${line('Coima clasificación', r.coima)}
+      ${line('Fijos (incl. flete-dif. + despachante)', r.fijo)}
+      ${line('Costo s/IVA', r.costoUsd, true)}
+      ${sec('Crédito fiscal (no es costo → Posición Fiscal)', 'imp-dt-cred')}
+      ${line('IVA', r.iva)}
+      ${line('IIBB percepción', r.iibb)}
+      ${line('Ganancias percepción', r.ganancias)}
+      ${line('Crédito fiscal', r.creditoUsd, true)}
+      ${sec('Bases', 'imp-dt-base')}
+      <tr><td>CIF del producto</td><td colspan="4" class="imp-mono" style="text-align:right">${usd(r.cif)}</td></tr>
+    </tbody>
+  </table></div>`;
 }
 
 // ── Delegación de eventos ────────────────────────────────────────────────
@@ -897,17 +930,20 @@ function inyectarEstilo() {
 
     /* Detalle expandible */
     .imp-detail{margin-top:14px;background:#FCFBF9;border:1px solid #F0EEEC;border-radius:10px;padding:16px}
-    .imp-det-grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}
-    .imp-det-h{font-size:11px;font-weight:700;color:#854F0B;text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px}
-    .imp-det-col:nth-child(2) .imp-det-h{color:#0C447C}
     .imp-dt-wrap{overflow-x:auto}
-    .imp-dt{width:100%;border-collapse:collapse;font-size:12.5px}
-    .imp-dt th{text-align:right;color:#A8A29E;font-weight:600;font-size:10.5px;padding:4px 8px;border-bottom:1px solid #EAE8E6;white-space:nowrap}
+    .imp-dt{width:100%;border-collapse:collapse;font-size:13px}
+    .imp-dt th{text-align:right;color:#A8A29E;font-weight:600;font-size:10.5px;padding:4px 10px;border-bottom:1px solid #EAE8E6;white-space:nowrap}
     .imp-dt th:first-child{text-align:left}
-    .imp-dt td{padding:5px 8px;text-align:right;color:#44403C;white-space:nowrap}
+    .imp-dt td{padding:5px 10px;text-align:right;color:#44403C;white-space:nowrap}
     .imp-dt td:first-child{text-align:left;color:#1C1917}
     .imp-d-strong td{font-weight:700;border-top:1px solid #E0DDDA;color:#1C1917}
-    .imp-det-cif{margin-top:10px;font-size:13px;color:#78716C;text-align:right}
+    .imp-dt-section td{font-weight:700;font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;text-align:left;padding-top:12px;border-bottom:1px solid #EAE8E6}
+    .imp-dt-cap td{color:#854F0B}
+    .imp-dt-cred td{color:#0C447C}
+    .imp-dt-base td{color:#78716C}
+    /* Resumen por producto */
+    #imp-body table.imp-resumen tbody td{font-size:14px;padding:8px 10px}
+    .imp-resumen-tot td{background:#F5F4F2;font-weight:700;border-top:2px solid #E7E5E4}
 
     /* Totales */
     .imp-totales{display:grid;grid-template-columns:1fr 1fr;gap:18px}
@@ -935,7 +971,7 @@ function inyectarEstilo() {
     .imp-badge-conf{background:#E1F5EE;color:#0F6E56}
 
     @media(max-width:720px){
-      .imp-det-grid,.imp-totales{grid-template-columns:1fr}
+      .imp-totales{grid-template-columns:1fr}
       .imp-prod-head{flex-wrap:wrap}
       .imp-pago-headrow{display:none}
       .imp-pago-item{grid-template-columns:1fr 1fr;gap:8px}
