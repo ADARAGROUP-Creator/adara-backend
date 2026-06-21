@@ -17,6 +17,7 @@ import { sbGet, sbPatch } from '../core/sb.js';
 let DATA = [];            // filas de v_gastos_ap
 let LINEAS = [];          // lineas_negocio
 let LINEA_LABEL = {};     // id -> label
+let CANALES = [];         // canales (maestro, FK de gasto_imputacion.canal)
 let CUENTAS = [];         // cuentas (para "cuenta origen intención")
 let PROVEEDORES = [];     // proveedores (opcional, puede estar vacío)
 let FILTRO = { periodo: '', categoria: '', linea: '', estado: '', q: '' };
@@ -111,6 +112,7 @@ export async function loadGastos() {
   try {
     LINEAS = await sbGet('lineas_negocio', 'order=id.asc');
     LINEA_LABEL = Object.fromEntries(LINEAS.map(l => [l.id, lineaLabel(l)]));
+    CANALES = await sbGet('canales', 'order=codigo.asc').catch(() => []);
     CUENTAS = await sbGet('cuentas', 'order=id.asc');
     PROVEEDORES = await sbGet('proveedores', 'order=id.asc').catch(() => []);
     await recargar();
@@ -147,7 +149,7 @@ function render() {
   // Tabla: período + resto de filtros
   const filtrados = delPeriodo.filter(g => {
     if (FILTRO.categoria && g.categoria_codigo !== FILTRO.categoria) return false;
-    if (FILTRO.linea && String(g.linea_id) !== FILTRO.linea) return false;
+    if (FILTRO.linea && !(Array.isArray(g.imputaciones) && g.imputaciones.some(i => String(i.linea_id) === FILTRO.linea))) return false;
     if (FILTRO.estado && g.estado_pago !== FILTRO.estado) return false;
     if (FILTRO.q) {
       const txt = `${g.descripcion || ''} ${CAT_LABEL[g.categoria_codigo] || ''} ${g.nro_comprobante || ''}`.toLowerCase();
@@ -222,7 +224,7 @@ function filaHTML(g) {
     <td>${(g.fecha || '').slice(8, 10)}/${(g.fecha || '').slice(5, 7)}</td>
     <td>${esc(g.descripcion || '—')} <span class="gas-comp">· ${comp}</span></td>
     <td><span class="gas-tag">${esc(CAT_LABEL[g.categoria_codigo] || g.categoria_codigo)}</span></td>
-    <td class="gas-muted">${esc(LINEA_LABEL[g.linea_id] || ('#' + g.linea_id))}</td>
+    <td class="gas-muted">${esc(g.lineas_resumen || '—')}</td>
     <td style="text-align:right" class="gas-mono">${fmtMonto(totalOrigen, g.moneda)}</td>
     <td><span class="gas-badge gas-badge-${estado}">${LABEL_ESTADO[estado] || estado}</span></td>
     <td style="text-align:right"><button class="gas-anular" data-id="${g.id}" title="Anular">Anular</button></td>
@@ -270,9 +272,18 @@ function openModalNuevo() {
         <div class="field"><label>Comprobante</label><select class="select" id="g-comp">${optComp}</select></div>
       </div>
 
-      <div class="gas-grid2">
-        <div class="field"><label>Categoría</label><select class="select" id="g-cat">${optCat}</select></div>
-        <div class="field"><label>Línea de negocio</label><select class="select" id="g-linea">${optLinea}</select></div>
+      <div class="field"><label>Categoría</label><select class="select" id="g-cat">${optCat}</select></div>
+
+      <div class="gas-imp">
+        <div class="gas-imp-h">
+          <span>Imputación por línea / canal</span>
+          <div>
+            <button type="button" class="gas-imp-eq" id="g-imp-eq">repartir equitativo</button>
+            <button type="button" class="gas-addfisc" id="g-imp-add">+ agregar</button>
+          </div>
+        </div>
+        <div id="g-imp-rows"></div>
+        <div class="gas-imp-total" id="g-imp-total"></div>
       </div>
 
       <div class="field"><label>Descripción</label><input class="input" id="g-desc" type="text" placeholder="Ej: alquiler depósito mayo"></div>
@@ -465,13 +476,59 @@ function openModalNuevo() {
   aplicarMoneda();
   recalc();
 
+  // Imputaciones (línea + canal opcional + %). El % reparte el gasto completo:
+  // neto al P&L por línea/canal; IVA y perc/ret al ledger fiscal por línea.
+  const optCanal = '<option value="">Toda la línea</option>' + CANALES.map(c => `<option value="${c.codigo}">${esc(c.nombre)}</option>`).join('');
+  const optLineaImp = '<option value="">Línea…</option>' + LINEAS.map(l => `<option value="${l.id}">${esc(LINEA_LABEL[l.id])}</option>`).join('');
+
+  function leerImput() {
+    return [...overlay.querySelectorAll('.gas-imp-row')].map(r => ({
+      linea_id: r.querySelector('.gas-i-linea').value ? +r.querySelector('.gas-i-linea').value : null,
+      canal: r.querySelector('.gas-i-canal').value || null,
+      porcentaje: parseFloat(r.querySelector('.gas-i-pct').value)
+    }));
+  }
+  function recalcImp() {
+    const suma = Math.round(leerImput().reduce((s, x) => s + (x.porcentaje || 0), 0) * 100) / 100;
+    const ok = Math.abs(suma - 100) < 0.01;
+    $('#g-imp-total').innerHTML = `Σ ${suma.toLocaleString('es-AR', { maximumFractionDigits: 2 })}% `
+      + (ok ? '<span class="gas-i-ok">✓</span>' : '<span class="gas-i-bad">debe sumar 100%</span>');
+  }
+  function addImpRow(pct) {
+    const row = document.createElement('div');
+    row.className = 'gas-imp-row';
+    row.innerHTML = `
+      <select class="select gas-i-linea">${optLineaImp}</select>
+      <select class="select gas-i-canal">${optCanal}</select>
+      <input class="input gas-i-pct" type="number" min="0" max="100" step="0.01" placeholder="%" value="${pct != null ? pct : ''}">
+      <button type="button" class="gas-i-del" title="Quitar">✕</button>`;
+    $('#g-imp-rows').appendChild(row);
+    row.querySelector('.gas-i-pct').addEventListener('input', recalcImp);
+    row.querySelector('.gas-i-del').addEventListener('click', () => { row.remove(); recalcImp(); });
+    recalcImp();
+  }
+  function repartirEquitativo() {
+    const inps = [...overlay.querySelectorAll('.gas-imp-row .gas-i-pct')];
+    const n = inps.length;
+    if (!n) return;
+    const base = Math.floor((100 / n) * 100) / 100;
+    let acc = 0;
+    inps.forEach((inp, i) => {
+      if (i === n - 1) { inp.value = Math.round((100 - acc) * 100) / 100; }
+      else { inp.value = base; acc = Math.round((acc + base) * 100) / 100; }
+    });
+    recalcImp();
+  }
+  $('#g-imp-add').addEventListener('click', () => addImpRow());
+  $('#g-imp-eq').addEventListener('click', repartirEquitativo);
+  addImpRow(100);   // arranca con un renglón al 100%
+
   // Guardar
   $('#g-guardar').addEventListener('click', async () => {
     const tipo_comprobante = compSel.value;
     const esA = tipo_comprobante === 'factura_a';
     const fecha = $('#g-fecha').value;
     const categoria_codigo = $('#g-cat').value;
-    const linea_id = $('#g-linea').value;
     const descripcion = $('#g-desc').value.trim();
     const moneda = monedaSel.value;
     const neto = parseFloat(netoInp.value);
@@ -485,10 +542,18 @@ function openModalNuevo() {
     const nro_comprobante = $('#g-nro').value.trim() || null;
     const fiscal = leerFiscal();
 
+    const imputacionesRaw = leerImput();
+    const imputaciones = imputacionesRaw.filter(x => x.linea_id && x.porcentaje > 0);
+
     if (!fecha) { window.toast('Falta la fecha', 'error'); return; }
     if (!tipo_comprobante) { window.toast('Elegí el comprobante', 'error'); return; }
     if (!categoria_codigo) { window.toast('Elegí una categoría', 'error'); return; }
-    if (!linea_id) { window.toast('Elegí una línea', 'error'); return; }
+    if (imputacionesRaw.some(x => (x.porcentaje > 0 && !x.linea_id) || (x.linea_id && !(x.porcentaje > 0)))) {
+      window.toast('Cada imputación necesita línea y %', 'error'); return;
+    }
+    if (!imputaciones.length) { window.toast('Cargá al menos una imputación (línea + %)', 'error'); return; }
+    const sumaPct = Math.round(imputaciones.reduce((s, x) => s + x.porcentaje, 0) * 100) / 100;
+    if (Math.abs(sumaPct - 100) > 0.01) { window.toast(`Las imputaciones deben sumar 100% (suman ${sumaPct}%)`, 'error'); return; }
     if (!descripcion) { window.toast('Poné una descripción', 'error'); return; }
     if (!(neto > 0)) { window.toast('El monto tiene que ser mayor a 0', 'error'); return; }
     if (moneda === 'USD' && tipo_comprobante === 'sin_factura' && forma_pago === 'efectivo' && !(parseFloat(tcVal) > 0)) {
@@ -497,7 +562,6 @@ function openModalNuevo() {
 
     const gasto = {
       fecha,
-      linea_id: +linea_id,
       categoria_codigo,
       proveedor_id,
       descripcion,
@@ -517,7 +581,7 @@ function openModalNuevo() {
       const r = await fetch('/gastos', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ gasto, fiscal })
+        body: JSON.stringify({ gasto, fiscal, imputaciones })
       });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
@@ -561,6 +625,14 @@ function inyectarEstilo() {
     .gas-addfisc{font-size:12px;color:#D97706;background:none;border:0;cursor:pointer;font:inherit}
     .gas-fisc-row{display:grid;grid-template-columns:1fr 120px 28px;gap:8px;margin-bottom:6px;align-items:center}
     .gas-f-del{background:none;border:0;color:#A8A29E;cursor:pointer;font-size:14px}
+    .gas-imp{margin:10px 0;padding:10px 12px;background:#FAFAF9;border:1px solid #E7E5E4;border-radius:8px}
+    .gas-imp-h{display:flex;justify-content:space-between;align-items:center;font-size:13px;color:#57534E;margin-bottom:6px}
+    .gas-imp-eq{font-size:12px;color:#0C447C;background:none;border:0;cursor:pointer;font:inherit;margin-right:10px}
+    .gas-imp-row{display:grid;grid-template-columns:1fr 1fr 90px 28px;gap:8px;margin-bottom:6px;align-items:center}
+    .gas-i-del{background:none;border:0;color:#A8A29E;cursor:pointer;font-size:14px}
+    .gas-imp-total{font-size:13px;color:#57534E;text-align:right;margin-top:4px}
+    .gas-i-ok{color:#0F6E56;font-weight:600}
+    .gas-i-bad{color:#B91C1C;font-weight:600}
     .gas-resumen{margin:10px 0;padding:8px 12px;border:1px dashed #D6D3D1;border-radius:8px}
     .gas-res-r{display:flex;justify-content:space-between;font-size:13px;padding:2px 0;color:#57534E}
     .gas-res-strong{font-weight:600;color:#1C1917;border-top:1px solid #E7E5E4;margin-top:4px;padding-top:6px}
