@@ -3151,10 +3151,10 @@ app.post('/gastos', async (req, res) => {
   let gastoId = null;
   let movAutoId = null;
   try {
-    const { gasto, fiscal } = req.body || {};
+    const { gasto, fiscal, imputaciones } = req.body || {};
     if (!gasto) return res.status(400).json({ error: 'Falta el objeto gasto' });
 
-    const requeridos = ['fecha', 'linea_id', 'categoria_codigo', 'descripcion', 'tipo_comprobante', 'moneda', 'monto_neto'];
+    const requeridos = ['fecha', 'categoria_codigo', 'descripcion', 'tipo_comprobante', 'moneda', 'monto_neto'];
     for (const f of requeridos) {
       if (gasto[f] === undefined || gasto[f] === null || gasto[f] === '') {
         return res.status(400).json({ error: `Falta ${f}` });
@@ -3177,10 +3177,35 @@ app.post('/gastos', async (req, res) => {
       return res.status(400).json({ error: 'Efectivo sin factura en USD: falta el TC' });
     }
 
-    // 1) Gasto
+    // Imputaciones: el gasto se reparte por línea + canal opcional + %.
+    // El % reparte TODO el gasto (neto al P&L; IVA y perc/ret al ledger fiscal por línea).
+    // Back-compat: si no vienen imputaciones pero hay gasto.linea_id, se sintetiza
+    // un único renglón 100% a esa línea sin canal.
+    let imps = Array.isArray(imputaciones) ? imputaciones : [];
+    if (!imps.length && gasto.linea_id) imps = [{ linea_id: gasto.linea_id, canal: null, porcentaje: 100 }];
+    imps = imps
+      .filter(x => x && x.linea_id != null && Number(x.porcentaje) > 0)
+      .map(x => ({
+        linea_id: Number(x.linea_id),
+        canal: (x.canal === '' || x.canal == null) ? null : String(x.canal),
+        porcentaje: round2(x.porcentaje)
+      }));
+    if (!imps.length) return res.status(400).json({ error: 'Falta al menos una imputación (línea + %)' });
+    const sumaPct = round2(imps.reduce((s, x) => s + x.porcentaje, 0));
+    if (Math.abs(sumaPct - 100) > 0.01) {
+      return res.status(400).json({ error: `Las imputaciones deben sumar 100% (suman ${sumaPct}%)` });
+    }
+    // Canal válido (FK canales): pre-chequeo amistoso
+    const canalesValidos = (await sbGet('canales', 'select=codigo')).map(c => c.codigo);
+    for (const x of imps) {
+      if (x.canal != null && !canalesValidos.includes(x.canal)) {
+        return res.status(400).json({ error: `Canal inválido: ${x.canal}` });
+      }
+    }
+
+    // 1) Gasto (linea_id queda deprecado: la verdad vive en gasto_imputacion)
     const filaGasto = {
       fecha: gasto.fecha,
-      linea_id: gasto.linea_id,
       categoria_codigo: gasto.categoria_codigo,
       proveedor_id: gasto.proveedor_id || null,
       descripcion: gasto.descripcion,
@@ -3198,6 +3223,11 @@ app.post('/gastos', async (req, res) => {
     const g = Array.isArray(insGasto) ? insGasto[0] : insGasto;
     if (!g || !g.id) throw new Error('No se obtuvo el id del gasto');
     gastoId = g.id;
+
+    // 1b) Imputaciones (reparto por línea/canal). El % reparte el gasto completo.
+    await sbUpsert('gasto_imputacion', imps.map(x => ({
+      gasto_id: gastoId, linea_id: x.linea_id, canal: x.canal, porcentaje: x.porcentaje
+    })));
 
     // 2) Renglones fiscales
     if (lineasFiscales.length) {
@@ -3249,6 +3279,7 @@ app.post('/gastos', async (req, res) => {
         await sb('DELETE', 'movimientos', null, `id=eq.${movAutoId}`);
       }
       if (gastoId) {
+        await sb('DELETE', 'gasto_imputacion', null, `gasto_id=eq.${gastoId}`);
         await sb('DELETE', 'gasto_fiscal', null, `gasto_id=eq.${gastoId}`);
         await sb('DELETE', 'gastos', null, `id=eq.${gastoId}`);
       }
