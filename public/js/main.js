@@ -3,7 +3,7 @@ import { loadHome } from './screens/home.js';
 import { loadSkus } from './screens/skus.js';
 import { loadMovimientos } from './screens/movimientos.js';
 import { loadSaldos } from './screens/saldos.js';
-import { loadVentasML } from './screens/ventas-ml.js?v=dev5';
+import { loadVentasML } from './screens/ventas-ml.js?v=dev6';
 import { loadFlex } from './screens/flex.js';
 import { loadGastos } from './screens/gastos.js';
 import { loadConciliacion } from './screens/conciliacion.js';
@@ -46,11 +46,16 @@ function route() {
   return _routing;
 }
 
+// Qué item de nav resaltar para cada hash. Flex vive bajo "Mercado Libre"
+// (mismo item que Ventas ML), así que comparten el resaltado.
+const NAV_ALIAS = { flex: 'ventas_ml' };
+
 async function renderScreen(hash) {
   const screen = screens[hash] || screens.home;
-  // Actualizar nav activo
+  // Actualizar nav activo (con alias de grupo)
+  const navHash = NAV_ALIAS[hash] || hash;
   document.querySelectorAll('.nav-item').forEach(a => {
-    a.classList.toggle('active', a.getAttribute('href') === '#' + hash);
+    a.classList.toggle('active', a.getAttribute('href') === '#' + navHash);
   });
   // Actualizar topbar
   document.getElementById('topbar-title').textContent = screen.title;
