@@ -12,6 +12,7 @@ let PROVEEDORES = [], PROV_BY_ID = {};
 let SKUS = [], SKU_BY_ID = {};
 let COMPRAS = [];     // v_compras_ap
 let GASTOS_AP = [];   // v_gastos_ap (para cuenta corriente)
+let ADJ = {};         // adjuntos por compra: compra_id -> [{id, nombre}]
 let TAB = 'facturas';
 let FILTRO = { periodo: '', q: '' };
 
@@ -77,6 +78,20 @@ async function recargar() {
   PROV_BY_ID = Object.fromEntries(PROVEEDORES.map(p => [p.id, p]));
   COMPRAS = await sbGet('v_compras_ap', 'order=fecha.desc,compra_id.desc');
   GASTOS_AP = await sbGet('v_gastos_ap', 'select=proveedor_id,a_pagar_ars,vinculado_ars,saldo_pendiente_ars').catch(() => []);
+  ADJ = {};
+  try {
+    const adj = await sbGet('adjuntos', 'op_tipo=eq.compra&select=id,op_id,nombre&order=id.desc');
+    for (const a of (adj || [])) (ADJ[a.op_id] = ADJ[a.op_id] || []).push(a);
+  } catch { ADJ = {}; }
+}
+
+async function verAdjunto(id) {
+  try {
+    const r = await fetch('/adjuntos/' + id + '/url');
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.url) throw new Error(d.error || 'No se pudo abrir');
+    window.open(d.url, '_blank');
+  } catch (e) { window.toast('Error al abrir el adjunto: ' + e.message, 'error'); }
 }
 
 function estadoPago(c) {
@@ -156,6 +171,7 @@ function renderFacturas() {
   document.getElementById('cf-q').addEventListener('input', e => { FILTRO.q = e.target.value; renderFacturas(); });
   document.getElementById('cf-nueva').addEventListener('click', openAlta);
   document.querySelectorAll('.com-anular').forEach(b => b.addEventListener('click', () => anularCompra(+b.dataset.id)));
+  document.querySelectorAll('.com-clip').forEach(b => b.addEventListener('click', () => verAdjunto(+b.dataset.adj)));
   document.querySelectorAll('.com-asignar-fac').forEach(b => b.addEventListener('click', () => asignarFactura(+b.dataset.id)));
 }
 
@@ -176,7 +192,7 @@ function filaCompra(c) {
     <td style="text-align:right" class="com-mono com-muted">${money(c.pagado_ars)}</td>
     <td style="text-align:right" class="com-mono">${money(c.saldo_ap_ars)}</td>
     <td><span class="com-badge com-badge-${est}">${est}</span></td>
-    <td style="text-align:right">${c.tipo_compra === 'inicial' ? '' : `<button class="com-anular" data-id="${c.compra_id}" title="Anular compra" style="font-size:12px;color:#B91C1C;background:none;border:0;cursor:pointer;font:inherit;padding:2px 4px">Anular</button>`}</td>
+    <td style="text-align:right">${(ADJ[c.compra_id] && ADJ[c.compra_id].length) ? `<button class="com-clip" data-adj="${ADJ[c.compra_id][0].id}" title="Ver factura: ${esc(ADJ[c.compra_id][0].nombre)}">📎</button>` : ''}${c.tipo_compra === 'inicial' ? '' : `<button class="com-anular" data-id="${c.compra_id}" title="Anular compra" style="font-size:12px;color:#B91C1C;background:none;border:0;cursor:pointer;font:inherit;padding:2px 4px">Anular</button>`}</td>
   </tr>`;
 }
 
@@ -315,7 +331,8 @@ function openAlta() {
         </div>
         <div class="field" id="c-tc-wrap" style="display:none"><label>TC (USD→ARS)</label>
           <input class="input" id="c-tc" inputmode="decimal" placeholder="0,00"></div>
-        <div class="field"></div>
+        <div class="field"><label>Factura / comprobante (PDF o imagen)</label>
+          <input class="input" id="c-adjunto" type="file" accept="application/pdf,image/*"></div>
       </div>
 
       <div class="com-block">
@@ -623,6 +640,24 @@ function openAlta() {
       });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+
+      // Subir la factura adjunta (si se eligió un archivo)
+      const fileEl = $('#c-adjunto');
+      const file = fileEl && fileEl.files && fileEl.files[0];
+      if (file && data.compra_id) {
+        try {
+          const fd = new FormData();
+          fd.append('op_tipo', 'compra');
+          fd.append('op_id', String(data.compra_id));
+          fd.append('file', file);
+          const ra = await fetch('/adjuntos', { method: 'POST', body: fd });
+          if (!ra.ok) { const da = await ra.json().catch(() => ({})); throw new Error(da.error || (ra.status + '')); }
+        } catch (eAdj) {
+          window.toast('Compra guardada, pero la factura no se subió: ' + eAdj.message, 'error');
+          close(); await recargar(); render(); return;
+        }
+      }
+
       window.toast('Compra cargada');
       close();
       await recargar();
@@ -643,6 +678,8 @@ function inyectarEstilo() {
   if (document.getElementById('com-style')) return;
   const css = `
     .com-mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums}
+    .com-clip{font-size:14px;background:none;border:0;cursor:pointer;padding:2px 6px;margin-right:2px}
+    .com-clip:hover{opacity:.65}
     .com-muted{color:#78716C}
     .com-sub{font-size:13px;color:#78716C;margin:-4px 0 12px}
     .com-badge{font-size:12px;padding:2px 8px;border-radius:6px}
