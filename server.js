@@ -921,26 +921,34 @@ app.post('/ml/sync', async (req, res) => {
     // FIFO (fn_consumir_fifo, idempotente por unidades ya consumidas) y, por último, se
     // congela el CMV estimado de las ventas SIN FIFO real (fn_congelar_cmv_estimado,
     // idempotente por ON CONFLICT (venta_item_id) DO NOTHING). Orden obligatorio:
-    // proyectar → consumir → congelar (el FIFO necesita los venta_items; el congelado
-    // necesita saber qué quedó sin consumo FIFO). El FIFO solo consume ventas con fecha
-    // >= fecha_alta del lote (seed); las ventas sin lote se costean por costo_referencia
-    // y su CMV se congela acá para que un lote futuro NO recalcule meses ya cerrados
-    // (CF3/CF4). En un sync normal congela 0 (ya estaban congeladas). No bloquea el sync:
-    // si el costeo falla, se loguea y se sigue. Ver ADARA-COSTEO-FIFO.md.
+    // proyectar → reconciliar canceladas → consumir → congelar. La reconciliación
+    // (fn_reconciliar_ml_canceladas, regla P13) corre ANTES del FIFO: saca del resultado
+    // las órdenes que pasaron a 'cancelled' después de proyectadas (estado→'cancelada') y
+    // revierte el CMV de las que nunca salieron (no_preparado/preparado, regla S4). Como
+    // fn_consumir_fifo filtra estado in (aprobada,entregada), una vez flipeadas ya no se
+    // re-consumen y el reverso queda estable. Full-scan (sin ventana): una cancelación
+    // puede ser de una venta vieja fuera del rango del sync. Idempotente: solo toca
+    // estado='aprobada'. El FIFO solo consume ventas con fecha >= fecha_alta del lote
+    // (seed); las ventas sin lote se costean por costo_referencia y su CMV se congela acá
+    // para que un lote futuro NO recalcule meses ya cerrados (CF3/CF4). En un sync normal
+    // congela 0 (ya estaban congeladas). No bloquea el sync: si el costeo falla, se loguea
+    // y se sigue. Ver ADARA-COSTEO-FIFO.md y ADARA-CANCELACIONES-DEVOLUCIONES.md.
     let costeo = null;
     try {
       const efDesde = desde || new Date(Date.now() - (parseInt(dias) || 7) * 86400000).toISOString().split('T')[0];
       const efHasta = hasta || new Date().toISOString().split('T')[0];
       const proyectadas = await sbRpc('fn_proyectar_ml',          { p_desde: efDesde, p_hasta: efHasta });
+      const reconciliadas = await sbRpc('fn_reconciliar_ml_canceladas', {});
       const fifo        = await sbRpc('fn_consumir_fifo',         { p_desde: efDesde, p_hasta: efHasta });
       const congelados  = await sbRpc('fn_congelar_cmv_estimado', {});
       costeo = {
         desde: efDesde, hasta: efHasta,
         ventas_proyectadas: proyectadas,
+        canceladas_reconciliadas: Array.isArray(reconciliadas) ? reconciliadas[0] : reconciliadas,
         fifo: Array.isArray(fifo) ? fifo[0] : fifo,
         cmv_congelados: congelados
       };
-      console.log(`  → Costeo ${efDesde}…${efHasta}: ${proyectadas} ventas proyectadas; FIFO ${JSON.stringify(costeo.fifo)}; ${congelados} CMV congelados`);
+      console.log(`  → Costeo ${efDesde}…${efHasta}: ${proyectadas} ventas proyectadas; canceladas ${JSON.stringify(costeo.canceladas_reconciliadas)}; FIFO ${JSON.stringify(costeo.fifo)}; ${congelados} CMV congelados`);
     } catch (e) {
       console.warn('  → Costeo (proyección/FIFO/congelado) falló (no bloquea el sync):', e.message);
       costeo = { error: e.message };
