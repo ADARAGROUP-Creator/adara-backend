@@ -4,6 +4,7 @@ import { loadSkus } from './screens/skus.js';
 import { loadMovimientos } from './screens/movimientos.js';
 import { loadSaldos } from './screens/saldos.js';
 import { loadVentasML } from './screens/ventas-ml.js?v=dev5';
+import { loadFlex } from './screens/flex.js';
 import { loadGastos } from './screens/gastos.js';
 import { loadConciliacion } from './screens/conciliacion.js';
 import { loadCuadre } from './screens/cuadre.js';
@@ -20,6 +21,7 @@ const screens = {
   movimientos: { fn: loadMovimientos, title: 'Movimientos', sub: 'Extracto unificado de cuentas' },
   saldos: { fn: loadSaldos, title: 'Saldos', sub: 'Saldo por cuenta y carga del saldo de arranque' },
   ventas_ml: { fn: loadVentasML, title: 'Ventas ML', sub: 'Ventas de Mercado Libre y su cobro' },
+  flex: { fn: loadFlex, title: 'Flex', sub: 'Control semanal de envíos Flex contra el resumen del proveedor' },
   conciliacion: { fn: loadConciliacion, title: 'Conciliación', sub: 'Vincular movimientos con operaciones' },
   cuadre: { fn: loadCuadre, title: 'Cuadre', sub: 'Control de conciliación: semáforo por cuenta y cola priorizada' },
   gastos: { fn: loadGastos, title: 'Gastos', sub: 'Gastos operativos' },
