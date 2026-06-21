@@ -158,7 +158,8 @@ function render() {
     const p = r.periodo;
     if (!perMap[p]) perMap[p] = {
       periodo: p, ventas: 0, costeadas: 0,
-      ingreso: 0, cmv: 0, cmv_real: 0, cmv_estimado: 0, comision: 0, envio: 0, financiero: 0, impuestos: 0
+      ingreso: 0, cmv: 0, cmv_real: 0, cmv_estimado: 0, comision: 0, envio: 0, financiero: 0, impuestos: 0,
+      devoluciones: 0
     };
     const a = perMap[p];
     a.ventas    += num(r.ventas);
@@ -171,6 +172,7 @@ function render() {
     a.envio     += num(r.envio);
     a.financiero+= num(r.costo_financiero);
     a.impuestos += num(r.impuestos);
+    a.devoluciones += num(r.devoluciones);
   }
   const filas = Object.values(perMap).sort((a, b) => a.periodo.localeCompare(b.periodo));
   // Margen de contribución ANTES de CMV (deducciones vienen con signo negativo)
@@ -188,7 +190,8 @@ function render() {
   }
   for (const f of filas) {
     f.gastos = gastoPer[f.periodo] || 0;
-    f.resultado_op = f.contrib - f.cmv - f.gastos;  // cmv y gastos positivos: se restan
+    // devoluciones viene con signo real (P3): refund negativo resta, caso ganado positivo suma
+    f.resultado_op = f.contrib - f.cmv - f.gastos + f.devoluciones;
     f.pct = f.ingreso > 0 ? f.resultado_op / f.ingreso * 100 : 0;  // margen operativo real (s/ventas)
   }
 
@@ -198,11 +201,15 @@ function render() {
     ingreso: a.ingreso + f.ingreso, cmv: a.cmv + f.cmv, cmv_real: a.cmv_real + f.cmv_real, cmv_estimado: a.cmv_estimado + f.cmv_estimado, comision: a.comision + f.comision,
     envio: a.envio + f.envio, financiero: a.financiero + f.financiero,
     impuestos: a.impuestos + f.impuestos, contrib: a.contrib + f.contrib,
-    gastos: a.gastos + f.gastos, resultado_op: a.resultado_op + f.resultado_op,
-  }), { ventas: 0, costeadas: 0, ingreso: 0, cmv: 0, cmv_real: 0, cmv_estimado: 0, comision: 0, envio: 0, financiero: 0, impuestos: 0, contrib: 0, gastos: 0, resultado_op: 0 });
+    gastos: a.gastos + f.gastos, devoluciones: a.devoluciones + f.devoluciones, resultado_op: a.resultado_op + f.resultado_op,
+  }), { ventas: 0, costeadas: 0, ingreso: 0, cmv: 0, cmv_real: 0, cmv_estimado: 0, comision: 0, envio: 0, financiero: 0, impuestos: 0, contrib: 0, gastos: 0, devoluciones: 0, resultado_op: 0 });
   const Tpct = T.ingreso > 0 ? T.resultado_op / T.ingreso * 100 : 0;
 
   const moneyNeg = n => `<span class="neg">${fmtMoney(n)}</span>`;
+  // Devoluciones: signo real (P3). Negativo (refund) en rojo; cero como guion.
+  const devCell = n => num(n) === 0
+    ? '<span class="pend">—</span>'
+    : num(n) < 0 ? moneyNeg(n) : fmtMoney(n);
   const cmvCell = (cmv, est) => num(cmv) === 0
     ? `<span class="pend">pendiente</span>`
     : num(est) > 0
@@ -233,10 +240,11 @@ function render() {
         <td class="contrib">${fmtMoney(f.contrib)}</td>
         <td>${cmvCell(f.cmv, f.cmv_estimado)}</td>
         <td>${f.gastos ? moneyNeg(-f.gastos) : '<span class="pend">—</span>'}</td>
+        <td>${devCell(f.devoluciones)}</td>
         <td class="contrib">${fmtMoney(f.resultado_op)}</td>
         <td>${fmtPct(f.pct)}</td>
       </tr>${EXPANDED === f.periodo ? panelRow(f) : ''}`).join('')
-    : `<tr><td colspan="11" class="empty">${
+    : `<tr><td colspan="12" class="empty">${
         LINEA_SEL === '__all__'
           ? 'Todavía no hay ventas cargadas.'
           : `«${esc(LINEA_SEL)}» todavía no tiene ventas cargadas. Las ventas que no son de Mercado Libre (Tienda Nube, B2B, sindicatos) entran con el sync de Tango.`
@@ -252,6 +260,7 @@ function render() {
       <td class="contrib">${fmtMoney(T.contrib)}</td>
       <td>${cmvCell(T.cmv, T.cmv_estimado)}</td>
       <td>${T.gastos ? moneyNeg(-T.gastos) : '<span class="pend">—</span>'}</td>
+      <td>${devCell(T.devoluciones)}</td>
       <td class="contrib">${fmtMoney(T.resultado_op)}</td>
       <td>${fmtPct(Tpct)}</td>
     </tr>` : '';
@@ -291,6 +300,7 @@ function render() {
         <th>Contribución</th>
         <th>CMV</th>
         <th>Gastos</th>
+        <th>Devoluciones</th>
         <th>Resultado op.</th>
         <th>Margen %</th>
       </tr></thead>
@@ -300,7 +310,9 @@ function render() {
     <div class="cost-note">
       <b>Cómo leer esta tabla.</b> Cada fila es un mes (criterio devengado, montos sin IVA). De las ventas netas
       se restan las deducciones de Mercado Libre (→ <b>contribución</b>), después el <b>CMV</b> y los <b>gastos</b>
-      operativos, para llegar al <b>resultado operativo</b>. El CMV marcado <i>est.</i> está <b>estimado a costo
+      operativos, para llegar al <b>resultado operativo</b>. Las <b>devoluciones</b> se imputan al <b>mes del
+      reembolso</b> (no al de la venta) y solo netean reembolsos de ventas que siguen contadas; las canceladas ya
+      salieron del resultado y no se netean de nuevo. El CMV marcado <i>est.</i> está <b>estimado a costo
       actual</b> del SKU (no al costo histórico exacto de la unidad vendida), porque las ventas previas al stock de
       apertura no consumen lote; las ventas nuevas costean por <b>lote real (FIFO)</b>. Por la inflación, ese costo
       a valor de hoy puede achicar un poco el margen de los meses viejos. Los <b>gastos son por línea</b> (no por
@@ -396,7 +408,7 @@ function panelRow(f) {
   const c = CONTROL[f.periodo] || {};
   const ded = num(f.comision) + num(f.envio) + num(f.financiero) + num(f.impuestos);
   const ivaCred = num(c.iva_cred_compras) + num(c.iva_cred_gastos);
-  return `<tr class="res-panel"><td colspan="11"><div class="rp-wrap">
+  return `<tr class="res-panel"><td colspan="12"><div class="rp-wrap">
     <div class="rp-card">
       <div class="rp-h">Cuadre con Mercado Libre</div>
       <div class="rp-row"><span>Órdenes</span><b>${fmtNum(c.ordenes_ml)}</b></div>
@@ -412,6 +424,7 @@ function panelRow(f) {
       <div class="rp-row"><span>Contribución</span><b>${fmtMoney(f.contrib)}</b></div>
       <div class="rp-row"><span>− CMV ${num(f.cmv_estimado) > 0 ? '(est.)' : ''}</span><b>${fmtMoney(-num(f.cmv))}</b></div>
       <div class="rp-row"><span>− Gastos</span><b>${f.gastos ? fmtMoney(-num(f.gastos)) : '—'}</b></div>
+      <div class="rp-row"><span>± Devoluciones del mes</span><b>${num(f.devoluciones) ? fmtMoney(num(f.devoluciones)) : '—'}</b></div>
       <div class="rp-row rp-strong"><span>Resultado op.</span><b>${fmtMoney(f.resultado_op)} · ${fmtPct(f.pct)}</b></div>
     </div>
     <div class="rp-card">
