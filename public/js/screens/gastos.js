@@ -15,6 +15,7 @@ import { sbGet, sbPatch } from '../core/sb.js';
 // - estado_pago lo deriva la vista: usd_sin_tc | pendiente | parcial | pagado.
 
 let DATA = [];            // filas de v_gastos_ap
+let ADJ = {};             // adjuntos por gasto: op_id -> [{id, nombre}]
 let LINEAS = [];          // lineas_negocio
 let LINEA_LABEL = {};     // id -> label
 let CANALES = [];         // canales (maestro, FK de gasto_imputacion.canal)
@@ -126,6 +127,20 @@ export async function loadGastos() {
 
 async function recargar() {
   DATA = await sbGet('v_gastos_ap', 'order=fecha.desc,id.desc');
+  ADJ = {};
+  try {
+    const adj = await sbGet('adjuntos', 'op_tipo=eq.gasto&select=id,op_id,nombre&order=id.desc');
+    for (const a of (adj || [])) (ADJ[a.op_id] = ADJ[a.op_id] || []).push(a);
+  } catch { ADJ = {}; }
+}
+
+async function verAdjunto(id) {
+  try {
+    const r = await fetch('/adjuntos/' + id + '/url');
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.url) throw new Error(d.error || 'No se pudo abrir');
+    window.open(d.url, '_blank');
+  } catch (e) { window.toast('Error al abrir el adjunto: ' + e.message, 'error'); }
 }
 
 function periodosPresentes() {
@@ -213,6 +228,7 @@ function render() {
   document.getElementById('btn-nuevo').addEventListener('click', openModalNuevo);
   document.querySelectorAll('.pill').forEach(p => p.addEventListener('click', () => { FILTRO.estado = p.dataset.estado; render(); }));
   document.querySelectorAll('.gas-anular').forEach(b => b.addEventListener('click', () => anularGasto(+b.dataset.id)));
+  document.querySelectorAll('.gas-clip').forEach(b => b.addEventListener('click', () => verAdjunto(+b.dataset.adj)));
 }
 
 function filaHTML(g) {
@@ -227,7 +243,7 @@ function filaHTML(g) {
     <td class="gas-muted">${esc(g.lineas_resumen || '—')}</td>
     <td style="text-align:right" class="gas-mono">${fmtMonto(totalOrigen, g.moneda)}</td>
     <td><span class="gas-badge gas-badge-${estado}">${LABEL_ESTADO[estado] || estado}</span></td>
-    <td style="text-align:right"><button class="gas-anular" data-id="${g.id}" title="Anular">Anular</button></td>
+    <td style="text-align:right">${(ADJ[g.id] && ADJ[g.id].length) ? `<button class="gas-clip" data-adj="${ADJ[g.id][0].id}" title="Ver factura: ${esc(ADJ[g.id][0].nombre)}">📎</button>` : ''}<button class="gas-anular" data-id="${g.id}" title="Anular">Anular</button></td>
   </tr>`;
 }
 
@@ -333,6 +349,11 @@ function openModalNuevo() {
       <div class="gas-resumen" id="g-resumen"></div>
 
       <div class="field"><label>Pago</label><select class="select" id="g-pago">${optPago}</select></div>
+
+      <div class="field"><label>Factura / comprobante (PDF o imagen)</label>
+        <input class="input" id="g-factura" type="file" accept="application/pdf,image/*">
+        <div class="gas-comp" style="margin-top:4px">Opcional. Se guarda el archivo y queda asociado al gasto.</div>
+      </div>
 
       <div class="modal-actions">
         <button class="btn btn-ghost" id="g-cancel">Cancelar</button>
@@ -585,6 +606,24 @@ function openModalNuevo() {
       });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+
+      // Subir la factura adjunta (si se eligió un archivo)
+      const fileEl = $('#g-factura');
+      const file = fileEl && fileEl.files && fileEl.files[0];
+      if (file && data.id) {
+        try {
+          const fd = new FormData();
+          fd.append('op_tipo', 'gasto');
+          fd.append('op_id', String(data.id));
+          fd.append('file', file);
+          const ra = await fetch('/adjuntos', { method: 'POST', body: fd });
+          if (!ra.ok) { const da = await ra.json().catch(() => ({})); throw new Error(da.error || (ra.status + '')); }
+        } catch (eAdj) {
+          window.toast('Gasto guardado, pero la factura no se subió: ' + eAdj.message, 'error');
+          close(); await recargar(); render(); return;
+        }
+      }
+
       window.toast('Gasto cargado');
       close();
       await recargar();
@@ -617,6 +656,8 @@ function inyectarEstilo() {
     .gas-badge-usd_sin_tc{background:#FAEEDA;color:#854F0B}
     .gas-row-warn{background:rgba(217,119,6,0.06)}
     .gas-anular{font-size:12px;color:#B91C1C;background:none;border:0;cursor:pointer;font:inherit;padding:2px 4px}
+    .gas-clip{font-size:14px;background:none;border:0;cursor:pointer;padding:2px 6px;margin-right:2px}
+    .gas-clip:hover{opacity:.65}
     .gas-anular:hover{text-decoration:underline}
     .gas-modal{max-width:560px}
     .gas-grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
