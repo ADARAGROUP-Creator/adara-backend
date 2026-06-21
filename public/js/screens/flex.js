@@ -1,4 +1,5 @@
 import { sbGet, sbPost, sbPatch } from '../core/sb.js';
+import { mlTabs } from '../core/mlTabs.js';
 
 // ── Pantalla: Flex ──────────────────────────────────────────────────────
 // Control semanal de envíos Flex contra el resumen del proveedor.
@@ -93,10 +94,7 @@ function render() {
   ).join('');
 
   root.innerHTML = `
-    <div class="flx-tabs">
-      <a class="flx-tab" href="#ventas_ml">Ventas ML</a>
-      <a class="flx-tab active" href="#flex">Flex</a>
-    </div>
+    ${mlTabs('flex')}
 
     <div class="flx-bar">
       <div>
@@ -293,10 +291,6 @@ async function guardarPrecio(logCod, zonaCod, valorStr) {
 function inyectarEstilo() {
   if (document.getElementById('flx-style')) return;
   const css = `
-    .flx-tabs{display:flex;gap:4px;border-bottom:1px solid #E7E5E4;margin-bottom:16px}
-    .flx-tab{padding:8px 16px;font-size:14px;font-weight:600;color:#78716C;text-decoration:none;border-bottom:2px solid transparent;margin-bottom:-1px}
-    .flx-tab:hover{color:#1C1917}
-    .flx-tab.active{color:#1C1917;border-bottom-color:#1C1917}
     .flx-bar{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:16px}
     .flx-lbl{display:block;font-size:12px;color:#78716C;margin-bottom:4px}
     .flx-sel{min-width:240px}
