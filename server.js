@@ -3288,6 +3288,84 @@ app.post('/gastos', async (req, res) => {
   }
 });
 
+// ── Adjuntos: subir / ver / borrar comprobantes (Supabase Storage) ────────
+// Bucket privado 'comprobantes'. El archivo se sube vía service_role (el front
+// no toca Storage). Tabla polimórfica `adjuntos` (op_tipo + op_id) → sirve para
+// gasto / compra / despacho. Ver = link firmado temporal (bucket privado).
+const ADJ_BUCKET = 'comprobantes';
+const STORAGE_H = { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` };
+
+function _safeName(s) {
+  return String(s || 'archivo')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')     // sin tildes
+    .replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80);
+}
+
+// Subir un adjunto (multipart: campos op_tipo, op_id + file)
+app.post('/adjuntos', upload.single('file'), async (req, res) => {
+  try {
+    const { op_tipo, op_id } = req.body || {};
+    if (!op_tipo || !op_id) return res.status(400).json({ error: 'Faltan op_tipo / op_id' });
+    if (!req.file) return res.status(400).json({ error: 'Falta el archivo' });
+
+    const path = `${op_tipo}/${op_id}/${Date.now()}-${_safeName(req.file.originalname)}`;
+    const up = await fetch(`${SUPABASE_URL}/storage/v1/object/${ADJ_BUCKET}/${encodeURI(path)}`, {
+      method: 'POST',
+      headers: { ...STORAGE_H, 'Content-Type': req.file.mimetype || 'application/octet-stream', 'x-upsert': 'false' },
+      body: req.file.buffer
+    });
+    if (!up.ok) throw new Error('Storage: ' + await up.text());
+
+    const ins = await sbUpsert('adjuntos', {
+      op_tipo, op_id: Number(op_id), bucket: ADJ_BUCKET, path,
+      nombre: req.file.originalname, mime: req.file.mimetype, tamano: req.file.size
+    });
+    const row = Array.isArray(ins) ? ins[0] : ins;
+    return res.json({ ok: true, id: row && row.id, path });
+  } catch (e) {
+    console.error('POST /adjuntos:', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Link temporal de descarga de un adjunto (bucket privado → URL firmada 1h)
+app.get('/adjuntos/:id/url', async (req, res) => {
+  try {
+    const rows = await sbGet('adjuntos', `id=eq.${Number(req.params.id)}&select=bucket,path,nombre`);
+    if (!rows || !rows.length) return res.status(404).json({ error: 'Adjunto no encontrado' });
+    const a = rows[0];
+    const r = await fetch(`${SUPABASE_URL}/storage/v1/object/sign/${a.bucket}/${encodeURI(a.path)}`, {
+      method: 'POST',
+      headers: { ...STORAGE_H, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expiresIn: 3600 })
+    });
+    const j = await r.json();
+    if (!r.ok || !j.signedURL) throw new Error('No se pudo firmar: ' + JSON.stringify(j));
+    return res.json({ url: `${SUPABASE_URL}/storage/v1${j.signedURL}`, nombre: a.nombre });
+  } catch (e) {
+    console.error('GET /adjuntos/:id/url:', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Borrar un adjunto (archivo en Storage + fila)
+app.delete('/adjuntos/:id', async (req, res) => {
+  try {
+    const rows = await sbGet('adjuntos', `id=eq.${Number(req.params.id)}&select=bucket,path`);
+    if (rows && rows.length) {
+      const a = rows[0];
+      await fetch(`${SUPABASE_URL}/storage/v1/object/${a.bucket}/${encodeURI(a.path)}`, {
+        method: 'DELETE', headers: STORAGE_H
+      }).catch(() => {});
+      await sb('DELETE', 'adjuntos', null, `id=eq.${Number(req.params.id)}`);
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /adjuntos/:id:', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Importador de extracto Supervielle (Excel/CSV → movimientos) ──────────
 // Parsea el export de movimientos de Supervielle (xlsx o csv), lo mapea a la
 // tabla nueva `movimientos` (capa 4), auto-clasifica el ruido (impuestos,
