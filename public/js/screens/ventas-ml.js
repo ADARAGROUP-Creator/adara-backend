@@ -1,4 +1,5 @@
 import { sbGet } from '../core/sb.js';
+import { mlTabs } from '../core/mlTabs.js';
 
 // ── Pantalla: Ventas ML (control diario/mensual + conciliación) ────────
 // Lista las ventas de ML por día o por mes con su detalle real y las cruza
@@ -401,6 +402,7 @@ function renderVentas() {
   const vacioTxt = esMes ? `el mes de ${esc(mesLargo(MES))}` : `el ${esc(ddmm(FECHA))}`;
 
   root.innerHTML = `
+    ${mlTabs('ventas_ml')}
     <div class="vml-bar">
       <button class="btn btn-primary" id="vml-sync">⟳ Sincronizar ventas</button>
       ${hayVentas ? modoHTML : ''}
