@@ -29,7 +29,7 @@ let PAGOS = [];            // { concepto, monto, moneda, tc }
 let _prevBolson = 0;
 
 function blankParams() {
-  return { tc: '', flete_declarado_usd: '', flete_real_usd: '', seguro_pct: '', seguro_monto: '', despachante_pct: '', despachante_monto: '', iibb_pct: '', ganancias_pct: '', coima_pct: '' };
+  return { tc: '', flete_declarado_usd: '', flete_real_usd: '', seguro_pct: '', seguro_monto: '', despachante_pct: '', despachante_monto: '', iibb_pct: '', ganancias_pct: '', coima_pct: '', arancel_sim_usd: 10 };
 }
 function blankProd() {
   return { nombre: '', fob_real_u: '', fob_decl_u: '', cantidad: '', peso_u: '', derechos_pct: '', derechos_pct_decl: '', estadistica_pct: '', estadistica_pct_decl: '', imp_internos_pct: '', iva_pct: 21, fijo_asignado: 0, declaro_distinto: false, _open: false };
@@ -60,6 +60,7 @@ function calc() {
   const iibbPct = num(P.iibb_pct) / 100;
   const ganPct = num(P.ganancias_pct) / 100;
   const coimaPct = num(P.coima_pct) / 100;
+  const aranceSim = num(P.arancel_sim_usd);   // tasa SIM: monto fijo, capitaliza al costo (vía bolsón), NO entra a base IVA ni genera crédito, pero se paga en el VEP (suma a tributos)
   const bolsonManual = bolsonActual();
   const fleteDiff = fleteReal - fleteDecl;   // (real − declarado) → va al bolsón de fijos
   // Override de declaración: vacío ⇒ usa el real (sin subfacturación / sin coima).
@@ -85,9 +86,9 @@ function calc() {
   // Despachante: si hay monto cargado pisa el %. NO entra al CIF → va al bolsón de fijos.
   const despTotal = despMonto > 0 ? despMonto : despPct * sCif;
 
-  // Bolsón EFECTIVO = fijos manuales + diferencia de flete + despachante.
+  // Bolsón EFECTIVO = fijos manuales + diferencia de flete + despachante + arancel SIM.
   // Se reparte entre productos por fijo_asignado (como el usuario lo marca).
-  const bolson = bolsonManual + fleteDiff + despTotal;
+  const bolson = bolsonManual + fleteDiff + despTotal + aranceSim;
 
   rows.forEach(r => {
     const p = r.p;
@@ -124,7 +125,7 @@ function calc() {
   const ahorroTot = rows.reduce((s, r) => s + r.ahorro, 0);
   const coimaTot = rows.reduce((s, r) => s + r.coima, 0);
   const baseIvaTot = sCif + derechosTot + estadTot + impIntTot;
-  const tributosTot = derechosTot + estadTot + impIntTot + ivaTot + iibbTot + ganTot;
+  const tributosTot = derechosTot + estadTot + impIntTot + ivaTot + iibbTot + ganTot + aranceSim;
 
   const costoTotUsd = rows.reduce((s, r) => s + r.costoUsd, 0);
   const credTotUsd = rows.reduce((s, r) => s + r.creditoUsd, 0);
@@ -140,7 +141,7 @@ function calc() {
   const esperado = costoTotUsd + credTotUsd;
 
   return {
-    tc, bolson, bolsonManual, fleteDiff, sPeso, sFob, fobRealTot, sCif, seguroTotal, despTotal, rows, pagosRows,
+    tc, bolson, bolsonManual, fleteDiff, sPeso, sFob, fobRealTot, sCif, seguroTotal, despTotal, aranceSim, rows, pagosRows,
     derechosTot, estadTot, impIntTot, ivaTot, iibbTot, ganTot, baseIvaTot, tributosTot,
     ahorroTot, coimaTot, netoReclasif: ahorroTot - coimaTot,
     costoTotUsd, credTotUsd, costoTotArs: costoTotUsd * tc, credTotArs: credTotUsd * tc,
@@ -225,7 +226,8 @@ function buildDatos() {
       tc: num(P.tc), flete_declarado_usd: num(P.flete_declarado_usd), flete_real_usd: num(P.flete_real_usd),
       seguro_pct: num(P.seguro_pct), seguro_monto: num(P.seguro_monto),
       despachante_pct: num(P.despachante_pct), despachante_monto: num(P.despachante_monto),
-      iibb_pct: num(P.iibb_pct), ganancias_pct: num(P.ganancias_pct), coima_pct: num(P.coima_pct)
+      iibb_pct: num(P.iibb_pct), ganancias_pct: num(P.ganancias_pct), coima_pct: num(P.coima_pct),
+      arancel_sim_usd: num(P.arancel_sim_usd)
     },
     fijos: FIJOS.map(f => ({ concepto: f.concepto || '', monto_usd: num(f.monto_usd) })),
     fijos_modo: FIJOS_MODO,
@@ -251,7 +253,8 @@ function loadDatos(d) {
     tc: pa.tc ?? '', flete_declarado_usd: pa.flete_declarado_usd ?? '', flete_real_usd: pa.flete_real_usd ?? '',
     seguro_pct: pa.seguro_pct ?? '', seguro_monto: pa.seguro_monto ?? '',
     despachante_pct: pa.despachante_pct ?? '', despachante_monto: pa.despachante_monto ?? '',
-    iibb_pct: pa.iibb_pct ?? '', ganancias_pct: pa.ganancias_pct ?? '', coima_pct: pa.coima_pct ?? ''
+    iibb_pct: pa.iibb_pct ?? '', ganancias_pct: pa.ganancias_pct ?? '', coima_pct: pa.coima_pct ?? '',
+    arancel_sim_usd: pa.arancel_sim_usd ?? 10
   };
   FIJOS = (d.fijos || []).map(f => ({ concepto: f.concepto || '', monto_usd: f.monto_usd ?? '' }));
   FIJOS_MODO = d.fijos_modo === 'monto' ? 'monto' : 'pct';
@@ -427,6 +430,7 @@ function paramsCard() {
       ${f('IIBB percep. %', 'iibb_pct', 'crédito fiscal')}
       ${f('Ganancias percep. %', 'ganancias_pct', 'crédito fiscal')}
       ${f('Coima %', 'coima_pct', 'sobre derechos+estad. evitados')}
+      ${f('Arancel SIM (USD)', 'arancel_sim_usd', 'tasa fija · capitaliza, sin crédito')}
     </div>
     <div class="imp-bases" id="imp-bases"></div>
   </div>`;
@@ -449,6 +453,11 @@ function fijosCard() {
       <span class="imp-fijo-autolbl">Despachante <span class="imp-auto-badge">auto</span></span>
       <b class="imp-mono imp-fijo-automonto" id="imp-fijo-despachante">—</b>
       <span></span>
+    </div>
+    <div class="imp-fijo-item imp-fijo-auto">
+      <span class="imp-fijo-autolbl">Arancel SIM <span class="imp-auto-badge">auto</span></span>
+      <b class="imp-mono imp-fijo-automonto" id="imp-fijo-arancesim">—</b>
+      <span></span>
     </div>`;
   const pill = (val, lbl, act) => `<button class="imp-pill" data-act="${act}" data-val="${val}">${lbl}</button>`;
   return `<div class="card imp-card">
@@ -462,7 +471,7 @@ function fijosCard() {
       <button class="btn btn-ghost imp-mini" data-act="addfijo">+ Concepto</button>
     </div>
     <div class="imp-fijos">${filasManual}${filasAuto}</div>
-    <div class="imp-fijos-nota">La diferencia de flete y el despachante se cargan solos al bolsón (no entran al CIF) y se reparten por producto como marques abajo. Acordate de Precargar para repartir el 100%.</div>
+    <div class="imp-fijos-nota">La diferencia de flete, el despachante y el arancel SIM se cargan solos al bolsón (no entran al CIF) y se reparten por producto como marques abajo. Acordate de Precargar para repartir el 100%.</div>
     <div class="imp-reparto">
       <span>Bolsón total: <b id="imp-bolson" class="imp-mono"></b></span>
       <span id="imp-reparto-ind" class="imp-mono"></span>
@@ -627,6 +636,7 @@ function paint() {
   set('imp-bolson', usd(c.bolson));
   set('imp-fijo-fletediff', usd(c.fleteDiff));
   set('imp-fijo-despachante', usd(c.despTotal));
+  set('imp-fijo-arancesim', usd(c.aranceSim));
   const asignado = PRODS.reduce((s, p) => s + num(p.fijo_asignado), 0);
   const ind = document.getElementById('imp-reparto-ind');
   if (ind) {
@@ -701,6 +711,7 @@ function paint() {
       tt('IVA', c.ivaTot, 'imp-tt-credrow') +
       tt('IIBB percepción', c.iibbTot, 'imp-tt-credrow') +
       tt('Ganancias percepción', c.ganTot, 'imp-tt-credrow') +
+      tt('Arancel SIM', c.aranceSim, 'imp-tt-caprow') +
       tt('Total tributos del despacho', c.tributosTot, 'imp-tt-totalrow');
   }
 
@@ -743,7 +754,7 @@ function detalleHTML(r, tc) {
       ${line('Estadística', r.estadistica)}
       ${line('Imp. internos', r.impInternos)}
       ${line('Coima clasificación', r.coima)}
-      ${line('Fijos (incl. flete-dif. + despachante)', r.fijo)}
+      ${line('Fijos (incl. flete-dif. + despachante + SIM)', r.fijo)}
       ${line('Costo s/IVA', r.costoUsd, true)}
       ${sec('Crédito fiscal (no es costo → Posición Fiscal)', 'imp-dt-cred')}
       ${line('IVA', r.iva)}
@@ -776,7 +787,7 @@ function bindDelegation(body) {
     if (k === 'param') {
       P[f] = v;
       // Estos parámetros mueven el bolsón efectivo (flete-diff + despachante).
-      if (['flete_declarado_usd', 'flete_real_usd', 'despachante_pct', 'despachante_monto'].includes(f)) {
+      if (['flete_declarado_usd', 'flete_real_usd', 'despachante_pct', 'despachante_monto', 'arancel_sim_usd'].includes(f)) {
         onBolsonChanged(); syncProdFijoInputs();
       }
     }
