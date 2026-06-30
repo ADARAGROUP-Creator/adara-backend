@@ -82,20 +82,24 @@ function calc() {
   // Seguro: si hay monto cargado pisa el %. Se prorratea por FOB.
   const seguroTotal = segMonto > 0 ? segMonto : segPct * (sFob + fleteDecl);
 
-  // CIF usa SIEMPRE el flete DECLARADO (base aduanera).
+  // CIF DECLARADO (base aduanera): flete declarado por peso declarado, seguro por FOB declarado.
   rows.forEach(r => {
     r.fleteDeclShare = fleteDecl * safeDiv(r.pesoT, sPeso);
     r.seguro = seguroTotal * safeDiv(r.fobDeclT, sFob);
     r.cif = r.fobDeclT + r.fleteDeclShare + r.seguro;
   });
   const sCif = rows.reduce((s, r) => s + r.cif, 0);
-  // Despachante: si hay monto cargado pisa el %. NO entra al CIF → va al bolsón de fijos.
-  const despTotal = despMonto > 0 ? despMonto : despPct * sCif;
 
-  // Bolsón EFECTIVO = fijos manuales + diferencia de flete + despachante + arancel SIM.
-  // Se reparte entre productos por fijo_asignado (como el usuario lo marca).
-  const bolson = bolsonManual + fleteDiff + despTotal + aranceSim;
+  // CIF "real sombra": lo que declararías poniendo TODO a valor y cantidad reales.
+  // Solo mide el ahorro de derechos+estadística que habilita la coima; NO afecta el costo.
+  const sPesoReal = rows.reduce((s, r) => s + num(r.p.peso_u) * r.cantReal, 0);
+  const seguroReal = segMonto > 0 ? segMonto : segPct * (fobRealTot + fleteReal);
+  rows.forEach(r => {
+    const pesoRealT = num(r.p.peso_u) * r.cantReal;
+    r.cifReal = r.fobRealT + fleteReal * safeDiv(pesoRealT, sPesoReal) + seguroReal * safeDiv(r.fobRealT, fobRealTot);
+  });
 
+  // Tributos declarados (lo que pagás) + ahorro vs declarar todo real (derechos + estadística).
   rows.forEach(r => {
     const p = r.p;
     // Tasas: el campo primario es el REAL; el declarado es override (vacío = real).
@@ -106,17 +110,31 @@ function calc() {
     r.iva = r.baseIva * num(p.iva_pct) / 100;
     r.iibb = r.baseIva * iibbPct;
     r.ganancias = r.baseIva * ganPct;
-    // Reclasificación: ahorro = (real − declarado) de derechos+estad; coima = % del ahorro.
-    r.derReal = r.cif * num(p.derechos_pct) / 100;
-    r.estReal = r.cif * num(p.estadistica_pct) / 100;
-    r.ahorro = (r.derReal - r.derechos) + (r.estReal - r.estadistica);
-    r.coima = r.ahorro * coimaPct;                                // capitaliza, SIN crédito
+    // Ahorro = derechos+estad que pagarías declarando TODO real (FOB+cantidad+alícuota) − lo que pagás.
+    r.derRealFull = r.cifReal * num(p.derechos_pct) / 100;
+    r.estRealFull = r.cifReal * num(p.estadistica_pct) / 100;
+    r.ahorroDer = r.derRealFull - r.derechos;
+    r.ahorroEst = r.estRealFull - r.estadistica;
+    r.ahorro = r.ahorroDer + r.ahorroEst;
+  });
+
+  const ahorroTot = rows.reduce((s, r) => s + r.ahorro, 0);
+  const coimaTot = coimaPct * ahorroTot;   // coima GLOBAL = % × ahorro total; capitaliza vía bolsón, SIN crédito, NO es tributo
+  // Despachante: si hay monto cargado pisa el %. NO entra al CIF → va al bolsón de fijos.
+  const despTotal = despMonto > 0 ? despMonto : despPct * sCif;
+  // Bolsón EFECTIVO = fijos manuales + dif. flete + despachante + arancel SIM + coima.
+  // Se reparte entre productos por fijo_asignado (como el usuario lo marca).
+  const bolson = bolsonManual + fleteDiff + despTotal + aranceSim + coimaTot;
+
+  // Costo por producto (necesita el bolsón ya cerrado, porque la coima vive ahí dentro).
+  rows.forEach(r => {
+    const p = r.p;
     // El COSTO de flete usa el DECLARADO (por peso); la diferencia ya está en el bolsón.
     r.fleteCosto = r.fleteDeclShare;
     r.fijo = FIJOS_MODO === 'pct' ? num(p.fijo_asignado) / 100 * bolson : num(p.fijo_asignado);
     r.noDeclarado = r.fobRealT - r.fobDeclT;
-    // Despachante NO es línea propia del costo: vive dentro de r.fijo (bolsón).
-    r.costoUsd = r.fobRealT + r.fleteCosto + r.seguro + r.derechos + r.estadistica + r.impInternos + r.coima + r.fijo;
+    // Despachante y coima NO son línea propia del costo: viven dentro de r.fijo (bolsón).
+    r.costoUsd = r.fobRealT + r.fleteCosto + r.seguro + r.derechos + r.estadistica + r.impInternos + r.fijo;
     r.creditoUsd = r.iva + r.iibb + r.ganancias;
     r.costoUnitUsd = safeDiv(r.costoUsd, r.cantReal);   // divisor = cantidad REAL; las no declaradas también absorben costo
     r.costoUnitArs = r.costoUnitUsd * tc;
@@ -128,8 +146,8 @@ function calc() {
   const ivaTot = rows.reduce((s, r) => s + r.iva, 0);
   const iibbTot = rows.reduce((s, r) => s + r.iibb, 0);
   const ganTot = rows.reduce((s, r) => s + r.ganancias, 0);
-  const ahorroTot = rows.reduce((s, r) => s + r.ahorro, 0);
-  const coimaTot = rows.reduce((s, r) => s + r.coima, 0);
+  const ahorroDerTot = rows.reduce((s, r) => s + r.ahorroDer, 0);
+  const ahorroEstTot = rows.reduce((s, r) => s + r.ahorroEst, 0);
   const baseIvaTot = sCif + derechosTot + estadTot + impIntTot;
   const tributosTot = derechosTot + estadTot + impIntTot + ivaTot + iibbTot + ganTot + aranceSim;
 
@@ -149,7 +167,7 @@ function calc() {
   return {
     tc, bolson, bolsonManual, fleteDiff, sPeso, sFob, fobRealTot, sCif, seguroTotal, despTotal, aranceSim, rows, pagosRows,
     derechosTot, estadTot, impIntTot, ivaTot, iibbTot, ganTot, baseIvaTot, tributosTot,
-    ahorroTot, coimaTot, netoReclasif: ahorroTot - coimaTot,
+    ahorroTot, ahorroDerTot, ahorroEstTot, coimaTot, netoReclasif: ahorroTot - coimaTot,
     costoTotUsd, credTotUsd, costoTotArs: costoTotUsd * tc, credTotArs: credTotUsd * tc,
     pagosUsd, esperado, diff: pagosUsd - esperado
   };
@@ -464,6 +482,11 @@ function fijosCard() {
       <span class="imp-fijo-autolbl">Arancel SIM <span class="imp-auto-badge">auto</span></span>
       <b class="imp-mono imp-fijo-automonto" id="imp-fijo-arancesim">—</b>
       <span></span>
+    </div>
+    <div class="imp-fijo-item imp-fijo-auto">
+      <span class="imp-fijo-autolbl">Coima <span class="imp-auto-badge">auto</span></span>
+      <b class="imp-mono imp-fijo-automonto" id="imp-fijo-coima">—</b>
+      <span></span>
     </div>`;
   const pill = (val, lbl, act) => `<button class="imp-pill" data-act="${act}" data-val="${val}">${lbl}</button>`;
   return `<div class="card imp-card">
@@ -477,7 +500,7 @@ function fijosCard() {
       <button class="btn btn-ghost imp-mini" data-act="addfijo">+ Concepto</button>
     </div>
     <div class="imp-fijos">${filasManual}${filasAuto}</div>
-    <div class="imp-fijos-nota">La diferencia de flete, el despachante y el arancel SIM se cargan solos al bolsón (no entran al CIF) y se reparten por producto como marques abajo. Acordate de Precargar para repartir el 100%.</div>
+    <div class="imp-fijos-nota">La diferencia de flete, el despachante, el arancel SIM y la coima se cargan solos al bolsón (no entran al CIF) y se reparten por producto como marques abajo. Acordate de Precargar para repartir el 100%.</div>
     <div class="imp-reparto">
       <span>Bolsón total: <b id="imp-bolson" class="imp-mono"></b></span>
       <span id="imp-reparto-ind" class="imp-mono"></span>
@@ -575,13 +598,26 @@ function totalesCard() {
 
 function reclasifCard() {
   return `<div class="card imp-card imp-reclasif" id="imp-reclasif" style="display:none">
-    <div class="card-title">Reclasificación de posición (coima)</div>
-    <div class="imp-reclasif-grid">
-      <div class="imp-reclasif-block"><span class="imp-reclasif-lbl">Ahorro derechos + estadística</span><b id="imp-ahorro" class="imp-mono"></b></div>
-      <div class="imp-reclasif-block imp-reclasif-coima"><span class="imp-reclasif-lbl">Coima (capitaliza, sin crédito)</span><b id="imp-coima" class="imp-mono"></b></div>
+    <div class="card-title">Coima — ahorro de derechos + estadística por producto</div>
+    <div class="imp-tt-legend">Ahorro = lo que pagarías declarando TODO real (FOB + cantidad + alícuota) − lo que pagás declarando. La coima capitaliza al costo (vía bolsón) y es salida de caja: cargala también como pago en el cierre. No genera crédito fiscal.</div>
+    <div class="table-wrap"><table class="t imp-coima">
+      <thead><tr>
+        <th>#</th><th>Producto</th>
+        <th style="text-align:right">Derechos pagás</th>
+        <th style="text-align:right">Derechos real</th>
+        <th style="text-align:right">Estad. pagás</th>
+        <th style="text-align:right">Estad. real</th>
+        <th style="text-align:right">Ahorro (USD)</th>
+        <th style="text-align:right">Ahorro (ARS)</th>
+      </tr></thead>
+      <tbody id="imp-coima-body"></tbody>
+    </table></div>
+    <div class="imp-coima-foot">
+      <div class="imp-reclasif-block"><span class="imp-reclasif-lbl">Ahorro total derechos + estadística</span><b id="imp-ahorro" class="imp-mono"></b></div>
+      <div class="imp-reclasif-block"><span class="imp-reclasif-lbl">% coima a pagar</span><b id="imp-coima-pct" class="imp-mono"></b></div>
+      <div class="imp-reclasif-block imp-reclasif-coima"><span class="imp-reclasif-lbl">Coima a pagar (→ bolsón)</span><b id="imp-coima" class="imp-mono"></b></div>
       <div class="imp-reclasif-block imp-reclasif-neto"><span class="imp-reclasif-lbl">Neto a favor (ahorro − coima)</span><b id="imp-neto" class="imp-mono"></b></div>
     </div>
-    <div class="imp-fijos-nota">El ahorro es lo que NO pagás de derechos+estadística al declarar otra posición (no es costo). La coima sí capitaliza al costo y es salida de caja: cargala también como pago en el cierre.</div>
   </div>`;
 }
 
@@ -644,6 +680,7 @@ function paint() {
   set('imp-fijo-fletediff', usd(c.fleteDiff));
   set('imp-fijo-despachante', usd(c.despTotal));
   set('imp-fijo-arancesim', usd(c.aranceSim));
+  set('imp-fijo-coima', usd(c.coimaTot));
   const asignado = PRODS.reduce((s, p) => s + num(p.fijo_asignado), 0);
   const ind = document.getElementById('imp-reparto-ind');
   if (ind) {
@@ -693,13 +730,37 @@ function paint() {
   set('imp-tot-cred-usd', usd(c.credTotUsd));
   set('imp-tot-cred-ars', ars(c.credTotArs));
 
-  // Resumen de reclasificación (coima): se muestra solo si hay algo
+  // Tablota de coima: ahorro de derechos+estadística por producto
   const recl = document.getElementById('imp-reclasif');
   if (recl) {
     const hay = Math.abs(c.ahorroTot) > 0.005 || Math.abs(c.coimaTot) > 0.005;
     recl.style.display = hay ? 'block' : 'none';
     if (hay) {
+      const cb = document.getElementById('imp-coima-body');
+      if (cb) {
+        cb.innerHTML = c.rows.map((r, i) => `
+          <tr${Math.abs(r.ahorro) < 0.005 ? ' class="imp-muted"' : ''}>
+            <td>${i + 1}</td>
+            <td>${esc(PRODS[i].nombre) || '<span class="imp-muted">(sin nombre)</span>'}</td>
+            <td class="imp-mono" style="text-align:right">${usd(r.derechos)}</td>
+            <td class="imp-mono" style="text-align:right">${usd(r.derRealFull)}</td>
+            <td class="imp-mono" style="text-align:right">${usd(r.estadistica)}</td>
+            <td class="imp-mono" style="text-align:right">${usd(r.estRealFull)}</td>
+            <td class="imp-mono" style="text-align:right"><b>${usd(r.ahorro)}</b></td>
+            <td class="imp-mono" style="text-align:right">${ars(r.ahorro * c.tc)}</td>
+          </tr>`).join('') +
+          `<tr class="imp-resumen-tot">
+            <td></td><td>Total</td>
+            <td class="imp-mono" style="text-align:right">${usd(c.derechosTot)}</td>
+            <td class="imp-mono" style="text-align:right">${usd(c.derechosTot + c.ahorroDerTot)}</td>
+            <td class="imp-mono" style="text-align:right">${usd(c.estadTot)}</td>
+            <td class="imp-mono" style="text-align:right">${usd(c.estadTot + c.ahorroEstTot)}</td>
+            <td class="imp-mono" style="text-align:right"><b>${usd(c.ahorroTot)}</b></td>
+            <td class="imp-mono" style="text-align:right">${ars(c.ahorroTot * c.tc)}</td>
+          </tr>`;
+      }
       set('imp-ahorro', usd(c.ahorroTot) + '  ·  ' + ars(c.ahorroTot * c.tc));
+      set('imp-coima-pct', pctTxt(num(P.coima_pct)));
       set('imp-coima', usd(c.coimaTot) + '  ·  ' + ars(c.coimaTot * c.tc));
       set('imp-neto', usd(c.netoReclasif) + '  ·  ' + ars(c.netoReclasif * c.tc));
     }
@@ -760,8 +821,7 @@ function detalleHTML(r, tc) {
       ${line('Derechos', r.derechos)}
       ${line('Estadística', r.estadistica)}
       ${line('Imp. internos', r.impInternos)}
-      ${line('Coima clasificación', r.coima)}
-      ${line('Fijos (incl. flete-dif. + despachante + SIM)', r.fijo)}
+      ${line('Fijos (incl. flete-dif. + despachante + SIM + coima)', r.fijo)}
       ${line('Costo s/IVA', r.costoUsd, true)}
       ${sec('Crédito fiscal (no es costo → Posición Fiscal)', 'imp-dt-cred')}
       ${line('IVA', r.iva)}
