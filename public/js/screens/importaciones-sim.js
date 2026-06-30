@@ -32,7 +32,7 @@ function blankParams() {
   return { tc: '', flete_declarado_usd: '', flete_real_usd: '', seguro_pct: '', seguro_monto: '', despachante_pct: '', despachante_monto: '', iibb_pct: '', ganancias_pct: '', coima_pct: '', arancel_sim_usd: 10 };
 }
 function blankProd() {
-  return { nombre: '', fob_real_u: '', fob_decl_u: '', cantidad: '', peso_u: '', derechos_pct: '', derechos_pct_decl: '', estadistica_pct: '', estadistica_pct_decl: '', imp_internos_pct: '', iva_pct: 21, fijo_asignado: 0, declaro_distinto: false, _open: false };
+  return { nombre: '', fob_real_u: '', fob_decl_u: '', cantidad: '', cantidad_decl: '', peso_u: '', derechos_pct: '', derechos_pct_decl: '', estadistica_pct: '', estadistica_pct_decl: '', imp_internos_pct: '', iva_pct: 21, fijo_asignado: 0, declaro_distinto: false, _open: false };
 }
 function blankPago() {
   return { concepto: '', monto: '', moneda: 'USD', tc: num(P.tc) > 0 ? P.tc : '' };
@@ -67,8 +67,14 @@ function calc() {
   const eff = (ov, real) => (ov === '' || ov === null || ov === undefined) ? num(real) : num(ov);
 
   const rows = PRODS.map(p => {
-    const cant = num(p.cantidad);
-    return { p, cant, pesoT: num(p.peso_u) * cant, fobDeclT: eff(p.fob_decl_u, p.fob_real_u) * cant, fobRealT: num(p.fob_real_u) * cant };
+    const cantReal = num(p.cantidad);                          // unidades que ENTRAN → stock real → costo
+    const cantDecl = eff(p.cantidad_decl, p.cantidad);         // unidades DECLARADAS en aduana → base de tributos/crédito
+    return {
+      p, cant: cantReal, cantReal, cantDecl,
+      pesoT: num(p.peso_u) * cantDecl,                         // peso DECLARADO → CIF / flete aduanero
+      fobDeclT: eff(p.fob_decl_u, p.fob_real_u) * cantDecl,    // base aduanera (precio y cantidad declarados)
+      fobRealT: num(p.fob_real_u) * cantReal                  // base costo real (todo lo que entró)
+    };
   });
   const sPeso = rows.reduce((s, r) => s + r.pesoT, 0);
   const sFob = rows.reduce((s, r) => s + r.fobDeclT, 0);
@@ -112,7 +118,7 @@ function calc() {
     // Despachante NO es línea propia del costo: vive dentro de r.fijo (bolsón).
     r.costoUsd = r.fobRealT + r.fleteCosto + r.seguro + r.derechos + r.estadistica + r.impInternos + r.coima + r.fijo;
     r.creditoUsd = r.iva + r.iibb + r.ganancias;
-    r.costoUnitUsd = safeDiv(r.costoUsd, r.cant);
+    r.costoUnitUsd = safeDiv(r.costoUsd, r.cantReal);   // divisor = cantidad REAL; las no declaradas también absorben costo
     r.costoUnitArs = r.costoUnitUsd * tc;
   });
 
@@ -236,7 +242,7 @@ function buildDatos() {
       const ov = x => (x === '' || x == null) ? null : num(x);
       return {
         nombre: p.nombre || '', fob_real_u: num(p.fob_real_u), fob_decl_u: ov(p.fob_decl_u),
-        cantidad: num(p.cantidad), peso_u: num(p.peso_u),
+        cantidad: num(p.cantidad), cantidad_decl: ov(p.cantidad_decl), peso_u: num(p.peso_u),
         derechos_pct: num(p.derechos_pct), derechos_pct_decl: ov(p.derechos_pct_decl),
         estadistica_pct: num(p.estadistica_pct), estadistica_pct_decl: ov(p.estadistica_pct_decl),
         imp_internos_pct: num(p.imp_internos_pct), iva_pct: num(p.iva_pct),
@@ -274,7 +280,7 @@ function loadProdV2(p) {
   return {
     ...blankProd(),
     nombre: p.nombre || '', fob_real_u: p.fob_real_u ?? '', fob_decl_u: p.fob_decl_u ?? '',
-    cantidad: p.cantidad ?? '', peso_u: p.peso_u ?? '',
+    cantidad: p.cantidad ?? '', cantidad_decl: p.cantidad_decl ?? '', peso_u: p.peso_u ?? '',
     derechos_pct: p.derechos_pct ?? '', derechos_pct_decl: p.derechos_pct_decl ?? '',
     estadistica_pct: p.estadistica_pct ?? '', estadistica_pct_decl: p.estadistica_pct_decl ?? '',
     imp_internos_pct: p.imp_internos_pct ?? '', iva_pct: p.iva_pct ?? 21,
@@ -498,6 +504,7 @@ function prodCard(p, i) {
   const chk = `<label class="imp-chk"><input type="checkbox" data-k="prod" data-i="${i}" data-f="declaro_distinto" ${p.declaro_distinto ? 'checked' : ''}> Declaro distinto (subfacturación / reclasificación)</label>`;
   const overrides = `<div class="imp-prod-override" style="display:${p.declaro_distinto ? 'grid' : 'none'}">
       ${fnum('fob_decl_u', 'FOB declarado u', 'lo que declarás (≤ real)')}
+      ${fnum('cantidad_decl', 'Cant. declarada', 'unidades declaradas (≤ real)')}
       ${fnum('derechos_pct_decl', 'Derechos declarado %', 'lo que pagás')}
       ${fnum('estadistica_pct_decl', 'Estad. declarado %', 'lo que pagás')}
     </div>`;
@@ -762,6 +769,7 @@ function detalleHTML(r, tc) {
       ${line('Ganancias percepción', r.ganancias)}
       ${line('Crédito fiscal', r.creditoUsd, true)}
       ${sec('Bases', 'imp-dt-base')}
+      <tr><td>Cantidad real / declarada</td><td colspan="4" class="imp-mono" style="text-align:right">${num(r.cantReal).toLocaleString('es-AR')} / ${num(r.cantDecl).toLocaleString('es-AR')}${r.cantDecl < r.cantReal ? `  ·  ${num(r.cantReal - r.cantDecl).toLocaleString('es-AR')} sin declarar` : ''}</td></tr>
       <tr><td>CIF del producto</td><td colspan="4" class="imp-mono" style="text-align:right">${usd(r.cif)}</td></tr>
     </tbody>
   </table></div>`;
