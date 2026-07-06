@@ -1,5 +1,6 @@
 import { sbGet } from '../core/sb.js';
 import { mlTabs } from '../core/mlTabs.js';
+import { exportarVentasXLSX } from '../core/reporte-ventas-xlsx.js';
 
 // ── Pantalla: Ventas ML (control diario/mensual + conciliación) ────────
 // Lista las ventas de ML por día o por mes con su detalle real y las cruza
@@ -409,6 +410,7 @@ function renderVentas() {
       ${navHTML}
       ${(!esDevueltas && conciliablesN > 0) ? `<button class="btn btn-conc" id="vml-conc-todas">✓ Conciliar todas (${conciliablesN})</button>` : ''}
       ${(hayVentas && FILTRO === 'canceladas') ? `<label class="vml-pendchk"><input type="checkbox" id="vml-solo-pend" ${SOLO_PEND_CANC ? 'checked' : ''}> Solo pendientes (${pendCancN})</label>` : ''}
+      <button class="btn btn-ghost" id="vml-export-xlsx" style="margin-left:auto">📥 Exportar XLSX</button>
     </div>
 
     ${hayVentas ? `
@@ -455,6 +457,7 @@ function renderVentas() {
   `;
 
   document.getElementById('vml-sync').addEventListener('click', openSyncModal);
+  document.getElementById('vml-export-xlsx').addEventListener('click', openExportModal);
   if (hayVentas) {
     root.querySelectorAll('.vml-modo button').forEach(b =>
       b.addEventListener('click', () => { MODO = b.dataset.modo; render(); }));
@@ -1459,4 +1462,50 @@ function inyectarEstilo() {
   style.id = 'vml-style';
   style.textContent = css;
   document.head.appendChild(style);
+}
+
+// ── Modal de exportación XLSX ──────────────────────────────────────────
+function openExportModal() {
+  const hoy = hoyISO();
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal" style="max-width:380px">
+      <h3 style="margin:0 0 16px">Exportar reporte XLSX</h3>
+      <p style="font-size:13px;color:#78716C;margin:0 0 14px">Genera un Excel con una hoja por SKU y hoja RESUMEN.</p>
+      <div class="field">
+        <label>Desde</label>
+        <input type="date" class="input" id="exp-desde" value="${hoy}" style="width:100%">
+      </div>
+      <div class="field" style="margin-top:10px">
+        <label>Hasta</label>
+        <input type="date" class="input" id="exp-hasta" value="${hoy}" style="width:100%">
+      </div>
+      <div class="modal-actions" style="margin-top:18px">
+        <button class="btn" id="exp-cancel">Cancelar</button>
+        <button class="btn btn-primary" id="exp-go">📥 Descargar</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const close = () => overlay.remove();
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  overlay.querySelector('#exp-cancel').addEventListener('click', close);
+  overlay.querySelector('#exp-go').addEventListener('click', async () => {
+    const desde = overlay.querySelector('#exp-desde').value;
+    const hasta = overlay.querySelector('#exp-hasta').value;
+    if (!desde || !hasta) { window.toast('Seleccioná ambas fechas', 'error'); return; }
+    if (desde > hasta) { window.toast('Desde no puede ser mayor que Hasta', 'error'); return; }
+    const btn = overlay.querySelector('#exp-go');
+    btn.disabled = true;
+    btn.textContent = '⏳ Generando…';
+    try {
+      await exportarVentasXLSX(desde, hasta);
+      close();
+    } catch (err) {
+      window.toast('Error: ' + err.message, 'error');
+      btn.disabled = false;
+      btn.textContent = '📥 Descargar';
+    }
+  });
 }
