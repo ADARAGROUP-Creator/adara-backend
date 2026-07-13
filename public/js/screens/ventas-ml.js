@@ -578,18 +578,27 @@ function renderConciliar() {
       </tr>`;
   }).join('') : `<tr><td colspan="5" class="vmlc-empty">✓ No quedan ventas por conciliar en este período.</td></tr>`;
 
-  const filasCobros = disponibles.length ? disponibles.map(c => {
+  // Los cobros SUGERIDOS para la venta elegida van primeros en la tabla (con un
+  // separador antes del resto), para no tener que buscarlos entre cientos.
+  const rowCobro = c => {
     const ref = String(c.referencia_externa || '').split('|')[1] || '';
-    const sug = sugeridos.has(c.id);
+    const esSug = sugeridos.has(c.id);
     const esBonif = /bonific/i.test(c.descripcion || '');
-    return `<tr class="${sug ? 'vmlc-sug' : ''}">
+    return `<tr class="${esSug ? 'vmlc-sug' : ''}">
         <td class="vml-mono">${esc(ddmm(c.fecha))}</td>
         <td class="vml-mono vmlc-ref">${esc(ref)}</td>
         <td class="vmlc-desc" title="${esc(c.descripcion || '')}">${esBonif ? '<span class="vml-bonif">bonif. envío</span> ' : ''}${esc((c.descripcion || '').slice(0, 34))}</td>
         <td style="text-align:right" class="vml-mono">${money(c.monto)}</td>
-        <td>${sug ? '<span class="vmlc-sugbadge">sugerido</span>' : ''}</td>
+        <td>${esSug ? '<span class="vmlc-sugbadge">sugerido</span>' : ''}</td>
       </tr>`;
-  }).join('') : `<tr><td colspan="5" class="vmlc-empty">No hay cobros sin vincular en el extracto.</td></tr>`;
+  };
+  const cobSug = disponibles.filter(c => sugeridos.has(c.id));
+  const cobResto = disponibles.filter(c => !sugeridos.has(c.id));
+  const dividerCob = cobSug.length && cobResto.length
+    ? `<tr class="vmlc-divider"><td colspan="5">— resto de cobros del extracto —</td></tr>` : '';
+  const filasCobros = disponibles.length
+    ? (cobSug.map(rowCobro).join('') + dividerCob + cobResto.map(rowCobro).join(''))
+    : `<tr><td colspan="5" class="vmlc-empty">No hay cobros sin vincular en el extracto.</td></tr>`;
 
   const selResumen = sel
     ? `<div class="vmlc-selbar">
@@ -1579,6 +1588,8 @@ function inyectarEstilo() {
     .vmlc-sug{background:#E1F5EE}
     .vmlc-sug:hover{background:#D3EFE5}
     .vmlc-sugbadge{font-size:11px;color:#0F6E56;background:#CDEDE1;border-radius:6px;padding:1px 7px;font-weight:600}
+    .vmlc-sug td{border-top:1px solid #B7E3D3}
+    .vmlc-divider td{background:#F5F5F4;color:#A8A29E;font-size:11px;text-align:center;padding:5px;text-transform:uppercase;letter-spacing:.04em}
     .vmlc-ok{color:#0F6E56;font-weight:600}
     .vmlc-rev{font-size:12px;color:#92500A;background:#FAF1E1;border-radius:6px;padding:2px 8px}
     .vmlc-no{font-size:12px;color:#857a5c;background:#FAF6EC;border:1px dashed #E3D9BE;border-radius:6px;padding:2px 8px}
