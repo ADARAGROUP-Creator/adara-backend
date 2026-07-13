@@ -30,6 +30,8 @@ let FILTRO = 'todas';        // todas | por_cobrar | cobradas | conciliadas | ca
 let SOLO_PEND_CANC = true;   // en el chip Canceladas, mostrar solo las pendientes (se van limpiando)
 let COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', com: '', envio: '', imp: '', fin: '', cobrar: '', envest: '', estado: '' }; // filtros por columna
 let BONIF_MAP_CUR = {};      // bonifs del período actual (para el repintado parcial de filtros)
+let VISTA = 'control';       // control (lista) | conciliar (dos tablas Ventas ↔ Cobros)
+let CONC_SEL = null;         // venta seleccionada en la vista de conciliación manual
 
 // ── Solapas de la pantalla ──────────────────────────────────────────────
 
@@ -191,6 +193,8 @@ const ESTADO_LBL = {
 export async function loadVentasML() {
   const root = document.getElementById('app-screens');
   root.innerHTML = `<div class="loading">Cargando ventas de ML…</div>`;
+  VISTA = 'control';    // al (re)entrar a la pantalla, arrancar siempre en la lista de control
+  CONC_SEL = null;
   DEV_BUNDLES = null;   // invalidar cache de bundles de devolución → se recarga al abrir la solapa
   try {
     VENTAS = await sbGet('ventas_ml', 'order=fecha.asc,hora_venta.asc,id.asc');
@@ -319,6 +323,7 @@ function paso(delta) {
 // Render principal de la pantalla Ventas ML (incluye, en el chip "Devueltas",
 // la herramienta de conciliación de devoluciones por bundle).
 function render() {
+  if (VISTA === 'conciliar') return renderConciliar();
   return renderVentas();
 }
 
@@ -408,7 +413,7 @@ function renderVentas() {
       <button class="btn btn-primary" id="vml-sync">⟳ Sincronizar ventas</button>
       ${hayVentas ? modoHTML : ''}
       ${navHTML}
-      ${(!esDevueltas && conciliablesN > 0) ? `<button class="btn btn-conc" id="vml-conc-todas">✓ Conciliar todas (${conciliablesN})</button>` : ''}
+      ${!esDevueltas ? `<button class="btn btn-conc" id="vml-conc-manual">🔗 Conciliar a mano${conciliablesN > 0 ? ` (${conciliablesN} listas)` : ''}</button>` : ''}
       ${(hayVentas && FILTRO === 'canceladas') ? `<label class="vml-pendchk"><input type="checkbox" id="vml-solo-pend" ${SOLO_PEND_CANC ? 'checked' : ''}> Solo pendientes (${pendCancN})</label>` : ''}
       <button class="btn btn-ghost" id="vml-export-xlsx" style="margin-left:auto">📥 Exportar XLSX</button>
     </div>
@@ -477,8 +482,8 @@ function renderVentas() {
     } else {
       const tabla = document.getElementById('vml-tabla');
       if (tabla) tabla.addEventListener('click', onTablaClick);
-      const cTodas = document.getElementById('vml-conc-todas');
-      if (cTodas) cTodas.addEventListener('click', conciliarTodas);
+      const cManual = document.getElementById('vml-conc-manual');
+      if (cManual) cManual.addEventListener('click', () => { VISTA = 'conciliar'; CONC_SEL = null; render(); });
       // Filtros por columna: repintan SOLO el tbody/tfoot (no se pierde el foco).
       BONIF_MAP_CUR = BONIF_MAP;
       root.querySelectorAll('.vmlf').forEach(el => {
@@ -499,6 +504,150 @@ function celdaMonto(valor) {
   const n = Number(valor) || 0;
   if (n === 0) return `<td style="text-align:right" class="vml-mono vml-cero">—</td>`;
   return `<td style="text-align:right" class="vml-mono ${n < 0 ? 'vml-neg' : 'vml-pos'}">${money(n)}</td>`;
+}
+
+// ── Vista de conciliación manual (dos tablas: Ventas ↔ Cobros) ───────────
+// Reemplaza el "Conciliar todas" automático. Izquierda: ventas pendientes con su
+// sugerencia de match (motor determinístico: matchCobros + bonificación + colecta O8).
+// Derecha: cobros del extracto sin vincular; al elegir una venta se resaltan sus
+// cobros sugeridos. La confirmación es venta por venta (reusa conciliar(), que
+// vincula SOLO esa venta). No se vincula nada en lote ni automáticamente.
+function infoMatch(v, bonifMap) {
+  const cobros = matchCobros(v);
+  const sum = r2(cobros.reduce((s, c) => s + (Number(c.monto) || 0), 0));
+  const obj = objetivoDe(v);
+  const bonif = bonifMap[v.id] || null;
+  const cierra = conciliable(v, bonifMap);
+  const falta = r2(obj - sum - (bonif ? (Number(bonif.monto) || 0) : 0));
+  return { cobros, sum, obj, bonif, cierra, falta, sinCobro: cobros.length === 0 };
+}
+
+function renderConciliar() {
+  const root = document.getElementById('app-screens');
+  const esMes = MODO === 'mes';
+  const base = VENTAS.length ? conjuntoActual() : [];
+  const BONIF_MAP = asignarBonifs(base);
+  const pend = base.filter(v => !estaConciliada(v) && v.ml_status !== 'cancelled' && !v.devuelta);
+  const cierranN = pend.filter(v => conciliable(v, BONIF_MAP)).length;
+
+  // Selección: la primera que cierra si la actual ya no está pendiente.
+  if (CONC_SEL == null || !pend.some(v => String(v.id) === String(CONC_SEL))) {
+    const f = pend.find(v => conciliable(v, BONIF_MAP)) || pend[0];
+    CONC_SEL = f ? f.id : null;
+  }
+  const sel = pend.find(v => String(v.id) === String(CONC_SEL)) || null;
+  const selI = sel ? infoMatch(sel, BONIF_MAP) : null;
+  const sugeridos = new Set();
+  if (selI) { selI.cobros.forEach(c => sugeridos.add(c.id)); if (selI.bonif) sugeridos.add(selI.bonif.id); }
+
+  const disponibles = Object.values(COBROS_BY_ID)
+    .filter(c => !VINC_MOV_USADOS.has(c.id))
+    .sort((a, b) => String(a.fecha || '').localeCompare(String(b.fecha || '')) || (a.id - b.id));
+
+  let navHTML = '';
+  if (esMes) {
+    const i = MESES.indexOf(MES);
+    navHTML = `<button class="btn btn-ghost" id="vmlc-prev" ${i <= 0 ? 'disabled' : ''}>‹</button>
+      <input type="month" class="input" id="vmlc-mes" value="${MES}" style="width:auto">
+      <button class="btn btn-ghost" id="vmlc-next" ${i >= MESES.length - 1 ? 'disabled' : ''}>›</button>
+      <span class="vml-fechalbl">${esc(mesLargo(MES))}</span>`;
+  } else {
+    const i = DIAS.indexOf(FECHA);
+    navHTML = `<button class="btn btn-ghost" id="vmlc-prev" ${i <= 0 ? 'disabled' : ''}>‹</button>
+      <input type="date" class="input" id="vmlc-fecha" value="${FECHA}" style="width:auto">
+      <button class="btn btn-ghost" id="vmlc-next" ${i >= DIAS.length - 1 ? 'disabled' : ''}>›</button>
+      <span class="vml-fechalbl">${esc(fechaLarga(FECHA))}</span>`;
+  }
+
+  const estadoChip = I => I.sinCobro
+    ? `<span class="vmlc-no">sin cobro</span>`
+    : (I.cierra ? `<span class="vmlc-ok">✓ cierra</span>`
+      : `<span class="vmlc-rev">${I.falta > 0 ? 'falta ' + money(I.falta) : 'sobra ' + money(I.falta)}</span>`);
+
+  const filasVentas = pend.length ? pend.map(v => {
+    const I = infoMatch(v, BONIF_MAP);
+    const acc = I.cierra
+      ? `<button class="btn btn-primary vml-mini" data-cel="conc" data-venta="${v.id}">Conciliar</button>`
+      : `<button class="btn vml-mini" disabled title="No cierra con el por cobrar">Conciliar</button>`;
+    return `<tr data-venta="${v.id}" class="${String(v.id) === String(CONC_SEL) ? 'vmlc-sel' : ''}">
+        <td><a class="vml-venta-id" href="https://www.mercadolibre.com.ar/ventas/${esc(v.ml_order_id)}/detalle" target="_blank" rel="noopener">${esc(v.ml_order_id || v.id)}</a></td>
+        <td class="vmlc-prod" title="${esc(v.titulo || '')}">${esc((v.titulo || '').slice(0, 40))}</td>
+        <td style="text-align:right" class="vml-mono vml-fuerte">${money(I.obj)}</td>
+        <td>${estadoChip(I)}</td>
+        <td style="text-align:right">${acc}</td>
+      </tr>`;
+  }).join('') : `<tr><td colspan="5" class="vmlc-empty">✓ No quedan ventas por conciliar en este período.</td></tr>`;
+
+  const filasCobros = disponibles.length ? disponibles.map(c => {
+    const ref = String(c.referencia_externa || '').split('|')[1] || '';
+    const sug = sugeridos.has(c.id);
+    const esBonif = /bonific/i.test(c.descripcion || '');
+    return `<tr class="${sug ? 'vmlc-sug' : ''}">
+        <td class="vml-mono">${esc(ddmm(c.fecha))}</td>
+        <td class="vml-mono vmlc-ref">${esc(ref)}</td>
+        <td class="vmlc-desc" title="${esc(c.descripcion || '')}">${esBonif ? '<span class="vml-bonif">bonif. envío</span> ' : ''}${esc((c.descripcion || '').slice(0, 34))}</td>
+        <td style="text-align:right" class="vml-mono">${money(c.monto)}</td>
+        <td>${sug ? '<span class="vmlc-sugbadge">sugerido</span>' : ''}</td>
+      </tr>`;
+  }).join('') : `<tr><td colspan="5" class="vmlc-empty">No hay cobros sin vincular en el extracto.</td></tr>`;
+
+  const selResumen = sel
+    ? `<div class="vmlc-selbar">
+         Venta seleccionada <b>#${esc(sel.ml_order_id || sel.id)}</b> ·
+         objetivo <b>${money(selI.obj)}</b> ·
+         cobros sugeridos <b>${money(selI.sum)}</b>${selI.bonif ? ` + bonif. <b>${money(selI.bonif.monto)}</b>` : ''} ·
+         ${selI.cierra ? '<span class="vmlc-ok">cierra ✓</span>' : `<span class="vmlc-rev">${selI.sinCobro ? 'sin cobro' : (selI.falta > 0 ? 'falta ' + money(selI.falta) : 'sobra ' + money(selI.falta))}</span>`}
+       </div>`
+    : `<div class="vmlc-selbar">Seleccioná una venta de la izquierda para ver su match sugerido.</div>`;
+
+  root.innerHTML = `
+    ${mlTabs('ventas_ml')}
+    <div class="vml-bar">
+      <button class="btn btn-ghost" id="vmlc-back">‹ Volver a la lista</button>
+      <div class="vml-modo">
+        <button class="${!esMes ? 'active' : ''}" data-modo="dia">Día</button>
+        <button class="${esMes ? 'active' : ''}" data-modo="mes">Mes</button>
+      </div>
+      ${navHTML}
+      <span class="vmlc-cuenta">${pend.length} por conciliar · ${cierranN} cierran</span>
+    </div>
+    <div class="vml-sub" style="margin-top:6px">Conciliación manual. La app sugiere el match (cobro por <code>mp_payment_id</code> + bonificación de envío + colecta); vos confirmás venta por venta. No se vincula nada automáticamente.</div>
+    ${selResumen}
+    <div class="vmlc-grid">
+      <div class="card vmlc-col" id="vmlc-left">
+        <div class="card-title">Ventas por conciliar <span class="vmlc-hint">(clic en una fila para seleccionar)</span></div>
+        <div class="table-wrap"><table class="t vmlc-tabla">
+          <thead><tr><th># Venta</th><th>Producto</th><th style="text-align:right">Objetivo</th><th>Match</th><th style="text-align:right">Acción</th></tr></thead>
+          <tbody>${filasVentas}</tbody>
+        </table></div>
+      </div>
+      <div class="card vmlc-col">
+        <div class="card-title">Cobros del extracto sin vincular <span class="vmlc-hint">(resaltados = sugeridos para la venta elegida)</span></div>
+        <div class="table-wrap"><table class="t vmlc-tabla">
+          <thead><tr><th>Fecha</th><th>Referencia</th><th>Descripción</th><th style="text-align:right">Monto</th><th></th></tr></thead>
+          <tbody>${filasCobros}</tbody>
+        </table></div>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('vmlc-back').addEventListener('click', () => { VISTA = 'control'; render(); });
+  root.querySelectorAll('.vml-modo button').forEach(b =>
+    b.addEventListener('click', () => { MODO = b.dataset.modo; CONC_SEL = null; render(); }));
+  const prev = document.getElementById('vmlc-prev');
+  const next = document.getElementById('vmlc-next');
+  if (prev) prev.addEventListener('click', () => { CONC_SEL = null; paso(-1); });
+  if (next) next.addEventListener('click', () => { CONC_SEL = null; paso(1); });
+  const inpF = document.getElementById('vmlc-fecha');
+  const inpM = document.getElementById('vmlc-mes');
+  if (inpF) inpF.addEventListener('change', e => { FECHA = e.target.value; CONC_SEL = null; render(); });
+  if (inpM) inpM.addEventListener('change', e => { MES = e.target.value; CONC_SEL = null; render(); });
+  document.getElementById('vmlc-left').addEventListener('click', e => {
+    const btn = e.target.closest('button[data-cel="conc"]');
+    if (btn) { e.stopPropagation(); conciliar(btn.dataset.venta); return; }
+    const row = e.target.closest('tr[data-venta]');
+    if (row) { CONC_SEL = row.dataset.venta; render(); }
+  });
 }
 
 function cobroCellInner(v, bonifMap) {
@@ -1025,54 +1174,11 @@ function conjuntoActual() {
   return VENTAS.filter(v => v.fecha === FECHA);
 }
 
-// Arma la lista de vínculos de todas las ventas conciliables (pago, y bonificación
-// cuando corresponde), reservando cada bonificación una sola vez.
-function armarLoteConciliacion(ventas) {
-  const usados = new Set(VINC_MOV_USADOS);
-  const lote = [];
-  for (const v of ventas) {
-    if (estaConciliada(v) || v.ml_status === 'cancelled' || v.devuelta) continue;
-    const cb = matchCobros(v);
-    if (!cb.length) continue;
-    const sum = cb.reduce((s, c) => s + (Number(c.monto) || 0), 0);
-    const pc = objetivoDe(v);
-    let bonif = null;
-    if (Math.abs(sum - pc) >= TOL) {
-      const falta = r2(pc - sum);
-      if (falta <= TOL) continue;
-      bonif = buscarBonif(falta, usados);
-      if (!bonif) continue;
-    }
-    for (const c of cb) lote.push({ movimiento_id: c.id, op_tipo: 'venta_ml', op_id: v.id, monto: r2(Math.abs(Number(c.monto) || 0)) });
-    if (bonif) {
-      lote.push({ movimiento_id: bonif.id, op_tipo: 'venta_ml', op_id: v.id, monto: r2(Math.abs(Number(bonif.monto) || 0)) });
-      usados.add(bonif.id);
-    }
-  }
-  return lote;
-}
-
-// Concilia de una sola vez todas las ventas que cierran del período visible.
-async function conciliarTodas() {
-  const lote = armarLoteConciliacion(conjuntoActual());
-  if (!lote.length) { window.toast('No hay ventas para conciliar'); return; }
-  const nVentas = new Set(lote.map(x => x.op_id)).size;
-  const periodo = MODO === 'mes' ? mesLargo(MES) : fechaLarga(FECHA);
-  if (!confirm(`¿Conciliar ${nVentas} ventas de ${periodo}? Se vinculan con su cobro (y la bonificación de envío cuando corresponde). Las que no cierran no se tocan.`)) return;
-  window.toast(`Conciliando ${nVentas} ventas…`);
-  try {
-    const r = await fetch('/vincular-lote', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ vinculos: lote })
-    });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
-    window.toast(`Listo: ${nVentas} ventas conciliadas`);
-    await refrescarVinculos();
-  } catch (e) {
-    window.toast('Error al conciliar todas: ' + e.message, 'error');
-  }
-}
+// NOTA: el flujo automático "Conciliar todas" (funciones armarLoteConciliacion /
+// conciliarTodas, que vinculaban en lote vía POST /vincular-lote) se retiró el
+// 13/07/2026 por decisión de UX: la conciliación de ventas ML pasa a ser manual,
+// venta por venta, desde la vista de dos tablas (renderConciliar → conciliar()).
+// El endpoint /vincular-lote sigue existiendo en el backend por si se reusa.
 
 function openSyncModal() {
   const hoy = hoyISO();
@@ -1457,6 +1563,28 @@ function inyectarEstilo() {
     .vml-env-entregado{background:#E1F5EE;color:#0F6E56}
     .vml-env-despachado{background:#E6F1FB;color:#0C447C}
     .vml-env-no_preparado{background:#F1EFEC;color:#78716C}
+    /* ── Vista de conciliación manual (dos tablas) ── */
+    .vmlc-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px}
+    @media(max-width:1000px){.vmlc-grid{grid-template-columns:1fr}}
+    .vmlc-col{padding:12px}
+    .vmlc-tabla{font-size:13px}
+    .vmlc-tabla th{white-space:nowrap}
+    .vmlc-hint{font-size:11px;color:#A8A29E;font-weight:400}
+    .vmlc-prod{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .vmlc-desc{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#57534E}
+    .vmlc-ref{color:#0C447C}
+    .vmlc-tabla tbody tr[data-venta]{cursor:pointer}
+    .vmlc-tabla tbody tr[data-venta]:hover{background:#FBFAF6}
+    .vmlc-sel{background:#FEF6E7!important;box-shadow:inset 3px 0 0 #D97706}
+    .vmlc-sug{background:#E1F5EE}
+    .vmlc-sug:hover{background:#D3EFE5}
+    .vmlc-sugbadge{font-size:11px;color:#0F6E56;background:#CDEDE1;border-radius:6px;padding:1px 7px;font-weight:600}
+    .vmlc-ok{color:#0F6E56;font-weight:600}
+    .vmlc-rev{font-size:12px;color:#92500A;background:#FAF1E1;border-radius:6px;padding:2px 8px}
+    .vmlc-no{font-size:12px;color:#857a5c;background:#FAF6EC;border:1px dashed #E3D9BE;border-radius:6px;padding:2px 8px}
+    .vmlc-empty{text-align:center;color:#A8A29E;padding:16px}
+    .vmlc-selbar{margin:8px 0 4px;font-size:13px;color:#57534E;background:#FAFAF9;border:1px solid #EFEAE3;border-radius:8px;padding:8px 12px}
+    .vmlc-cuenta{font-size:13px;color:#78716C;margin-left:4px}
   `;
   const style = document.createElement('style');
   style.id = 'vml-style';
