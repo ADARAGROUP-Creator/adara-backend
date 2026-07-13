@@ -1,4 +1,4 @@
-import { sbGet } from '../core/sb.js';
+import { sbGet, sbPatch } from '../core/sb.js';
 import { mlTabs } from '../core/mlTabs.js';
 import { exportarVentasXLSX } from '../core/reporte-ventas-xlsx.js';
 
@@ -33,6 +33,7 @@ let COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', com: 
 let BONIF_MAP_CUR = {};      // bonifs del período actual (para el repintado parcial de filtros)
 let VISTA = 'control';       // control (lista) | conciliar (dos tablas Ventas ↔ Cobros)
 let CONC_SEL = null;         // venta seleccionada en la vista de conciliación manual
+let CONC_HIDE_DONE = false;  // ocultar de las tablas lo ya conciliado (los totales igual lo cuentan)
 
 // ── Solapas de la pantalla ──────────────────────────────────────────────
 
@@ -61,6 +62,7 @@ const ddmm = f => `${(f || '').slice(8, 10)}/${(f || '').slice(5, 7)}`;
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const hoyISO = () => new Date().toISOString().slice(0, 10);
 const mesDe = f => (f || '').slice(0, 7);
+const nextPeriodo = ym => { const [y, m] = String(ym || '').split('-').map(Number); if (!y || !m) return ym; return m === 12 ? (y + 1) + '-01' : y + '-' + String(m + 1).padStart(2, '0'); };
 const fechaLarga = f => {
   if (!f) return '—';
   const [y, m, d] = f.split('-');
@@ -527,10 +529,31 @@ function infoMatch(v, bonifMap) {
   return { cobros, sum, obj, bonif, cierra, falta, sinCobro: cobros.length === 0 };
 }
 
+// Mueve una venta a otro "período de conciliación" (o la devuelve a su mes de venta
+// con periodo=null). Persiste en ventas_ml.conciliacion_periodo. Requiere la columna
+// (ver migración conciliacion_periodo) y policy UPDATE para authenticated (A17).
+async function diferirVenta(ventaId, periodo) {
+  try {
+    await sbPatch('ventas_ml', `id=eq.${ventaId}`, { conciliacion_periodo: periodo });
+    const v = VENTAS.find(x => String(x.id) === String(ventaId));
+    if (v) v.conciliacion_periodo = periodo;
+    if (String(CONC_SEL) === String(ventaId)) CONC_SEL = null;
+    window.toast(periodo ? 'Venta diferida a ' + periodo : 'Venta devuelta a su mes de venta');
+    render();
+  } catch (e) {
+    window.toast('No se pudo diferir la venta: ' + e.message, 'error');
+  }
+}
+
 function renderConciliar() {
   const root = document.getElementById('app-screens');
   const esMes = MODO === 'mes';
-  const base = VENTAS.length ? conjuntoActual() : [];
+  // La vista de conciliación usa el "período de conciliación" efectivo (override manual
+  // conciliacion_periodo, o el mes de la venta si no se difirió), para poder mover
+  // ventas entre meses con "Diferir →" y cerrar el mes actual al 100%.
+  const efPeriodo = v => v.conciliacion_periodo || mesDe(v.fecha);
+  const base = !VENTAS.length ? []
+    : (esMes ? VENTAS.filter(v => efPeriodo(v) === MES) : VENTAS.filter(v => v.fecha === FECHA));
   const BONIF_MAP = asignarBonifs(base);
 
   // Ventas del período. Se INCLUYEN conciliadas (marcadas), canceladas que salieron
@@ -620,6 +643,7 @@ function renderConciliar() {
   // Estado + acción por venta.
   const ventaRow = v => {
     let chip = '', acc = '', done = '';
+    const deferred = !!v.conciliacion_periodo;
     if (estaConciliada(v)) {
       chip = '<span class="vmlc-ok">✓ conciliada</span>'; done = 'vmlc-done';
       acc = `<button class="btn vml-mini vmlc-desv" data-accion="desv" data-venta="${v.id}">Deshacer</button>`;
@@ -632,6 +656,12 @@ function renderConciliar() {
       if (I.sinCobro) chip = '<span class="vmlc-no">sin cobro</span>';
       else if (I.cierra) { chip = '<span class="vmlc-ok">✓ cierra</span>'; acc = `<button class="btn btn-primary vml-mini" data-accion="conc" data-venta="${v.id}">Conciliar</button>`; }
       else chip = `<span class="vmlc-rev">${I.falta > 0 ? 'falta ' + money(I.falta) : 'sobra ' + money(I.falta)}</span>`;
+      // Las que no cierran se pueden empujar al mes siguiente para cerrar el mes actual.
+      if (!I.cierra) acc += `<button class="btn vml-mini vmlc-dif" data-accion="diferir" data-venta="${v.id}" title="Pasar esta venta al mes siguiente para conciliarla ahí">Diferir →</button>`;
+    }
+    if (deferred) {
+      chip += ` <span class="vmlc-difbadge" title="Movida a ${esc(v.conciliacion_periodo)}">diferida</span>`;
+      acc += ` <button class="btn vml-mini vmlc-traer" data-accion="traer" data-venta="${v.id}" title="Devolver al mes de la venta">↩</button>`;
     }
     return `<tr data-venta="${v.id}" class="${String(v.id) === String(CONC_SEL) ? 'vmlc-sel' : ''} ${done}">
         <td><a class="vml-venta-id" href="https://www.mercadolibre.com.ar/ventas/${esc(v.ml_order_id)}/detalle" target="_blank" rel="noopener">${esc(v.ml_order_id || v.id)}</a></td>
@@ -643,9 +673,16 @@ function renderConciliar() {
         <td style="text-align:right">${acc}</td>
       </tr>`;
   };
-  const ventasSorted = sel ? [sel, ...ventas.filter(v => v !== sel)] : ventas;
-  const filasVentas = ventasSorted.length ? ventasSorted.map(ventaRow).join('')
-    : `<tr><td colspan="7" class="vmlc-empty">No hay ventas en este período.</td></tr>`;
+  // Pendientes arriba (la seleccionada primero); las ya conciliadas bajan al fondo
+  // bajo un separador, y se pueden ocultar con el check. Los KPIs igual las cuentan.
+  const pendV0 = ventas.filter(v => !resuelta(v));
+  const pendV = sel && pendV0.includes(sel) ? [sel, ...pendV0.filter(v => v !== sel)] : pendV0;
+  const doneV = ventas.filter(v => resuelta(v));
+  const divV = (doneV.length && !CONC_HIDE_DONE) ? `<tr class="vmlc-divider"><td colspan="7">— ya conciliadas (${doneV.length}) —</td></tr>` : '';
+  const cuerpoV = pendV.map(ventaRow).join('') + divV + (CONC_HIDE_DONE ? '' : doneV.map(ventaRow).join(''));
+  const filasVentas = !ventas.length
+    ? `<tr><td colspan="7" class="vmlc-empty">No hay ventas en este período.</td></tr>`
+    : (cuerpoV || `<tr><td colspan="7" class="vmlc-empty">✓ Todas las ventas del mes están conciliadas.</td></tr>`);
 
   // Fila del extracto de MP (todo el movimiento de la cuenta, con su estado).
   const movRow = m => {
@@ -664,13 +701,18 @@ function renderConciliar() {
         <td>${estado}${isSel ? ' <span class="vmlc-sugbadge">sugerido</span>' : ''}</td>
       </tr>`;
   };
-  const movSel = movsMes.filter(m => selMovs.has(m.id));
-  const movResto = movsMes.filter(m => !selMovs.has(m.id));
-  const dividerMov = movSel.length && movResto.length
-    ? `<tr class="vmlc-divider"><td colspan="5">— resto del extracto de MP del mes —</td></tr>` : '';
-  const filasMovs = movsMes.length
-    ? (movSel.map(movRow).join('') + dividerMov + movResto.map(movRow).join(''))
-    : `<tr><td colspan="5" class="vmlc-empty">No hay movimientos de MP en este período.</td></tr>`;
+  // Orden: sugeridos (de la venta elegida) → pendientes sin vincular → ya vinculados/
+  // automáticos (al fondo, ocultables). Así lo actionable queda arriba y no marea.
+  const isDoneMov = m => !!(linkMov[m.id] || m.conciliado_auto);
+  const movSug = movsMes.filter(m => selMovs.has(m.id));
+  const movPend = movsMes.filter(m => !selMovs.has(m.id) && !isDoneMov(m));
+  const movDone = movsMes.filter(m => !selMovs.has(m.id) && isDoneMov(m));
+  const divPend = (movSug.length && movPend.length) ? `<tr class="vmlc-divider"><td colspan="5">— resto pendientes del extracto —</td></tr>` : '';
+  const divDone = (movDone.length && !CONC_HIDE_DONE && (movSug.length || movPend.length)) ? `<tr class="vmlc-divider"><td colspan="5">— ya vinculados / automáticos (${movDone.length}) —</td></tr>` : '';
+  const cuerpoM = movSug.map(movRow).join('') + divPend + movPend.map(movRow).join('') + divDone + (CONC_HIDE_DONE ? '' : movDone.map(movRow).join(''));
+  const filasMovs = !movsMes.length
+    ? `<tr><td colspan="5" class="vmlc-empty">No hay movimientos de MP en este período.</td></tr>`
+    : (cuerpoM || `<tr><td colspan="5" class="vmlc-empty">✓ Todo el extracto del mes está conciliado.</td></tr>`);
 
   // Barra de selección (bidireccional).
   let selResumen;
@@ -688,6 +730,7 @@ function renderConciliar() {
         <button class="${esMes ? 'active' : ''}" data-modo="mes">Mes</button>
       </div>
       ${navHTML}
+      <label class="vmlc-hidechk"><input type="checkbox" id="vmlc-hide" ${CONC_HIDE_DONE ? 'checked' : ''}> Ocultar conciliadas</label>
     </div>
     ${kpi}
     <div class="vml-sub" style="margin-top:4px">Conciliación mensual bidireccional: clic en una venta (izq.) o en un movimiento (der.) y se resalta su contraparte sugerida. Confirmás vos, venta por venta.</div>
@@ -721,6 +764,8 @@ function renderConciliar() {
   const inpM = document.getElementById('vmlc-mes');
   if (inpF) inpF.addEventListener('change', e => { FECHA = e.target.value; CONC_SEL = null; render(); });
   if (inpM) inpM.addEventListener('change', e => { MES = e.target.value; CONC_SEL = null; render(); });
+  const hideChk = document.getElementById('vmlc-hide');
+  if (hideChk) hideChk.addEventListener('change', e => { CONC_HIDE_DONE = e.target.checked; render(); });
   document.getElementById('vmlc-left').addEventListener('click', e => {
     const btn = e.target.closest('button[data-accion]');
     if (btn) {
@@ -729,6 +774,8 @@ function renderConciliar() {
       if (a === 'conc') conciliar(id);
       else if (a === 'concmov') conciliarMovimientos(id);
       else if (a === 'desv') desvincular(id);
+      else if (a === 'diferir') diferirVenta(id, nextPeriodo(MES));
+      else if (a === 'traer') diferirVenta(id, null);
       return;
     }
     const row = e.target.closest('tr[data-venta]');
@@ -1692,6 +1739,11 @@ function inyectarEstilo() {
     .vmlc-desv{color:#B91C1C}
     #vmlc-right tbody tr[data-mov]{cursor:pointer}
     #vmlc-right tbody tr[data-mov]:hover{background:#FBFAF6}
+    .vmlc-hidechk{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:#57534E;cursor:pointer;user-select:none}
+    .vmlc-hidechk input{cursor:pointer}
+    .vmlc-dif{color:#0C447C;margin-left:4px}
+    .vmlc-traer{color:#78716C;padding:5px 8px;margin-left:2px}
+    .vmlc-difbadge{font-size:11px;color:#0C447C;background:#E6F1FB;border-radius:6px;padding:1px 7px}
     .vmlc-ok{color:#0F6E56;font-weight:600}
     .vmlc-rev{font-size:12px;color:#92500A;background:#FAF1E1;border-radius:6px;padding:2px 8px}
     .vmlc-no{font-size:12px;color:#857a5c;background:#FAF6EC;border:1px dashed #E3D9BE;border-radius:6px;padding:2px 8px}
