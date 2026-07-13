@@ -532,16 +532,17 @@ function infoMatch(v, bonifMap) {
 // Mueve una venta a otro "período de conciliación" (o la devuelve a su mes de venta
 // con periodo=null). Persiste en ventas_ml.conciliacion_periodo. Requiere la columna
 // (ver migración conciliacion_periodo) y policy UPDATE para authenticated (A17).
-async function diferirVenta(ventaId, periodo) {
+async function diferirVenta(ventaId, periodo, select = false) {
   try {
     await sbPatch('ventas_ml', `id=eq.${ventaId}`, { conciliacion_periodo: periodo });
     const v = VENTAS.find(x => String(x.id) === String(ventaId));
     if (v) v.conciliacion_periodo = periodo;
-    if (String(CONC_SEL) === String(ventaId)) CONC_SEL = null;
-    window.toast(periodo ? 'Venta diferida a ' + periodo : 'Venta devuelta a su mes de venta');
+    if (select) CONC_SEL = String(ventaId);            // traída a este mes → queda seleccionada
+    else if (String(CONC_SEL) === String(ventaId)) CONC_SEL = null;
+    window.toast(periodo ? 'Venta movida a ' + periodo : 'Venta devuelta a su mes de venta');
     render();
   } catch (e) {
-    window.toast('No se pudo diferir la venta: ' + e.message, 'error');
+    window.toast('No se pudo mover la venta: ' + e.message, 'error');
   }
 }
 
@@ -575,6 +576,11 @@ function renderConciliar() {
   }
   const ordById = {};
   VENTAS.forEach(v => { ordById[v.id] = v.ml_order_id || v.id; });
+  // Para traer al mes una venta de OTRO mes cuando aparece su movimiento: mapa
+  // referencia(mp_payment_id) -> venta sobre TODAS las ventas + set de las visibles.
+  const ventaByRef = {};
+  for (const v of VENTAS) for (const pid of paymentIds(v)) if (ventaByRef[pid] == null) ventaByRef[pid] = v;
+  const curVentaIds = new Set(ventas.map(v => String(v.id)));
 
   // Selección (bidireccional). Default: primera pendiente que cierra, si no la primera.
   if (CONC_SEL == null || !ventas.some(v => String(v.id) === String(CONC_SEL))) {
@@ -687,13 +693,16 @@ function renderConciliar() {
   // Fila del extracto de MP (todo el movimiento de la cuenta, con su estado).
   const movRow = m => {
     const ref = String(m.referencia_externa || '').split('|')[1] || '';
-    const vId = linkMov[m.id];
-    const estado = vId
-      ? `<span class="vmlc-ok">→ #${esc(ordById[vId] || vId)}</span>`
-      : (m.conciliado_auto ? '<span class="vmlc-auto">auto</span>' : '<span class="vmlc-pend">pendiente</span>');
+    const linkedV = linkMov[m.id];         // ya vinculado a una venta (cualquier mes)
+    const inMonthV = mov2venta[m.id];       // venta visible en este mes (para seleccionar)
+    const anyV = ventaByRef[ref];           // venta en cualquier mes (para traer)
+    let estado, dataAttr = '';
+    if (linkedV) estado = `<span class="vmlc-ok">→ #${esc(ordById[linkedV] || linkedV)}</span>`;
+    else if (inMonthV != null && curVentaIds.has(String(inMonthV))) { estado = m.conciliado_auto ? '<span class="vmlc-auto">auto</span>' : '<span class="vmlc-pend">pendiente</span>'; dataAttr = ` data-venta="${inMonthV}"`; }
+    else if (anyV) { estado = `<span class="vmlc-traible">venta de ${esc(efPeriodo(anyV))} · traer ↰</span>`; dataAttr = ` data-traer="${anyV.id}"`; }
+    else estado = m.conciliado_auto ? '<span class="vmlc-auto">auto</span>' : '<span class="vmlc-pend">sin venta</span>';
     const isSel = selMovs.has(m.id);
-    const dv = mov2venta[m.id];
-    return `<tr class="${isSel ? 'vmlc-sug' : (vId ? 'vmlc-done' : '')}" data-mov="${m.id}"${dv != null ? ` data-venta="${dv}"` : ''}>
+    return `<tr class="${isSel ? 'vmlc-sug' : (linkedV ? 'vmlc-done' : '')}" data-mov="${m.id}"${dataAttr}>
         <td class="vml-mono">${esc(ddmm(m.fecha))}</td>
         <td class="vml-mono vmlc-ref">${esc(ref)}</td>
         <td class="vmlc-desc" title="${esc(m.descripcion || '')}">${esc((m.descripcion || '').slice(0, 38))}</td>
@@ -782,10 +791,18 @@ function renderConciliar() {
     if (row) { CONC_SEL = row.dataset.venta; render(); }
   });
   document.getElementById('vmlc-right').addEventListener('click', e => {
-    const row = e.target.closest('tr[data-venta]');
-    if (row) { CONC_SEL = row.dataset.venta; render(); return; }
+    const rowV = e.target.closest('tr[data-venta]');
+    if (rowV) { CONC_SEL = rowV.dataset.venta; render(); return; }
+    const rowT = e.target.closest('tr[data-traer]');
+    if (rowT) {
+      const vid = rowT.dataset.traer;
+      const v = VENTAS.find(x => String(x.id) === String(vid));
+      const mesV = v ? (v.conciliacion_periodo || mesDe(v.fecha)) : '?';
+      if (confirm(`Esta venta (#${v ? (v.ml_order_id || v.id) : vid}) es de ${mesV}. ¿Traerla a ${MES} para conciliarla acá?`)) diferirVenta(vid, MES, true);
+      return;
+    }
     const m = e.target.closest('tr[data-mov]');
-    if (m) window.toast('Ese movimiento todavía no tiene una venta asociada');
+    if (m) window.toast('Ese movimiento no corresponde a una venta de ADARA (posible cargo de ML o venta 2025)');
   });
 }
 
@@ -1744,6 +1761,7 @@ function inyectarEstilo() {
     .vmlc-dif{color:#0C447C;margin-left:4px}
     .vmlc-traer{color:#78716C;padding:5px 8px;margin-left:2px}
     .vmlc-difbadge{font-size:11px;color:#0C447C;background:#E6F1FB;border-radius:6px;padding:1px 7px}
+    .vmlc-traible{font-size:12px;color:#0C447C;background:#E6F1FB;border-radius:6px;padding:2px 8px;font-weight:600}
     .vmlc-ok{color:#0F6E56;font-weight:600}
     .vmlc-rev{font-size:12px;color:#92500A;background:#FAF1E1;border-radius:6px;padding:2px 8px}
     .vmlc-no{font-size:12px;color:#857a5c;background:#FAF6EC;border:1px dashed #E3D9BE;border-radius:6px;padding:2px 8px}
