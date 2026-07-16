@@ -332,7 +332,23 @@ app.get('/debug/order/:orderId', async (req, res) => {
         }
       });
     }
-    res.json({ order_id: order.id, status: order.status, total_amount: order.total_amount, payments: result });
+    // Bloque para confirmar el aporte de ML en promos compartidas (ML-BON1):
+    // total_amount = lo que ADARA guarda como importe_bruto; coupon = aporte de ML;
+    // paid_amount = lo que pagó el comprador; por ítem, full_unit_price (lista) vs unit_price (cobrado).
+    const bon = {
+      total_amount: order.total_amount,
+      paid_amount:  order.paid_amount,
+      coupon:       order.coupon || null,
+      order_items:  (order.order_items || []).map(it => ({
+        titulo:          it.item?.title,
+        seller_sku:      it.item?.seller_sku || it.item?.seller_custom_field,
+        cantidad:        it.quantity,
+        unit_price:      it.unit_price,
+        full_unit_price: it.full_unit_price,
+        sale_fee:        it.sale_fee,
+      })),
+    };
+    res.json({ order_id: order.id, status: order.status, total_amount: order.total_amount, bonificacion_ml_debug: bon, payments: result });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
