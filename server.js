@@ -596,15 +596,6 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
         const payment = approvedPayments[0] || o.payments?.[0] || {};
         const allPaymentIds = approvedPayments.map(p => String(p.id));
         const bruto   = o.total_amount     || 0;
-        // "Real facturado" = lo que efectivamente paga el comprador (base de la factura
-        // electrónica / IVA débito). Vive a NIVEL PAGO (transaction_amount), NO a nivel
-        // orden: en promos compartidas o.total_amount y o.paid_amount vienen con el aporte
-        // de ML incluido, mientras que payment.transaction_amount es el precio del comprador.
-        // Se suman todos los pagos aprobados (split payment). Aporte de ML = bruto - facturado.
-        // Ver ADARA-ML-BONIFICACIONES.md §9-§11.
-        const facturado = approvedPayments.reduce(
-          (s, p) => s + (p.transaction_amount != null ? p.transaction_amount
-                        : (p.total_paid_amount != null ? p.total_paid_amount : 0)), 0);
         // Fecha y hora SIEMPRE en horario de Argentina, para que coincidan
         // exactamente con lo que muestra Mercado Libre (panel de ventas/envíos).
         // date_created puede venir en UTC o con offset; convertimos el instante
@@ -636,8 +627,8 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             sku:              sellerSku,
             cantidad:         item.quantity || 1,
             importe_bruto:    bruto,
-            importe_facturado: facturado > 0 ? facturado : null,
-            aporte_ml:        (facturado > 0 && bruto > facturado) ? +(bruto - facturado).toFixed(2) : 0,
+            importe_facturado: null,   // se completa tras leer los charges del pago (bruto - aporte ML)
+            aporte_ml:        0,       // aporte de ML = Σ cargos coupon/rebate (se acumula abajo)
             cargo_venta:      -Math.abs(comisionReal),
             cargo_envio:      0,
             costo_financiero: 0,
@@ -760,6 +751,7 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
           if (od.paymentIds.length && od.row.ml_status !== 'cancelled') {
             od._comision = 0; od._impuestos = 0; od._financiero = 0; od._financiero_info = 0; od._envio = 0;
             od._shippingBuyerContrib = 0; // contribución del comprador al envío
+            od._aporteMl = 0; // aporte de ML en promo compartida = Σ cargos coupon/rebate
 
             for (const pid of od.paymentIds) {
               promises.push(
@@ -777,9 +769,16 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
                     const type = (ch.type || '').toLowerCase();
                     const name = (ch.name || '').toLowerCase();
 
-                    // Skip buyer-side charges (coupons, discounts)
-                    if (type === 'coupon' || type === 'discount') continue;
-                    if (name.includes('coupon') || name.includes('rebate')) continue;
+                    // Coupon / rebate = APORTE DE MERCADO LIBRE en promo compartida.
+                    // No es cargo del vendedor (por eso no entra a comisión/impuestos), pero
+                    // SÍ está adentro de importe_bruto (=total_amount): el real facturado al
+                    // comprador = importe_bruto − aporte. Lo acumulamos para derivar
+                    // importe_facturado / aporte_ml. Ver ADARA-ML-BONIFICACIONES.md §9-§11.
+                    if (type === 'coupon' || type === 'discount'
+                        || name.includes('coupon') || name.includes('rebate')) {
+                      od._aporteMl += amt;
+                      continue;
+                    }
                     // tax_withholding_payer-* = retencion del COMPRADOR, no del vendedor → ignorar
                     if (type === 'tax' && name.includes('_payer')) continue;
 
@@ -824,6 +823,17 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
           // Aplicar totales acumulados de TODOS los payments (split payment support)
           if (od._comision > 0) od.row.cargo_venta = -od._comision;
           if (od._impuestos > 0) od.row.impuestos = -od._impuestos;
+
+          // Real facturado (base de la factura / IVA débito) = importe_bruto − aporte de ML.
+          // El aporte es Σ de los cargos coupon/rebate del pago (acumulado arriba). Si no hay
+          // aporte, el facturado = el bruto. Ver ADARA-ML-BONIFICACIONES.md §9-§11.
+          {
+            const aporte = +((od._aporteMl || 0)).toFixed(2);
+            od.row.aporte_ml = aporte;
+            od.row.importe_facturado = od.row.importe_bruto != null
+              ? +((od.row.importe_bruto - aporte)).toFixed(2)
+              : null;
+          }
 
           // financing_add_on_fee: el VENDEDOR ofrece cuotas sin interés. ML descuenta este costo
           //   de la liquidación → afecta por_cobrar. Se guarda en costo_financiero.
