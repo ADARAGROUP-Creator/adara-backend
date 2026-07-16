@@ -596,6 +596,15 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
         const payment = approvedPayments[0] || o.payments?.[0] || {};
         const allPaymentIds = approvedPayments.map(p => String(p.id));
         const bruto   = o.total_amount     || 0;
+        // "Real facturado" = lo que efectivamente paga el comprador (base de la factura
+        // electrónica / IVA débito). Vive a NIVEL PAGO (transaction_amount), NO a nivel
+        // orden: en promos compartidas o.total_amount y o.paid_amount vienen con el aporte
+        // de ML incluido, mientras que payment.transaction_amount es el precio del comprador.
+        // Se suman todos los pagos aprobados (split payment). Aporte de ML = bruto - facturado.
+        // Ver ADARA-ML-BONIFICACIONES.md §9-§11.
+        const facturado = approvedPayments.reduce(
+          (s, p) => s + (p.transaction_amount != null ? p.transaction_amount
+                        : (p.total_paid_amount != null ? p.total_paid_amount : 0)), 0);
         // Fecha y hora SIEMPRE en horario de Argentina, para que coincidan
         // exactamente con lo que muestra Mercado Libre (panel de ventas/envíos).
         // date_created puede venir en UTC o con offset; convertimos el instante
@@ -627,6 +636,8 @@ async function syncMLVentas(diasAtras = 7, fechaDesde = null, fechaHasta = null)
             sku:              sellerSku,
             cantidad:         item.quantity || 1,
             importe_bruto:    bruto,
+            importe_facturado: facturado > 0 ? facturado : null,
+            aporte_ml:        (facturado > 0 && bruto > facturado) ? +(bruto - facturado).toFixed(2) : 0,
             cargo_venta:      -Math.abs(comisionReal),
             cargo_envio:      0,
             costo_financiero: 0,
