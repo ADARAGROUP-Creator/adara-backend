@@ -90,13 +90,16 @@ function calc() {
   });
   const sCif = rows.reduce((s, r) => s + r.cif, 0);
 
-  // CIF "real sombra": lo que declararías poniendo TODO a valor y cantidad reales.
-  // Solo mide el ahorro de derechos+estadística que habilita la coima; NO afecta el costo.
+  // CIF "real sombra": lo que declararías poniendo FOB y cantidad reales (los ejes de subdeclaración
+  // del PRODUCTO). Solo mide el ahorro de derechos+estadística que habilita la coima; NO afecta el costo.
+  // NOTA: el flete y el seguro se prorratean con los MISMOS valores DECLARADOS que el CIF declarado.
+  // La diferencia flete_real − flete_declarado es puro costeo (capitaliza vía bolsón) y NO es
+  // subdeclaración aduanera → no debe generar ahorro ni coima. El ahorro nace solo de FOB + cantidad
+  // + posición arancelaria del producto. (Fix HOKU 22/7/2026 — ver P15.)
   const sPesoReal = rows.reduce((s, r) => s + num(r.p.peso_u) * r.cantReal, 0);
-  const seguroReal = segMonto > 0 ? segMonto : segPct * (fobRealTot + fleteReal);
   rows.forEach(r => {
     const pesoRealT = num(r.p.peso_u) * r.cantReal;
-    r.cifReal = r.fobRealT + fleteReal * safeDiv(pesoRealT, sPesoReal) + seguroReal * safeDiv(r.fobRealT, fobRealTot);
+    r.cifReal = r.fobRealT + fleteDecl * safeDiv(pesoRealT, sPesoReal) + seguroTotal * safeDiv(r.fobRealT, fobRealTot);
   });
 
   // Tributos declarados (lo que pagás) + ahorro vs declarar todo real (derechos + estadística).
