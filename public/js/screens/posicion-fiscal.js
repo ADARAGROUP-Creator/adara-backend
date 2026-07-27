@@ -167,7 +167,7 @@ function render() {
       <td>${fmtMoney(To.iva_debito)}</td>
       <td>${fmtMoney(To.iva_credito)}</td>
       <td>${apagarCell(To.iva_a_pagar)}</td>
-      <td colspan="2" style="text-align:right">saldo a favor vigente: <span class="favor">${fmtMoney(apTec)}</span> téc. + <span class="favor">${fmtMoney(apLibre)}</span> libre</td>
+      <td colspan="2" style="text-align:right">saldo a favor de apertura (jun): <span class="favor">${fmtMoney(apTec)}</span> téc. + <span class="favor">${fmtMoney(apLibre)}</span> libre</td>
     </tr>`;
 
   // ── Tabla IIBB ─────────────────────────────────────────────────────────
@@ -228,7 +228,9 @@ function render() {
       adelante:</b> se calcula fino y esos saldos se descuentan mes a mes; el «a pagar» de julio es <b>provisional</b>
       (worst-case) hasta cargar el crédito por Compras y Gastos. El <b>saldo técnico</b> tapa IVA débito futuro; la
       <b>libre disponibilidad</b> se aplica a lo que quede a pagar o a otros impuestos. Los meses anteriores a junio son
-      <b>incompletos</b> (no oficiales).</div>
+      <b>incompletos</b> (no oficiales).<br><b>El arrastre es automático:</b> en julio el bruto de ${fmtMoney(apertura ? filas.find(f=>f.estado_fiscal==='fino')?.iva_debito : 0)} <b>ya tiene aplicados</b> los ${fmtMoney(apTec)} a favor
+      (por eso queda el «a pagar» que ves, no el débito entero). Si al cargar el crédito el neto del mes baja por debajo del
+      colchón, el a pagar es $0 y el remanente pasa solo al mes siguiente.</div>
     </div>
 
     <div class="pf-sec">
