@@ -12,16 +12,19 @@ import { sbGet } from '../core/sb.js';
 //   - iibb_percepciones ← compra_componentes (pago a cuenta).
 //   - impuesto_cheque   ← retenciones (impuesto a débitos/créditos bancarios).
 //
+// APERTURA FISCAL (27/7/2026): junio 2026 se carga como TOTAL de la DDJJ
+// (tabla posicion_fiscal_apertura) y v_posicion_fiscal arrastra dos saldos a
+// favor mes a mes: técnico (crédito > débito) y libre disponibilidad
+// (retenciones/percepciones de IVA). La vista expone:
+//   - saldo_tecnico_favor : colchón que tapa IVA débito futuro.
+//   - libre_disponibilidad: colchón aplicable al a pagar / otros impuestos.
+//   - estado_fiscal       : 'apertura' (jun, DDJJ), 'fino' (jul→), 'incompleto'
+//                           (ene–may, no oficial). Ver ADARA-IMPUESTOS.md.
+//
 // Límites actuales (ver ADARA-IMPUESTOS.md / P12):
-//  - IVA crédito INCOMPLETO: faltan compras/gastos con factura A → el "IVA a
-//    pagar" sale alto. El débito sí es exacto. Se llena con Tango/B2B + gastos.
-//  - IIBB DETERMINADO (alícuota × base por jurisdicción) PENDIENTE de las
-//    alícuotas del contador. Hoy solo se ven los pagos a cuenta; el saldo real
-//    (determinado − pagos a cuenta) no se puede cerrar todavía.
-//  - GANANCIAS pendiente de la tasa del contador.
-//  - Apertura por jurisdicción y el impuesto al cheque arrancan en abril (gap
-//    histórico ene/feb del settlement de MP, irrecuperable). El MONTO de IIBB
-//    retenido sí está completo desde enero. Ver ADARA-RETENCIONES-IIBB.md.
+//  - IVA crédito INCOMPLETO en los meses finos: faltan compras/gastos con
+//    factura A → el "a pagar" sale alto (worst-case). El débito sí es exacto.
+//  - IIBB DETERMINADO y GANANCIAS pendientes de alícuotas/tasa del contador.
 
 function num(v) { return Number(v) || 0; }
 function fmtNum(n, dec = 0) {
@@ -64,6 +67,7 @@ const STYLE = `
 .pf .pf-kpi .v{font-weight:700;font-size:22px;line-height:1.15;color:var(--text);letter-spacing:-0.02em;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pf .pf-kpi .s{font-size:11px;color:var(--text-muted);margin-top:5px;line-height:1.35}
 .pf .pf-kpi.acc .v{color:var(--acc)}
+.pf .pf-kpi.fav .v{color:#15803D}
 
 .pf .pf-sec{margin:0 0 26px}
 .pf .pf-sec-h{display:flex;align-items:baseline;gap:10px;margin:0 0 10px}
@@ -71,7 +75,7 @@ const STYLE = `
 .pf .pf-sec-h .tag{font-size:11px;font-weight:600;color:var(--text-muted)}
 
 .pf .tbl{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);overflow-x:auto}
-.pf table{width:100%;border-collapse:collapse;font-size:14px;min-width:640px}
+.pf table{width:100%;border-collapse:collapse;font-size:14px;min-width:760px}
 .pf thead th{text-align:right;padding:11px 14px;font-weight:600;font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;background:var(--surface-alt);border-bottom:1px solid var(--border);white-space:nowrap}
 .pf thead th:first-child{text-align:left}
 .pf tbody td{padding:11px 14px;border-top:1px solid var(--border);text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--text)}
@@ -80,19 +84,39 @@ const STYLE = `
 .pf .apagar{font-weight:600}
 .pf .favor{color:#15803D;font-weight:600}
 .pf .pend{color:var(--text-soft)}
+.pf .dash{color:var(--text-soft)}
 .pf .acct{color:var(--text-muted)}
 .pf tr.tot td{border-top:2px solid var(--border-strong);font-weight:700;background:var(--surface-alt)}
 .pf tr.tot:hover td{background:var(--surface-alt)}
+.pf tr.inc td{color:var(--text-soft)}
 .pf .empty{padding:34px;text-align:center;color:var(--text-muted)}
 .pf .note{margin-top:10px;font-size:12.5px;line-height:1.55;color:var(--text-muted)}
 .pf .note b{color:var(--text);font-weight:600}
+.pf .chip{display:inline-block;font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;letter-spacing:.03em;text-transform:uppercase;margin-left:6px;vertical-align:middle}
+.pf .chip.ap{background:#DBEAFE;color:#1E40AF}
+.pf .chip.inc{background:#F3E8D6;color:#9A6A00}
 </style>`;
 
-// IVA a pagar: positivo = a pagar; negativo = saldo a favor (carryforward)
-function ivaCell(n) {
+// A pagar de meses oficiales (apertura/fino): la vista ya lo deja >= 0.
+function apagarCell(n) {
+  const v = num(n);
+  return v > 0 ? `<span class="apagar">${fmtMoney(v)}</span>` : `<span class="dash">—</span>`;
+}
+// A pagar de meses incompletos (derivado): puede dar negativo = saldo a favor.
+function ivaCellInc(n) {
   const v = num(n);
   if (v < 0) return `<span class="favor">${fmtMoney(-v)} a favor</span>`;
   return `<span class="apagar">${fmtMoney(v)}</span>`;
+}
+function favorCell(n) {
+  const v = num(n);
+  return v > 0 ? `<span class="favor">${fmtMoney(v)}</span>` : `<span class="dash">—</span>`;
+}
+function estadoChip(f) {
+  const e = f.estado_fiscal;
+  if (e === 'apertura') return `<span class="chip ap" title="Cargado como total de la DDJJ">DDJJ</span>`;
+  if (e === 'incompleto') return `<span class="chip inc" title="Anterior al corte de apertura — no oficial">incompleto</span>`;
+  return ''; // fino: sin chip
 }
 
 function render() {
@@ -100,13 +124,10 @@ function render() {
   const filas = [...DATA].sort((a, b) => String(a.periodo).localeCompare(String(b.periodo)));
 
   const T = filas.reduce((a, f) => ({
-    iva_debito: a.iva_debito + num(f.iva_debito),
-    iva_credito: a.iva_credito + num(f.iva_credito),
-    iva_a_pagar: a.iva_a_pagar + num(f.iva_a_pagar),
     iibb_retenido: a.iibb_retenido + num(f.iibb_retenido),
     iibb_percepciones: a.iibb_percepciones + num(f.iibb_percepciones),
     impuesto_cheque: a.impuesto_cheque + num(f.impuesto_cheque),
-  }), { iva_debito:0, iva_credito:0, iva_a_pagar:0, iibb_retenido:0, iibb_percepciones:0, impuesto_cheque:0 });
+  }), { iibb_retenido:0, iibb_percepciones:0, impuesto_cheque:0 });
 
   const pagoCuentaIibb = T.iibb_retenido + T.iibb_percepciones;
 
@@ -115,18 +136,38 @@ function render() {
     return;
   }
 
+  // ── Meses oficiales (apertura + fino) para los totales de IVA ──────────────
+  const esOficial = f => f.estado_fiscal === 'apertura' || f.estado_fiscal === 'fino';
+  const oficial = filas.filter(esOficial);
+  const To = oficial.reduce((a, f) => ({
+    iva_debito: a.iva_debito + num(f.iva_debito),
+    iva_credito: a.iva_credito + num(f.iva_credito),
+    iva_a_pagar: a.iva_a_pagar + num(f.iva_a_pagar),
+  }), { iva_debito:0, iva_credito:0, iva_a_pagar:0 });
+
+  // Apertura = ancla del saldo a favor (número confirmado por la DDJJ).
+  const apertura = filas.find(f => f.estado_fiscal === 'apertura');
+  const apTec = apertura ? num(apertura.saldo_tecnico_favor) : 0;
+  const apLibre = apertura ? num(apertura.libre_disponibilidad) : 0;
+
   // ── Tabla IVA ──────────────────────────────────────────────────────────
-  const ivaBody = filas.map(f => `<tr>
-      <td>${esc(fmtPeriodo(f.periodo))}</td>
+  const ivaBody = filas.map(f => {
+    const ofi = esOficial(f);
+    return `<tr class="${ofi ? '' : 'inc'}">
+      <td>${esc(fmtPeriodo(f.periodo))}${estadoChip(f)}</td>
       <td>${fmtMoney(f.iva_debito)}</td>
       <td>${num(f.iva_credito) ? fmtMoney(f.iva_credito) : '<span class="pend">0,00</span>'}</td>
-      <td>${ivaCell(f.iva_a_pagar)}</td>
-    </tr>`).join('');
+      <td>${ofi ? apagarCell(f.iva_a_pagar) : ivaCellInc(f.iva_a_pagar)}</td>
+      <td>${ofi ? favorCell(f.saldo_tecnico_favor) : '<span class="dash">—</span>'}</td>
+      <td>${ofi ? favorCell(f.libre_disponibilidad) : '<span class="dash">—</span>'}</td>
+    </tr>`;
+  }).join('');
   const ivaTot = `<tr class="tot">
-      <td>Total</td>
-      <td>${fmtMoney(T.iva_debito)}</td>
-      <td>${fmtMoney(T.iva_credito)}</td>
-      <td>${ivaCell(T.iva_a_pagar)}</td>
+      <td>Total oficial (jun 2026 →)</td>
+      <td>${fmtMoney(To.iva_debito)}</td>
+      <td>${fmtMoney(To.iva_credito)}</td>
+      <td>${apagarCell(To.iva_a_pagar)}</td>
+      <td colspan="2" style="text-align:right">saldo a favor vigente: <span class="favor">${fmtMoney(apTec)}</span> téc. + <span class="favor">${fmtMoney(apLibre)}</span> libre</td>
     </tr>`;
 
   // ── Tabla IIBB ─────────────────────────────────────────────────────────
@@ -160,28 +201,34 @@ function render() {
 
     <div class="pf-aviso"><span class="ic">⚠</span><div>
       La <b>Posición Fiscal</b> mide cuánto se le debe al fisco y cómo pega en la <b>caja</b> — es distinto del
-      Resultado (el IVA no es rentabilidad). Hoy el <b>IVA a pagar sale alto porque el crédito está incompleto</b>
-      (faltan compras y gastos con factura A; se llena con Tango/B2B y gastos). El <b>IIBB determinado</b> (alícuota ×
-      base por jurisdicción) y <b>Ganancias</b> quedan pendientes de las alícuotas/tasa del contador. Las
-      <b>retenciones y percepciones son pagos a cuenta</b> (plata adelantada), no costo: descuentan lo que queda por
-      pagar, no se suman al impuesto.
+      Resultado (el IVA no es rentabilidad). <b>Junio 2026</b> está cargado como total de la DDJJ
+      (<span class="chip ap">DDJJ</span>) y quedó con <b>saldo a favor</b>; de <b>julio</b> en adelante se carga fino y
+      ese saldo se descuenta mes a mes. Los meses previos a junio son <b>incompletos</b> (no oficiales). El
+      <b>IVA a pagar de julio sale alto porque el crédito está incompleto</b> (faltan compras y gastos con factura A);
+      baja al cargarlos. <b>IIBB determinado</b> y <b>Ganancias</b> quedan pendientes de las alícuotas/tasa del contador.
+      Las <b>retenciones y percepciones son pagos a cuenta</b> (plata adelantada), no costo.
     </div></div>
 
     <div class="pf-kpis">
-      <div class="pf-kpi acc"><div class="l">IVA a pagar (acumulado)</div><div class="v">${fmtMoney(T.iva_a_pagar)}</div><div class="s">débito − crédito · crédito incompleto</div></div>
+      <div class="pf-kpi fav"><div class="l">IVA · saldo a favor (jun 2026)</div><div class="v">${fmtMoney(apTec)}</div><div class="s">+ ${fmtMoney(apLibre)} libre disponibilidad · arrastra</div></div>
+      <div class="pf-kpi acc"><div class="l">IVA a pagar (jul 2026 →)</div><div class="v">${fmtMoney(To.iva_a_pagar)}</div><div class="s">provisional · crédito de julio incompleto</div></div>
       <div class="pf-kpi"><div class="l">IIBB pagos a cuenta</div><div class="v">${fmtMoney(pagoCuentaIibb)}</div><div class="s">retenciones + percepciones</div></div>
       <div class="pf-kpi"><div class="l">Impuesto al cheque</div><div class="v">${fmtMoney(T.impuesto_cheque)}</div><div class="s">débitos/créditos bancarios</div></div>
       <div class="pf-kpi"><div class="l">IIBB determinado</div><div class="v pend" style="font-size:15px;font-weight:600">pendiente contador</div><div class="s">alícuotas por jurisdicción</div></div>
     </div>
 
     <div class="pf-sec">
-      <div class="pf-sec-h"><h3>IVA</h3><span class="tag">débito − crédito = a pagar · mensual, devengado</span></div>
+      <div class="pf-sec-h"><h3>IVA</h3><span class="tag">apertura jun (DDJJ) + arrastre de saldos a favor · mensual, devengado</span></div>
       <div class="tbl"><table>
-        <thead><tr><th>Período</th><th>Débito (ventas)</th><th>Crédito (compras/gastos)</th><th>A pagar</th></tr></thead>
+        <thead><tr><th>Período</th><th>Débito (ventas)</th><th>Crédito (compras/gastos)</th><th>A pagar</th><th>Saldo téc. a favor</th><th>Libre disp.</th></tr></thead>
         <tbody>${ivaBody}${ivaTot}</tbody>
       </table></div>
-      <div class="note"><b>Crédito incompleto:</b> solo están cargadas unas pocas compras con IVA. A medida que entren
-      las compras (Tango/B2B) y los gastos con factura A, el crédito sube y el «a pagar» baja al valor real.</div>
+      <div class="note"><b>Junio = apertura (DDJJ):</b> se cargó como total; dejó un <b>saldo técnico a favor</b> de
+      ${fmtMoney(apTec)} + ${fmtMoney(apLibre)} de <b>libre disponibilidad</b> que arrastran a julio. <b>Julio en
+      adelante:</b> se calcula fino y esos saldos se descuentan mes a mes; el «a pagar» de julio es <b>provisional</b>
+      (worst-case) hasta cargar el crédito por Compras y Gastos. El <b>saldo técnico</b> tapa IVA débito futuro; la
+      <b>libre disponibilidad</b> se aplica a lo que quede a pagar o a otros impuestos. Los meses anteriores a junio son
+      <b>incompletos</b> (no oficiales).</div>
     </div>
 
     <div class="pf-sec">
