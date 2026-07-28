@@ -1,4 +1,4 @@
-import { sbGet } from '../core/sb.js';
+import { sbGet, sbPost } from '../core/sb.js';
 
 // ── Pantalla: Compras (capa 2) ──────────────────────────────────────────
 // Facturas de compra de MERCADERÍA (local). A diferencia de Gastos, una compra
@@ -54,6 +54,15 @@ const JURISDICCIONES = [
   ['santiago_del_estero', 'Santiago del Estero'],
   ['tierra_del_fuego', 'Tierra del Fuego'],
   ['tucuman', 'Tucumán'],
+];
+
+// Familias (igual que la pantalla SKUs) para el alta rápida de SKU en la compra.
+const FAMILIAS = [
+  { val: '', label: 'Sin clasificar' },
+  { val: 'electronica', label: 'Electrónica' },
+  { val: 'luminaria', label: 'Luminaria' },
+  { val: 'mochila_sindical', label: 'Mochila sindical' },
+  { val: 'mochila_individual', label: 'Mochila individual' },
 ];
 
 export async function loadCompras() {
@@ -336,7 +345,7 @@ function openAlta() {
       </div>
 
       <div class="com-block">
-        <div class="com-block-h"><span>Productos (mercadería)</span><button class="btn btn-ghost com-mini" id="c-add-item" type="button">+ Agregar</button></div>
+        <div class="com-block-h"><span>Productos (mercadería)</span><div style="display:flex;gap:6px"><button class="btn btn-ghost com-mini" id="c-new-sku" type="button">+ Nuevo SKU</button><button class="btn btn-ghost com-mini" id="c-add-item" type="button">+ Agregar</button></div></div>
         <div id="c-items"></div>
       </div>
 
@@ -474,6 +483,59 @@ function openAlta() {
     if (e.target.matches('.com-it-del')) { leerItems(); ITEMS.splice(+e.target.closest('.com-item').dataset.i, 1); pintarItems(); }
   });
   $('#c-add-item').addEventListener('click', () => { leerItems(); ITEMS.push({ sku_id: '', cantidad: '', costo: '', iva: 0.21, extra: '' }); pintarItems(); });
+
+  // + Nuevo SKU: alta al vuelo sin salir de la compra (reusa sbPost('skus') como la pantalla SKUs).
+  function openNuevoSku() {
+    const ov = document.createElement('div');
+    ov.className = 'modal-overlay';
+    ov.innerHTML = `
+      <div class="modal" style="max-width:460px">
+        <div class="card-title">Nuevo SKU</div>
+        <div class="field"><label>Código *</label><input class="input" id="ns-cod" placeholder="ej: TA012G"></div>
+        <div class="field"><label>Descripción *</label><input class="input" id="ns-desc" placeholder="ej: Tablet Samsung Galaxy Tab A9"></div>
+        <div class="com-row3">
+          <div class="field" style="grid-column:span 2"><label>Familia</label><select class="select" id="ns-fam">${FAMILIAS.map(f => `<option value="${f.val}" ${f.val === 'electronica' ? 'selected' : ''}>${esc(f.label)}</option>`).join('')}</select></div>
+          <div class="field"><label>IVA (%)</label><input class="input" id="ns-iva" value="21,00"></div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-ghost" id="ns-cancel" type="button">Cancelar</button>
+          <button class="btn btn-primary" id="ns-save" type="button">Crear SKU</button>
+        </div>
+      </div>`;
+    document.body.appendChild(ov);
+    const q = s => ov.querySelector(s);
+    const cerrar = () => ov.remove();
+    ov.addEventListener('click', e => { if (e.target === ov) cerrar(); });
+    q('#ns-cancel').addEventListener('click', cerrar);
+    q('#ns-cod').focus();
+    q('#ns-save').addEventListener('click', async () => {
+      const codigo = q('#ns-cod').value.trim();
+      const desc = q('#ns-desc').value.trim();
+      const fam = q('#ns-fam').value || null;
+      const ivaNum = parseFloat(q('#ns-iva').value.replace('%', '').replace(',', '.').trim());
+      if (!codigo) { window.toast('Falta el código', 'error'); return; }
+      if (!desc) { window.toast('Falta la descripción', 'error'); return; }
+      if (isNaN(ivaNum) || ivaNum < 0 || ivaNum > 100) { window.toast('IVA inválido', 'error'); return; }
+      if (SKUS.some(s => (s.codigo || '').toLowerCase() === codigo.toLowerCase())) { window.toast('Ya existe un SKU con ese código', 'error'); return; }
+      const btn = q('#ns-save'); btn.disabled = true;
+      try {
+        const created = await sbPost('skus', { codigo, descripcion: desc, familia: fam, alicuota_iva: +(ivaNum / 100).toFixed(4), activo: true });
+        const s = (created && created[0]) ? created[0] : { id: null, codigo, descripcion: desc, alicuota_iva: +(ivaNum / 100).toFixed(4) };
+        SKUS.push(s); SKUS.sort((a, b) => (a.codigo || '').localeCompare(b.codigo || ''));
+        SKU_BY_ID[s.id] = s;
+        // Lo dejo seleccionado en la primera fila sin SKU (o creo una nueva).
+        leerItems();
+        let idx = ITEMS.findIndex(it => !it.sku_id);
+        if (idx === -1) { ITEMS.push({ sku_id: '', cantidad: '', costo: '', iva: 0.21, extra: '' }); idx = ITEMS.length - 1; }
+        ITEMS[idx].sku_id = String(s.id);
+        if (s.alicuota_iva != null) ITEMS[idx].iva = Number(s.alicuota_iva);
+        pintarItems();
+        window.toast('SKU creado: ' + codigo);
+        cerrar();
+      } catch (e) { window.toast('Error: ' + e.message, 'error'); btn.disabled = false; }
+    });
+  }
+  $('#c-new-sku').addEventListener('click', openNuevoSku);
 
   // Moneda / TC
   const monedaSel = $('#c-moneda');
