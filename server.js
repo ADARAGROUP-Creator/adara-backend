@@ -182,15 +182,52 @@ let TF_TOKEN = null, TF_EXP = 0;
 async function getTFToken() {
   if (TF_TOKEN && Date.now() < TF_EXP) return TF_TOKEN;
   if (!TF_APP_KEY) throw new Error('Tango Factura no configurado');
-  const r = await fetch('https://www.tangofactura.com/Services/Autorizacion/GetToken', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ApplicationPublicKey: TF_APP_KEY, UserIdentifier: TF_USER_ID, Username: TF_USERNAME, Password: TF_PASSWORD })
-  });
-  const data = await r.json();
-  if (!data?.Data?.Token) throw new Error('Tango auth falló: ' + JSON.stringify(data?.Error || data));
-  TF_TOKEN = data.Data.Token;
-  TF_EXP   = Date.now() + 18 * 60 * 1000;
-  return TF_TOKEN;
+
+  // Tango Factura tiene dos variantes de endpoint de auth segun version.
+  // Probamos la documentada (Provisioning/GetAuthToken, respuesta = string
+  // URL-encoded) y, si falla, la original (Services/Autorizacion/GetToken,
+  // respuesta = { Data: { Token } }). Nos quedamos con la que devuelva token.
+  const attempts = [
+    {
+      url: 'https://www.tangofactura.com/Provisioning/GetAuthToken',
+      body: { UserName: TF_USERNAME, Password: TF_PASSWORD, UserSecret: TF_USER_ID }
+    },
+    {
+      url: 'https://www.tangofactura.com/Services/Autorizacion/GetToken',
+      body: { ApplicationPublicKey: TF_APP_KEY, UserIdentifier: TF_USER_ID, Username: TF_USERNAME, Password: TF_PASSWORD }
+    }
+  ];
+
+  const errors = [];
+  for (const a of attempts) {
+    try {
+      const r = await fetch(a.url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(a.body)
+      });
+      const text = await r.text();
+      if (!r.ok) { errors.push(`${a.url} -> HTTP ${r.status}: ${text.slice(0, 180)}`); continue; }
+
+      let token = null;
+      try {
+        const data = JSON.parse(text);
+        if (typeof data === 'string') token = decodeURIComponent(data);          // respuesta = string suelto
+        else token = data?.Data?.Token || data?.Token || null;                    // respuesta = objeto
+      } catch (_) {
+        token = decodeURIComponent(text.replace(/^"|"$/g, ''));                    // no era JSON: string crudo
+      }
+
+      if (token) {
+        TF_TOKEN = token;
+        TF_EXP   = Date.now() + 18 * 60 * 1000;
+        return TF_TOKEN;
+      }
+      errors.push(`${a.url} -> sin token: ${text.slice(0, 180)}`);
+    } catch (e) {
+      errors.push(`${a.url} -> ${String(e && e.message || e)}`);
+    }
+  }
+  throw new Error('Tango auth fallo. ' + errors.join('  ||  '));
 }
 
 async function tfPost(endpoint, body) {
@@ -224,6 +261,23 @@ app.get('/health', async (_, res) => {
   c.ml_token = !!ML.access && Date.now() < ML.expires;
   try { if (TF_APP_KEY) { await getTFToken(); c.tango = true; } } catch (_) {}
   res.json({ ok: Object.values(c).every(Boolean), checks: c });
+});
+
+// ── Debug temporal Tango: muestra el error exacto del login ───────────
+// TEMPORAL — quitar una vez que la integracion Tango este validada.
+// No expone credenciales: en exito solo devuelve un preview del token.
+app.get('/debug/tango', async (_, res) => {
+  const env = {
+    TF_APP_KEY: !!TF_APP_KEY, TF_USERNAME: !!TF_USERNAME,
+    TF_PASSWORD: !!TF_PASSWORD, TF_USER_ID: !!TF_USER_ID
+  };
+  try {
+    TF_TOKEN = null; TF_EXP = 0;                 // forzar login fresco
+    const t = await getTFToken();
+    res.json({ ok: true, env, tokenPreview: String(t).slice(0, 10) + '…', tokenLen: String(t).length });
+  } catch (e) {
+    res.json({ ok: false, env, error: String(e && e.message || e) });
+  }
 });
 
 
