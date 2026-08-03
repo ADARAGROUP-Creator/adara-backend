@@ -280,6 +280,50 @@ app.get('/debug/tango', async (_, res) => {
   }
 });
 
+// ── DEBUG temporal — lectura CRUDA de facturas Tango (NO escribe en la base) ──
+// TEMPORAL — quitar tras validar la integracion.
+// Prueba los endpoints candidatos y devuelve el shape real (nombres de campo)
+// para diseniar bien el vinculo con ventas ML. Responde rapido (timeout 7s).
+app.get('/debug/tango-raw', async (req, res) => {
+  const desde = req.query.desde || new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
+  const hasta = req.query.hasta || new Date().toISOString().split('T')[0];
+
+  async function probe(endpoint, body) {
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 7000);
+    try {
+      const token = await getTFToken();
+      const r = await fetch(`https://www.tangofactura.com/Services/Facturacion/${endpoint}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...body, ApplicationPublicKey: TF_APP_KEY, UserIdentifier: TF_USER_ID, Token: token }),
+        signal: ctrl.signal
+      });
+      const text = await r.text();
+      let data = null; try { data = JSON.parse(text); } catch (_) {}
+      const arr = data ? (Array.isArray(data.Data) ? data.Data : (data.Data ? [data.Data] : [])) : null;
+      const first = arr && arr.length ? arr[0] : null;
+      return {
+        endpoint, httpStatus: r.status,
+        topKeys: data ? Object.keys(data) : null,
+        codigoError: data ? (data.CodigoError ?? null) : null,
+        errorMsg: data && data.Error ? data.Error : null,
+        count: arr ? arr.length : null,
+        firstKeys: first ? Object.keys(first) : null,
+        firstSample: first || (data ? null : text.slice(0, 500))
+      };
+    } catch (e) {
+      return { endpoint, error: String(e && e.message || e) };
+    } finally { clearTimeout(to); }
+  }
+
+  const body = { FechaComprobante: `${desde}T00:00:00`, FechaServicioHasta: `${hasta}T23:59:59`, ObtenerInfoAplicaciones: true };
+  const results = await Promise.all([
+    probe('ObtenerInfoMovimientosPorNroFactura', body),
+    probe('ListarMovimientos', body)
+  ]);
+  res.json({ desde, hasta, results });
+});
+
 
 // ── DEBUG — Inspección directa de payment via MP API (mismo path que sync) ──
 // GET /debug/payment/:paymentId
