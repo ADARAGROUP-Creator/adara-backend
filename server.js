@@ -296,10 +296,9 @@ app.get('/debug/tango-raw', (req, res) => {
   TANGO_PROBE = { status: 'running', startedAt: new Date().toISOString(), result: null };
 
   (async () => {
-    async function probe(endpoint, body) {
-      const t0 = Date.now();
+    async function tf(endpoint, body, timeoutMs) {
       const ctrl = new AbortController();
-      const to = setTimeout(() => ctrl.abort(), 55000);
+      const to = setTimeout(() => ctrl.abort(), timeoutMs || 45000);
       try {
         const token = await getTFToken();
         const r = await fetch(`https://www.tangofactura.com/Services/Facturacion/${endpoint}`, {
@@ -309,29 +308,46 @@ app.get('/debug/tango-raw', (req, res) => {
         });
         const text = await r.text();
         let data = null; try { data = JSON.parse(text); } catch (_) {}
-        const arr = data ? (Array.isArray(data.Data) ? data.Data : (data.Data ? [data.Data] : [])) : null;
-        const first = arr && arr.length ? arr[0] : null;
-        return { endpoint, ms: Date.now() - t0, httpStatus: r.status,
-          topKeys: data ? Object.keys(data) : null,
-          codigoError: data ? (data.CodigoError ?? null) : null,
-          errorMsg: data && data.Error ? data.Error : null,
-          count: arr ? arr.length : null,
-          firstKeys: first ? Object.keys(first) : null,
-          firstSample: first || (data ? null : String(text).slice(0, 600)) };
-      } catch (e) {
-        return { endpoint, ms: Date.now() - t0, error: String(e && e.message || e) };
+        return { httpStatus: r.status, data };
       } finally { clearTimeout(to); }
     }
-    const body = { FechaComprobante: `${desde}T00:00:00`, FechaServicioHasta: `${hasta}T23:59:59`, ObtenerInfoAplicaciones: true };
-    const results = await Promise.all([
-      probe('ObtenerInfoMovimientosPorNroFactura', body),
-      probe('ListarMovimientos', body)
-    ]);
-    console.log('tango-raw done:', JSON.stringify(results).slice(0, 800));
-    TANGO_PROBE = { status: 'done', startedAt: TANGO_PROBE.startedAt, result: { desde, hasta, results } };
-  })().catch(e => {
-    TANGO_PROBE = { status: 'done', startedAt: TANGO_PROBE.startedAt, result: { error: String(e && e.message || e) } };
-  });
+    try {
+      // 1) Lista resumida
+      const t0 = Date.now();
+      const lista = await tf('ListarMovimientos', { FechaComprobante: `${desde}T00:00:00`, FechaServicioHasta: `${hasta}T23:59:59` });
+      const arr = lista.data && Array.isArray(lista.data.Data) ? lista.data.Data : [];
+      const listaMs = Date.now() - t0;
+
+      // 2) Detalle de las primeras facturas (aca viene CAE, Numero, UrlPDF y el vinculo ML)
+      const detalles = [];
+      for (const mov of arr.slice(0, 6)) {
+        const d0 = Date.now();
+        try {
+          const det = await tf('ObtenerInfoMovimiento', { MovimientoId: mov.MovimientoId, ObtenerInfoAplicaciones: true }, 30000);
+          const D = det.data && det.data.Data ? det.data.Data : null;
+          const dae = D && D.DatosAplicacionExterna ? D.DatosAplicacionExterna : null;
+          detalles.push({
+            MovimientoId: mov.MovimientoId, ms: Date.now() - d0,
+            Letra: D ? D.Letra : null, Numero: D ? D.Numero : null,
+            CAE: D ? D.CAE : null, tieneUrlPDF: !!(D && D.UrlPDF),
+            Subtotal: D ? D.Subtotal : null, TotalIVA: D ? D.TotalIVA : null, Total: D ? D.Total : null,
+            detalleKeys: D ? Object.keys(D) : null,
+            DatosAplicacionExterna: dae ? { AplicacionNombre: dae.AplicacionNombre, ExternalID: dae.ExternalID, keys: Object.keys(dae) } : null
+          });
+        } catch (e) {
+          detalles.push({ MovimientoId: mov.MovimientoId, ms: Date.now() - d0, error: String(e && e.message || e) });
+        }
+      }
+      const conVinculoML = detalles.filter(d => d.DatosAplicacionExterna && d.DatosAplicacionExterna.ExternalID).length;
+      TANGO_PROBE = { status: 'done', startedAt: TANGO_PROBE.startedAt, result: {
+        desde, hasta, listaMs, listaCount: arr.length,
+        listaFirstDescripcion: arr[0] ? arr[0].MovimientoDescripcion : null,
+        detallesConVinculoML: conVinculoML, detalles
+      } };
+    } catch (e) {
+      TANGO_PROBE = { status: 'done', startedAt: TANGO_PROBE.startedAt, result: { error: String(e && e.message || e) } };
+    }
+  })();
 
   res.json({ status: 'started', desde, hasta, hint: 'volve a pegarle en ~40s' });
 });
