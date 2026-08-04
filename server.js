@@ -3228,63 +3228,71 @@ app.post('/banco/extracto', upload.single('file'), async (req, res) => {
 
 // ── TANGO FACTURA — Solo lectura ─────────────────────────────────────
 
-// Traer facturas emitidas en un período y sincronizar a Supabase
-app.get('/tango/sync', async (req, res) => {
-  try {
-    const { desde, hasta } = req.query;
-    const fDesde = desde || new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
-    const fHasta = hasta || new Date().toISOString().split('T')[0];
+// Le pega a cada venta ML su dato fiscal de Tango: nro de factura, tipo (A/B/C)
+// y monto facturado. Vinculo: ventas_ml.ml_order_id = DatosAplicacionExterna.ExternalID.
+// ListarMovimientos es lento (~30s), asi que corre en SEGUNDO PLANO:
+//   1a llamada -> {status:'started'};  volver a pegarle -> progreso o {status:'done', ...}
+//   ?desde=YYYY-MM-DD&hasta=YYYY-MM-DD para el rango;  ?reset=1 / ?rerun=1 para relanzar.
+let TANGO_SYNC = { status: 'idle', startedAt: null, progress: null, result: null };
 
-    // ObtenerInfoMovimientosPorNroFactura con rango de fechas
-    const result = await tfPost('ObtenerInfoMovimientosPorNroFactura', {
-      FechaComprobante:   `${fDesde}T00:00:00`,
-      FechaServicioHasta: `${fHasta}T23:59:59`
-    });
+async function syncTangoFacturas(desde, hasta) {
+  const lista = await tfPost('ListarMovimientos', {
+    FechaComprobante: `${desde}T00:00:00`, FechaServicioHasta: `${hasta}T23:59:59`
+  });
+  const movs = Array.isArray(lista.Data) ? lista.Data : (lista.Data ? [lista.Data] : []);
+  const stats = { total: movs.length, ml: 0, no_ml: 0, actualizadas: 0, sin_venta: 0, errores: 0, procesadas: 0, huerfanas: [] };
 
-    const facturas = Array.isArray(result.Data) ? result.Data : (result.Data ? [result.Data] : []);
-    if (!facturas.length) return res.json({ ok: true, sincronizadas: 0, mensaje: 'Sin facturas en ese período' });
-
-    // Guardar en tabla facturas_tango
-    const rows = facturas.map(f => ({
-      movimiento_id:    String(f.MovimientoId || ''),
-      nro_factura:      f.NroFactura ? String(f.NroFactura) : null,
-      cai_cae:          f.CAICAE || null,
-      fecha_emision:    f.FechaEmision ? f.FechaEmision.split('T')[0] : null,
-      fecha_vencimiento: f.FechaVencimiento ? f.FechaVencimiento.split('T')[0] : null,
-      total:            f.Total || 0,
-      total_iva:        f.TotalIVA || 0,
-      subtotal:         f.Subtotal || 0,
-      estado_id:        f.EstadoId || 0,
-      electronico:      f.Electronico || false,
-      grabado:          f.Grabado || false
-    }));
-
-    await sbUpsert('facturas_tango', rows, 'movimiento_id');
-
-    // Intentar cruzar con ventas ML por número de factura
-    let cruzadas = 0;
-    for (const f of rows) {
-      if (!f.nro_factura) continue;
-      const ventas = await sbGet('ventas_ml', `factura_tango=eq.${f.nro_factura}&limit=5`).catch(() => []);
-      if (ventas?.length) cruzadas++;
+  for (const m of movs) {
+    stats.procesadas++;
+    TANGO_SYNC.progress = { procesadas: stats.procesadas, total: stats.total, actualizadas: stats.actualizadas };
+    try {
+      const det = await tfPost('ObtenerInfoMovimiento', { MovimientoId: m.MovimientoId, ObtenerInfoAplicaciones: true });
+      const D = det.Data || {};
+      const dae = D.DatosAplicacionExterna;
+      if (!(dae && dae.AplicacionNombre === 'Mercado Libre' && dae.ExternalID)) { stats.no_ml++; continue; }
+      stats.ml++;
+      const patch = {
+        nro_factura:         D.Numero != null ? String(D.Numero) : null,
+        tipo_factura:        D.Letra || m.MovimientoLetra || null,
+        importe_facturado:   D.Total != null ? D.Total : (m.Total ?? null),
+        tango_movimiento_id: String(m.MovimientoId)
+      };
+      const upd = await sbPatch('ventas_ml', `ml_order_id=eq.${encodeURIComponent(dae.ExternalID)}`, patch);
+      if (Array.isArray(upd) && upd.length) stats.actualizadas += upd.length;
+      else { stats.sin_venta++; if (stats.huerfanas.length < 50) stats.huerfanas.push({ ml_order_id: dae.ExternalID, nro_factura: patch.nro_factura }); }
+    } catch (e) {
+      stats.errores++;
+      console.error('Tango detalle', m.MovimientoId, e.message);
     }
-
-    res.json({ ok: true, sincronizadas: rows.length, cruzadas_con_ml: cruzadas, desde: fDesde, hasta: fHasta });
-  } catch (e) {
-    console.error('Tango sync:', e);
-    res.status(500).json({ error: e.message });
   }
+  return stats;
+}
+
+app.get('/tango/sync', (req, res) => {
+  if (req.query.reset) TANGO_SYNC = { status: 'idle', startedAt: null, progress: null, result: null };
+  if (TANGO_SYNC.status === 'running')
+    return res.json({ status: 'running', startedAt: TANGO_SYNC.startedAt, progress: TANGO_SYNC.progress });
+  if (TANGO_SYNC.status === 'done' && !req.query.rerun)
+    return res.json({ status: 'done', startedAt: TANGO_SYNC.startedAt, ...TANGO_SYNC.result });
+
+  const desde = req.query.desde || new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
+  const hasta = req.query.hasta || new Date().toISOString().split('T')[0];
+  TANGO_SYNC = { status: 'running', startedAt: new Date().toISOString(), progress: null, result: null };
+
+  syncTangoFacturas(desde, hasta)
+    .then(stats => { TANGO_SYNC = { status: 'done', startedAt: TANGO_SYNC.startedAt, progress: null, result: { desde, hasta, ...stats } }; })
+    .catch(e => { TANGO_SYNC = { status: 'done', startedAt: TANGO_SYNC.startedAt, progress: null, result: { desde, hasta, error: String(e && e.message || e) } }; });
+
+  res.json({ status: 'started', desde, hasta, hint: 'volve a pegarle cada ~30s para ver el progreso' });
 });
 
-// Listar facturas Tango guardadas en Supabase
+// Listar las ventas ML que ya tienen factura Tango vinculada
 app.get('/tango/facturas', async (req, res) => {
   try {
-    const { desde, hasta, limit = 100 } = req.query;
-    let q = `order=fecha_emision.desc&limit=${limit}`;
-    if (desde) q += `&fecha_emision=gte.${desde}`;
-    if (hasta) q += `&fecha_emision=lte.${hasta}`;
-    const facturas = await sbGet('facturas_tango', q);
-    res.json(facturas);
+    const { limit = 100 } = req.query;
+    const rows = await sbGet('ventas_ml',
+      `select=ml_order_id,fecha,titulo,nro_factura,tipo_factura,importe_bruto,importe_facturado,tango_movimiento_id&nro_factura=not.is.null&order=fecha.desc&limit=${limit}`);
+    res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -3294,6 +3302,22 @@ cron.schedule('0 * * * *', async () => {
   if (!ML.access) return;
   console.log('⏰ Cron: sync ML...');
   try { await syncMLVentas(1); } catch (e) { console.error('Cron ML:', e.message); }
+});
+
+// Cada 3 horas: pegar datos de factura Tango a las ventas ML recientes (ultimos 3 dias)
+cron.schedule('30 */3 * * *', async () => {
+  if (!TF_APP_KEY || TANGO_SYNC.status === 'running') return;
+  const hasta = new Date().toISOString().split('T')[0];
+  const desde = new Date(Date.now() - 3 * 86400000).toISOString().split('T')[0];
+  TANGO_SYNC = { status: 'running', startedAt: new Date().toISOString(), progress: null, result: null };
+  console.log('⏰ Cron: sync Tango facturas...');
+  try {
+    const stats = await syncTangoFacturas(desde, hasta);
+    TANGO_SYNC = { status: 'done', startedAt: TANGO_SYNC.startedAt, progress: null, result: { desde, hasta, ...stats } };
+  } catch (e) {
+    TANGO_SYNC = { status: 'done', startedAt: TANGO_SYNC.startedAt, progress: null, result: { desde, hasta, error: e.message } };
+    console.error('Cron Tango:', e.message);
+  }
 });
 
 // Cada 6 horas: renovar token ML
