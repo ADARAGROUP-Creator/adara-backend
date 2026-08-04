@@ -3183,7 +3183,7 @@ async function tfPostRetry(endpoint, body, intentos = 3, esperaMs = 3000) {
 // (Desde / Hasta / Tope). Antes se mandaba FechaComprobante/FechaServicioHasta
 // (de otro endpoint), Tango los ignoraba y hacia una consulta sin filtro -> lento y con errores.
 async function syncTangoFacturas(desde, hasta) {
-  const stats = { total: 0, ml: 0, no_ml: 0, actualizadas: 0, sin_venta: 0, errores: 0, procesadas: 0, huerfanas: [] };
+  const stats = { total: 0, ml: 0, no_ml: 0, actualizadas: 0, por_pack: 0, sin_venta: 0, errores: 0, procesadas: 0, huerfanas: [] };
 
   const lista = await tfPostRetry('ListarMovimientos', {
     Desde: `${desde}T00:00:00`, Hasta: `${hasta}T23:59:59`, Tope: 5000
@@ -3206,7 +3206,14 @@ async function syncTangoFacturas(desde, hasta) {
         total_facturado_tango: D.Total != null ? D.Total : (m.Total ?? null),
         tango_movimiento_id:   String(m.MovimientoId)
       };
-      const upd = await sbPatch('ventas_ml', `ml_order_id=eq.${encodeURIComponent(dae.ExternalID)}`, patch);
+      // 1) Venta suelta: match por ml_order_id. 2) Pack: Tango factura el pack
+      //    entero y lo identifica con el pack_id, así que si no matcheó por orden,
+      //    buscamos por pack_id (actualiza TODOS los items del pack con la misma factura).
+      let upd = await sbPatch('ventas_ml', `ml_order_id=eq.${encodeURIComponent(dae.ExternalID)}`, patch);
+      if (!(Array.isArray(upd) && upd.length)) {
+        upd = await sbPatch('ventas_ml', `pack_id=eq.${encodeURIComponent(dae.ExternalID)}`, patch);
+        if (Array.isArray(upd) && upd.length) stats.por_pack += upd.length;
+      }
       if (Array.isArray(upd) && upd.length) stats.actualizadas += upd.length;
       else { stats.sin_venta++; if (stats.huerfanas.length < 50) stats.huerfanas.push({ ml_order_id: dae.ExternalID, nro_factura: patch.nro_factura }); }
     } catch (e) {
