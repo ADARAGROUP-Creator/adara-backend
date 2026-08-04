@@ -15,6 +15,8 @@ import { exportarVentasXLSX } from '../core/reporte-ventas-xlsx.js';
 // vínculo op_tipo='venta_ml', op_id=ventas_ml.id, monto = monto de cada movimiento.
 
 let VENTAS = [];
+let PACK_CANT = {};   // pack_id -> cantidad de ventas con ese pack (combo real si >=2)
+let PACK_NETO = {};   // pack_id -> suma del neto del comprador (importe_facturado) del pack
 let COBROS_BY_REF = {};      // REFERENCE_ID del extracto -> movimiento (cobro_venta)
 let COBROS_BY_ID = {};       // movimiento.id -> movimiento (cobro_venta) — para el detalle de operaciones
 let BONIFS = [];             // movimientos cobro_venta de "bonificación por envío"
@@ -201,6 +203,15 @@ export async function loadVentasML() {
   DEV_BUNDLES = null;   // invalidar cache de bundles de devolución → se recarga al abrir la solapa
   try {
     VENTAS = await sbGet('ventas_ml', 'order=fecha.asc,hora_venta.asc,id.asc');
+    // Info de packs: una venta es "combo real" solo si varias comparten el mismo
+    // pack_id. La mayoría de las ventas tienen pack_id propio (un solo producto) —
+    // esas NO son combo. PACK_NETO acumula el neto del comprador por pack.
+    PACK_CANT = {}; PACK_NETO = {};
+    for (const v of VENTAS) {
+      if (!v.pack_id) continue;
+      PACK_CANT[v.pack_id] = (PACK_CANT[v.pack_id] || 0) + 1;
+      PACK_NETO[v.pack_id] = (PACK_NETO[v.pack_id] || 0) + (Number(v.importe_facturado) || 0);
+    }
     const cobros = await sbGet('movimientos', 'categoria=eq.cobro_venta&order=fecha.asc,id.asc');
     COBROS_BY_REF = {};
     COBROS_BY_ID = {};
@@ -529,16 +540,16 @@ function celdaFacturado(v) {
   if (v.nro_factura == null || v.total_facturado_tango == null)
     return `<td style="text-align:right" class="vml-mono vml-cero">—</td>`;
   const tango = Number(v.total_facturado_tango) || 0;
-  // Pack: la factura cubre varios productos, el total es del pack completo → no
-  // se compara item por item (eso va en la vista de combo). Se muestra sin semáforo.
-  if (v.pack_id && String(v.pack_id) !== String(v.ml_order_id))
-    return `<td style="text-align:right" class="vml-mono" title="Factura de un pack (varios productos). El total es del pack completo.">${money(tango)} <span style="color:#6b7280;font-size:11px">pack</span></td>`;
-  const neto = Number(v.importe_facturado) || 0;
+  // Combo REAL = varias ventas comparten el mismo pack_id. Una venta con pack_id
+  // propio (un solo producto) NO es combo → se compara normal item por item.
+  const esCombo = !!(v.pack_id && (PACK_CANT[v.pack_id] || 0) >= 2);
+  const neto = esCombo ? (Number(PACK_NETO[v.pack_id]) || 0) : (Number(v.importe_facturado) || 0);
   const dif = r2(tango - neto);
+  const combo = esCombo ? ` <span style="color:#6b7280;font-size:11px" title="Factura de un combo de ${PACK_CANT[v.pack_id]} productos; el total es del combo entero">combo ${PACK_CANT[v.pack_id]}</span>` : '';
   if (Math.abs(dif) < 1)
-    return `<td style="text-align:right" class="vml-mono" title="Coincide con lo que pagó el comprador">${money(tango)} <span style="color:#0F6E56">✓</span></td>`;
+    return `<td style="text-align:right" class="vml-mono" title="Coincide con lo que pagó el comprador${esCombo ? ' (combo)' : ''}">${money(tango)} <span style="color:#0F6E56">✓</span>${combo}</td>`;
   const signo = dif > 0 ? '+' : '−';
-  return `<td style="text-align:right;color:#B45309" class="vml-mono" title="No coincide con el neto del comprador (${money(neto)}). Descuadre ${signo}${money(dif)} — revisar.">${money(tango)} ⚠</td>`;
+  return `<td style="text-align:right;color:#B45309" class="vml-mono" title="No coincide con el neto del comprador (${money(neto)})${esCombo ? ' del combo' : ''}. Descuadre ${signo}${money(dif)} — revisar.">${money(tango)} ⚠${combo}</td>`;
 }
 
 // ── Vista de conciliación manual mensual (dos tablas: Ventas ↔ Extracto MP) ──
