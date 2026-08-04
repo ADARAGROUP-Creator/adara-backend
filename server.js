@@ -280,77 +280,6 @@ app.get('/debug/tango', async (_, res) => {
   }
 });
 
-// ── DEBUG temporal — lectura CRUDA de facturas Tango (background, NO escribe) ──
-// TEMPORAL — quitar tras validar la integracion.
-// Tango tarda mucho en responder, asi que corre en segundo plano:
-//   1a llamada -> {status:'started'};  volver a pegarle a los ~40s -> {status:'done', ...}
-//   ?reset=1 para reiniciar;  ?desde=YYYY-MM-DD&hasta=YYYY-MM-DD para el rango.
-let TANGO_PROBE = { status: 'idle', startedAt: null, result: null };
-app.get('/debug/tango-raw', (req, res) => {
-  if (req.query.reset) TANGO_PROBE = { status: 'idle', startedAt: null, result: null };
-  if (TANGO_PROBE.status === 'running') return res.json({ status: 'running', startedAt: TANGO_PROBE.startedAt });
-  if (TANGO_PROBE.status === 'done')    return res.json({ status: 'done', startedAt: TANGO_PROBE.startedAt, ...TANGO_PROBE.result });
-
-  const desde = req.query.desde || new Date(Date.now() - 2 * 86400000).toISOString().split('T')[0];
-  const hasta = req.query.hasta || new Date().toISOString().split('T')[0];
-  TANGO_PROBE = { status: 'running', startedAt: new Date().toISOString(), result: null };
-
-  (async () => {
-    async function tf(endpoint, body, timeoutMs) {
-      const ctrl = new AbortController();
-      const to = setTimeout(() => ctrl.abort(), timeoutMs || 45000);
-      try {
-        const token = await getTFToken();
-        const r = await fetch(`https://www.tangofactura.com/Services/Facturacion/${endpoint}`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...body, ApplicationPublicKey: TF_APP_KEY, UserIdentifier: TF_USER_ID, Token: token }),
-          signal: ctrl.signal
-        });
-        const text = await r.text();
-        let data = null; try { data = JSON.parse(text); } catch (_) {}
-        return { httpStatus: r.status, data };
-      } finally { clearTimeout(to); }
-    }
-    try {
-      // 1) Lista resumida
-      const t0 = Date.now();
-      const lista = await tf('ListarMovimientos', { FechaComprobante: `${desde}T00:00:00`, FechaServicioHasta: `${hasta}T23:59:59` });
-      const arr = lista.data && Array.isArray(lista.data.Data) ? lista.data.Data : [];
-      const listaMs = Date.now() - t0;
-
-      // 2) Detalle de las primeras facturas (aca viene CAE, Numero, UrlPDF y el vinculo ML)
-      const detalles = [];
-      for (const mov of arr.slice(0, 6)) {
-        const d0 = Date.now();
-        try {
-          const det = await tf('ObtenerInfoMovimiento', { MovimientoId: mov.MovimientoId, ObtenerInfoAplicaciones: true }, 30000);
-          const D = det.data && det.data.Data ? det.data.Data : null;
-          const dae = D && D.DatosAplicacionExterna ? D.DatosAplicacionExterna : null;
-          detalles.push({
-            MovimientoId: mov.MovimientoId, ms: Date.now() - d0,
-            Letra: D ? D.Letra : null, Numero: D ? D.Numero : null,
-            CAE: D ? D.CAE : null, tieneUrlPDF: !!(D && D.UrlPDF),
-            Subtotal: D ? D.Subtotal : null, TotalIVA: D ? D.TotalIVA : null, Total: D ? D.Total : null,
-            detalleKeys: D ? Object.keys(D) : null,
-            DatosAplicacionExterna: dae ? { AplicacionNombre: dae.AplicacionNombre, ExternalID: dae.ExternalID, keys: Object.keys(dae) } : null
-          });
-        } catch (e) {
-          detalles.push({ MovimientoId: mov.MovimientoId, ms: Date.now() - d0, error: String(e && e.message || e) });
-        }
-      }
-      const conVinculoML = detalles.filter(d => d.DatosAplicacionExterna && d.DatosAplicacionExterna.ExternalID).length;
-      TANGO_PROBE = { status: 'done', startedAt: TANGO_PROBE.startedAt, result: {
-        desde, hasta, listaMs, listaCount: arr.length,
-        listaFirstDescripcion: arr[0] ? arr[0].MovimientoDescripcion : null,
-        detallesConVinculoML: conVinculoML, detalles
-      } };
-    } catch (e) {
-      TANGO_PROBE = { status: 'done', startedAt: TANGO_PROBE.startedAt, result: { error: String(e && e.message || e) } };
-    }
-  })();
-
-  res.json({ status: 'started', desde, hasta, hint: 'volve a pegarle en ~40s' });
-});
 
 
 // ── DEBUG — Inspección directa de payment via MP API (mismo path que sync) ──
@@ -3235,18 +3164,38 @@ app.post('/banco/extracto', upload.single('file'), async (req, res) => {
 //   ?desde=YYYY-MM-DD&hasta=YYYY-MM-DD para el rango;  ?reset=1 / ?rerun=1 para relanzar.
 let TANGO_SYNC = { status: 'idle', startedAt: null, progress: null, result: null };
 
+// Reintento con backoff para errores transitorios de Tango.
+async function tfPostRetry(endpoint, body, intentos = 3, esperaMs = 3000) {
+  let ultimo;
+  for (let i = 0; i < intentos; i++) {
+    try { return await tfPost(endpoint, body); }
+    catch (e) {
+      ultimo = e;
+      if (i < intentos - 1) await new Promise(r => setTimeout(r, esperaMs * (i + 1)));
+    }
+  }
+  throw ultimo;
+}
+
+// Le pega a cada venta ML su dato fiscal de Tango (nro de factura, tipo A/B/C y
+// monto facturado), matcheando por ml_order_id = DatosAplicacionExterna.ExternalID.
+// IMPORTANTE: ListarMovimientos usa los parametros REALES de la API de Tango
+// (Desde / Hasta / Tope). Antes se mandaba FechaComprobante/FechaServicioHasta
+// (de otro endpoint), Tango los ignoraba y hacia una consulta sin filtro -> lento y con errores.
 async function syncTangoFacturas(desde, hasta) {
-  const lista = await tfPost('ListarMovimientos', {
-    FechaComprobante: `${desde}T00:00:00`, FechaServicioHasta: `${hasta}T23:59:59`
+  const stats = { total: 0, ml: 0, no_ml: 0, actualizadas: 0, sin_venta: 0, errores: 0, procesadas: 0, huerfanas: [] };
+
+  const lista = await tfPostRetry('ListarMovimientos', {
+    Desde: `${desde}T00:00:00`, Hasta: `${hasta}T23:59:59`, Tope: 5000
   });
   const movs = Array.isArray(lista.Data) ? lista.Data : (lista.Data ? [lista.Data] : []);
-  const stats = { total: movs.length, ml: 0, no_ml: 0, actualizadas: 0, sin_venta: 0, errores: 0, procesadas: 0, huerfanas: [] };
+  stats.total = movs.length;
 
   for (const m of movs) {
     stats.procesadas++;
     TANGO_SYNC.progress = { procesadas: stats.procesadas, total: stats.total, actualizadas: stats.actualizadas };
     try {
-      const det = await tfPost('ObtenerInfoMovimiento', { MovimientoId: m.MovimientoId, ObtenerInfoAplicaciones: true });
+      const det = await tfPostRetry('ObtenerInfoMovimiento', { MovimientoId: m.MovimientoId, ObtenerInfoAplicaciones: true }, 2);
       const D = det.Data || {};
       const dae = D.DatosAplicacionExterna;
       if (!(dae && dae.AplicacionNombre === 'Mercado Libre' && dae.ExternalID)) { stats.no_ml++; continue; }
