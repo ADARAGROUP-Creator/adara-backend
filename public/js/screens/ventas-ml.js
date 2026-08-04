@@ -529,6 +529,10 @@ function celdaFacturado(v) {
   if (v.nro_factura == null || v.total_facturado_tango == null)
     return `<td style="text-align:right" class="vml-mono vml-cero">—</td>`;
   const tango = Number(v.total_facturado_tango) || 0;
+  // Pack: la factura cubre varios productos, el total es del pack completo → no
+  // se compara item por item (eso va en la vista de combo). Se muestra sin semáforo.
+  if (v.pack_id && String(v.pack_id) !== String(v.ml_order_id))
+    return `<td style="text-align:right" class="vml-mono" title="Factura de un pack (varios productos). El total es del pack completo.">${money(tango)} <span style="color:#6b7280;font-size:11px">pack</span></td>`;
   const neto = Number(v.importe_facturado) || 0;
   const dif = r2(tango - neto);
   if (Math.abs(dif) < 1)
