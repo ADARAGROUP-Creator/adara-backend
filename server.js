@@ -230,17 +230,24 @@ async function getTFToken() {
   throw new Error('Tango auth fallo. ' + errors.join('  ||  '));
 }
 
-async function tfPost(endpoint, body) {
+async function tfPost(endpoint, body, timeoutMs = 30000) {
   const token = await getTFToken();
-  const r = await fetch(`https://www.tangofactura.com/Services/Facturacion/${endpoint}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ...body, ApplicationPublicKey: TF_APP_KEY, UserIdentifier: TF_USER_ID, Token: token })
-  });
-  const data = await r.json();
-  if (data.CodigoError && data.CodigoError !== 0) {
-    throw new Error(`TF ${endpoint}: ${(data.Error || []).map(e => e.Mensaje).join(' | ')}`);
-  }
-  return data;
+  // Timeout: si Tango cuelga una llamada, se aborta y se propaga como error
+  // (tfPostRetry reintenta y el sync sigue). Sin esto un cuelgue frena todo.
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(`https://www.tangofactura.com/Services/Facturacion/${endpoint}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, ApplicationPublicKey: TF_APP_KEY, UserIdentifier: TF_USER_ID, Token: token }),
+      signal: ctrl.signal
+    });
+    const data = await r.json();
+    if (data.CodigoError && data.CodigoError !== 0) {
+      throw new Error(`TF ${endpoint}: ${(data.Error || []).map(e => e.Mensaje).join(' | ')}`);
+    }
+    return data;
+  } finally { clearTimeout(to); }
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -3165,10 +3172,10 @@ app.post('/banco/extracto', upload.single('file'), async (req, res) => {
 let TANGO_SYNC = { status: 'idle', startedAt: null, progress: null, result: null };
 
 // Reintento con backoff para errores transitorios de Tango.
-async function tfPostRetry(endpoint, body, intentos = 3, esperaMs = 3000) {
+async function tfPostRetry(endpoint, body, intentos = 3, esperaMs = 3000, timeoutMs = 30000) {
   let ultimo;
   for (let i = 0; i < intentos; i++) {
-    try { return await tfPost(endpoint, body); }
+    try { return await tfPost(endpoint, body, timeoutMs); }
     catch (e) {
       ultimo = e;
       if (i < intentos - 1) await new Promise(r => setTimeout(r, esperaMs * (i + 1)));
@@ -3187,7 +3194,7 @@ async function syncTangoFacturas(desde, hasta) {
 
   const lista = await tfPostRetry('ListarMovimientos', {
     Desde: `${desde}T00:00:00`, Hasta: `${hasta}T23:59:59`, Tope: 5000
-  });
+  }, 3, 5000, 90000);   // ListarMovimientos es lento (~30s); timeout amplio (90s)
   const movs = Array.isArray(lista.Data) ? lista.Data : (lista.Data ? [lista.Data] : []);
   stats.total = movs.length;
 
