@@ -3201,10 +3201,10 @@ async function syncTangoFacturas(desde, hasta) {
       if (!(dae && dae.AplicacionNombre === 'Mercado Libre' && dae.ExternalID)) { stats.no_ml++; continue; }
       stats.ml++;
       const patch = {
-        nro_factura:         D.Numero != null ? String(D.Numero) : null,
-        tipo_factura:        D.Letra || m.MovimientoLetra || null,
-        importe_facturado:   D.Total != null ? D.Total : (m.Total ?? null),
-        tango_movimiento_id: String(m.MovimientoId)
+        nro_factura:           D.Numero != null ? String(D.Numero) : null,
+        tipo_factura:          D.Letra || m.MovimientoLetra || null,
+        total_facturado_tango: D.Total != null ? D.Total : (m.Total ?? null),
+        tango_movimiento_id:   String(m.MovimientoId)
       };
       const upd = await sbPatch('ventas_ml', `ml_order_id=eq.${encodeURIComponent(dae.ExternalID)}`, patch);
       if (Array.isArray(upd) && upd.length) stats.actualizadas += upd.length;
@@ -3240,7 +3240,7 @@ app.get('/tango/facturas', async (req, res) => {
   try {
     const { limit = 100 } = req.query;
     const rows = await sbGet('ventas_ml',
-      `select=ml_order_id,fecha,titulo,nro_factura,tipo_factura,importe_bruto,importe_facturado,tango_movimiento_id&nro_factura=not.is.null&order=fecha.desc&limit=${limit}`);
+      `select=ml_order_id,fecha,titulo,nro_factura,tipo_factura,importe_bruto,importe_facturado,total_facturado_tango,tango_movimiento_id&nro_factura=not.is.null&order=fecha.desc&limit=${limit}`);
     res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
