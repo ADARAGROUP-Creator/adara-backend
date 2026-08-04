@@ -29,7 +29,7 @@ let FECHA = '';              // YYYY-MM-DD (modo día)
 let MES = '';                // YYYY-MM (modo mes)
 let FILTRO = 'todas';        // todas | por_cobrar | cobradas | conciliadas | canceladas | devueltas
 let SOLO_PEND_CANC = true;   // en el chip Canceladas, mostrar solo las pendientes (se van limpiando)
-let COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', com: '', envio: '', imp: '', fin: '', cobrar: '', envest: '', estado: '' }; // filtros por columna
+let COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', factura: '', com: '', envio: '', imp: '', fin: '', cobrar: '', envest: '', estado: '' }; // filtros por columna
 let BONIF_MAP_CUR = {};      // bonifs del período actual (para el repintado parcial de filtros)
 let VISTA = 'control';       // control (lista) | conciliar (dos tablas Ventas ↔ Cobros)
 let CONC_SEL = null;         // venta seleccionada en la vista de conciliación manual
@@ -366,6 +366,8 @@ function renderVentas() {
       <th>${vIn('sku', 'sku')}</th>
       <th>${vIn('cant', 'cant')}</th>
       <th>${vIn('bruto', 'monto')}</th>
+      <th>${vIn('factura', '# fact')}</th>
+      <th></th>
       <th>${vIn('com', 'monto')}</th>
       <th>${vIn('envio', 'monto')}</th>
       <th>${vIn('imp', 'monto')}</th>
@@ -448,6 +450,8 @@ function renderVentas() {
                 <th style="width:56px">SKU</th>
                 <th style="width:34px;text-align:right">Cant</th>
                 <th style="width:96px;text-align:right">Bruto</th>
+                <th style="width:118px">Factura</th>
+                <th style="width:118px;text-align:right">Facturado</th>
                 <th style="width:90px;text-align:right">Comisión</th>
                 <th style="width:84px;text-align:right">Envío</th>
                 <th style="width:84px;text-align:right">Impuestos</th>
@@ -498,7 +502,7 @@ function renderVentas() {
       });
       const vclr = document.getElementById('vml-clear');
       if (vclr) vclr.addEventListener('click', () => {
-        COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', com: '', envio: '', imp: '', fin: '', cobrar: '', envest: '', estado: '' };
+        COLV = { fecha: '', venta: '', prod: '', sku: '', cant: '', bruto: '', factura: '', com: '', envio: '', imp: '', fin: '', cobrar: '', envest: '', estado: '' };
         render();
       });
       pintarVML();
@@ -512,17 +516,25 @@ function celdaMonto(valor) {
   return `<td style="text-align:right" class="vml-mono ${n < 0 ? 'vml-neg' : 'vml-pos'}">${money(n)}</td>`;
 }
 
-// Subrenglón del monto facturado en Tango (bajo el Bruto). Verde si coincide con
-// el bruto; ámbar con la diferencia si no (esa diferencia suele ser el aporte de
-// ML, que no se factura). Vacío si la venta todavía no tiene factura vinculada.
-function factCell(v) {
-  if (v.nro_factura == null || v.importe_facturado == null) return '';
-  const fact = Number(v.importe_facturado) || 0;
-  const dif = r2((Number(v.importe_bruto) || 0) - fact);
-  if (Math.abs(dif) < 0.01)
-    return `<div style="font-size:11px;color:#0F6E56;margin-top:2px" title="Facturado en Tango — coincide con el bruto">fact. ${money(fact)} ✓</div>`;
-  const signo = dif > 0 ? '−' : '+';
-  return `<div style="font-size:11px;color:#B45309;margin-top:2px" title="Facturado en Tango. La diferencia con el bruto suele ser el aporte de Mercado Libre, que no se factura.">fact. ${money(fact)} · ${signo}${money(dif)}</div>`;
+// Celda "Factura": tipo (A/B/C) + N° de factura de Tango. "—" si aún no tiene.
+function celdaFactura(v) {
+  if (!v.nro_factura) return `<td class="vml-mono vml-cero">—</td>`;
+  return `<td class="vml-mono" title="Factura Tango">${v.tipo_factura ? `<b>${esc(v.tipo_factura)}</b> ` : ''}${esc(v.nro_factura)}</td>`;
+}
+
+// Celda "Facturado": total real facturado en Tango + semáforo. Verde ✓ si coincide
+// con el neto del comprador (importe_facturado de ML = bruto − aporte); ámbar ⚠ con
+// el descuadre si NO coincide (caso a revisar). "—" si la venta aún no tiene factura.
+function celdaFacturado(v) {
+  if (v.nro_factura == null || v.total_facturado_tango == null)
+    return `<td style="text-align:right" class="vml-mono vml-cero">—</td>`;
+  const tango = Number(v.total_facturado_tango) || 0;
+  const neto = Number(v.importe_facturado) || 0;
+  const dif = r2(tango - neto);
+  if (Math.abs(dif) < 1)
+    return `<td style="text-align:right" class="vml-mono" title="Coincide con lo que pagó el comprador">${money(tango)} <span style="color:#0F6E56">✓</span></td>`;
+  const signo = dif > 0 ? '+' : '−';
+  return `<td style="text-align:right;color:#B45309" class="vml-mono" title="No coincide con el neto del comprador (${money(neto)}). Descuadre ${signo}${money(dif)} — revisar.">${money(tango)} ⚠</td>`;
 }
 
 // ── Vista de conciliación manual mensual (dos tablas: Ventas ↔ Extracto MP) ──
@@ -936,11 +948,13 @@ function filaHTML(v, esMes, bonifMap) {
     ${esMes ? `<td class="vml-mono">${esc(ddmm(v.fecha))}</td>` : ''}
     <td class="vml-mono">${v.ml_order_id
       ? `<a class="vml-venta-id" href="https://www.mercadolibre.com.ar/ventas/${encodeURIComponent(v.ml_order_id)}/detalle" target="_blank" rel="noopener" title="Abrir la venta en Mercado Libre">${esc(v.ml_order_id)}</a>`
-      : '—'}${v.nro_factura ? `<div style="font-size:11px;color:#6b7280;margin-top:2px;white-space:nowrap" title="Factura Tango">🧾 ${v.tipo_factura ? `<b>${esc(v.tipo_factura)}</b> ` : ''}${esc(v.nro_factura)}</div>` : ''}</td>
+      : '—'}</td>
     <td>${esc(v.titulo || '—')}</td>
     <td class="vml-mono">${esc(v.sku || '—')}</td>
     <td style="text-align:right">${v.cantidad || 1}</td>
-    <td style="text-align:right" class="vml-mono">${money(v.importe_bruto)}${factCell(v)}</td>
+    <td style="text-align:right" class="vml-mono">${money(v.importe_bruto)}</td>
+    ${celdaFactura(v)}
+    ${celdaFacturado(v)}
     ${celdaMonto(v.cargo_venta)}
     ${celdaMonto(v.cargo_envio)}
     ${celdaMonto(v.impuestos)}
@@ -972,6 +986,7 @@ function pasaColV(v) {
   if (COLV.sku && !String(v.sku || '').toLowerCase().includes(COLV.sku.toLowerCase())) return false;
   if (COLV.cant) { const x = COLV.cant.replace(/[^\d]/g, ''); if (x && !String(v.cantidad || 1).includes(x)) return false; }
   if (COLV.bruto && !num(v.importe_bruto, COLV.bruto)) return false;
+  if (COLV.factura && !String(v.nro_factura || '').toLowerCase().includes(COLV.factura.toLowerCase())) return false;
   if (COLV.com && !num(v.cargo_venta, COLV.com)) return false;
   if (COLV.envio && !num(v.cargo_envio, COLV.envio)) return false;
   if (COLV.imp && !num(v.impuestos, COLV.imp)) return false;
@@ -992,6 +1007,8 @@ function filaTotales(vis, esMes) {
     <td></td>
     <td style="text-align:right">${cant.toLocaleString('es-AR')}</td>
     <td style="text-align:right" class="vml-mono">${money(sum('importe_bruto'))}</td>
+    <td></td>
+    <td style="text-align:right" class="vml-mono">${money(sum('total_facturado_tango'))}</td>
     <td style="text-align:right" class="vml-mono">${money(sum('cargo_venta'))}</td>
     <td style="text-align:right" class="vml-mono">${money(sum('cargo_envio'))}</td>
     <td style="text-align:right" class="vml-mono">${money(sum('impuestos'))}</td>
@@ -1141,7 +1158,7 @@ function ventaDetalleHTML({ venta, cobros, devoluciones, retenciones }) {
         ? `<a class="vml-venta-id" href="https://www.mercadolibre.com.ar/ventas/${encodeURIComponent(venta.ml_order_id)}/detalle" target="_blank" rel="noopener">${esc(venta.ml_order_id)}</a>`
         : '—'}
       <div class="vml-dev-prod">${esc(venta.titulo || '—')}${venta.sku ? ' · SKU ' + esc(venta.sku) : ''}</div>
-      ${venta.nro_factura ? `<div class="vml-sub" style="margin:2px 0 0">🧾 Factura Tango ${venta.tipo_factura ? esc(venta.tipo_factura) + ' ' : ''}<b>${esc(venta.nro_factura)}</b>${venta.importe_facturado != null ? ` · facturado <b class="vml-mono">${money(venta.importe_facturado)}</b>` : ''}</div>` : ''}
+      ${venta.nro_factura ? `<div class="vml-sub" style="margin:2px 0 0">🧾 Factura Tango ${venta.tipo_factura ? esc(venta.tipo_factura) + ' ' : ''}<b>${esc(venta.nro_factura)}</b>${venta.total_facturado_tango != null ? ` · facturado <b class="vml-mono">${money(venta.total_facturado_tango)}</b>` : ''}</div>` : ''}
       <div class="vml-sub" style="margin:4px 0 0">${esc(ddmm(venta.fecha))}/${(venta.fecha || '').slice(0, 4)} ·
         <span class="vml-est vml-est-${est.cls || 'ok'}">${esc(est.txt)}</span> ·
         Por cobrar <b class="vml-mono">${money(venta.por_cobrar)}</b>${venta.devuelta ? ' · <span class="vml-dev-claim">devuelta</span>' : ''}</div>
