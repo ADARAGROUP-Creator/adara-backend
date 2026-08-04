@@ -280,48 +280,60 @@ app.get('/debug/tango', async (_, res) => {
   }
 });
 
-// ── DEBUG temporal — lectura CRUDA de facturas Tango (NO escribe en la base) ──
+// ── DEBUG temporal — lectura CRUDA de facturas Tango (background, NO escribe) ──
 // TEMPORAL — quitar tras validar la integracion.
-// Prueba los endpoints candidatos y devuelve el shape real (nombres de campo)
-// para diseniar bien el vinculo con ventas ML. Responde rapido (timeout 7s).
-app.get('/debug/tango-raw', async (req, res) => {
-  const desde = req.query.desde || new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
+// Tango tarda mucho en responder, asi que corre en segundo plano:
+//   1a llamada -> {status:'started'};  volver a pegarle a los ~40s -> {status:'done', ...}
+//   ?reset=1 para reiniciar;  ?desde=YYYY-MM-DD&hasta=YYYY-MM-DD para el rango.
+let TANGO_PROBE = { status: 'idle', startedAt: null, result: null };
+app.get('/debug/tango-raw', (req, res) => {
+  if (req.query.reset) TANGO_PROBE = { status: 'idle', startedAt: null, result: null };
+  if (TANGO_PROBE.status === 'running') return res.json({ status: 'running', startedAt: TANGO_PROBE.startedAt });
+  if (TANGO_PROBE.status === 'done')    return res.json({ status: 'done', startedAt: TANGO_PROBE.startedAt, ...TANGO_PROBE.result });
+
+  const desde = req.query.desde || new Date(Date.now() - 2 * 86400000).toISOString().split('T')[0];
   const hasta = req.query.hasta || new Date().toISOString().split('T')[0];
+  TANGO_PROBE = { status: 'running', startedAt: new Date().toISOString(), result: null };
 
-  async function probe(endpoint, body) {
-    const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 7000);
-    try {
-      const token = await getTFToken();
-      const r = await fetch(`https://www.tangofactura.com/Services/Facturacion/${endpoint}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...body, ApplicationPublicKey: TF_APP_KEY, UserIdentifier: TF_USER_ID, Token: token }),
-        signal: ctrl.signal
-      });
-      const text = await r.text();
-      let data = null; try { data = JSON.parse(text); } catch (_) {}
-      const arr = data ? (Array.isArray(data.Data) ? data.Data : (data.Data ? [data.Data] : [])) : null;
-      const first = arr && arr.length ? arr[0] : null;
-      return {
-        endpoint, httpStatus: r.status,
-        topKeys: data ? Object.keys(data) : null,
-        codigoError: data ? (data.CodigoError ?? null) : null,
-        errorMsg: data && data.Error ? data.Error : null,
-        count: arr ? arr.length : null,
-        firstKeys: first ? Object.keys(first) : null,
-        firstSample: first || (data ? null : text.slice(0, 500))
-      };
-    } catch (e) {
-      return { endpoint, error: String(e && e.message || e) };
-    } finally { clearTimeout(to); }
-  }
+  (async () => {
+    async function probe(endpoint, body) {
+      const t0 = Date.now();
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 55000);
+      try {
+        const token = await getTFToken();
+        const r = await fetch(`https://www.tangofactura.com/Services/Facturacion/${endpoint}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...body, ApplicationPublicKey: TF_APP_KEY, UserIdentifier: TF_USER_ID, Token: token }),
+          signal: ctrl.signal
+        });
+        const text = await r.text();
+        let data = null; try { data = JSON.parse(text); } catch (_) {}
+        const arr = data ? (Array.isArray(data.Data) ? data.Data : (data.Data ? [data.Data] : [])) : null;
+        const first = arr && arr.length ? arr[0] : null;
+        return { endpoint, ms: Date.now() - t0, httpStatus: r.status,
+          topKeys: data ? Object.keys(data) : null,
+          codigoError: data ? (data.CodigoError ?? null) : null,
+          errorMsg: data && data.Error ? data.Error : null,
+          count: arr ? arr.length : null,
+          firstKeys: first ? Object.keys(first) : null,
+          firstSample: first || (data ? null : String(text).slice(0, 600)) };
+      } catch (e) {
+        return { endpoint, ms: Date.now() - t0, error: String(e && e.message || e) };
+      } finally { clearTimeout(to); }
+    }
+    const body = { FechaComprobante: `${desde}T00:00:00`, FechaServicioHasta: `${hasta}T23:59:59`, ObtenerInfoAplicaciones: true };
+    const results = await Promise.all([
+      probe('ObtenerInfoMovimientosPorNroFactura', body),
+      probe('ListarMovimientos', body)
+    ]);
+    console.log('tango-raw done:', JSON.stringify(results).slice(0, 800));
+    TANGO_PROBE = { status: 'done', startedAt: TANGO_PROBE.startedAt, result: { desde, hasta, results } };
+  })().catch(e => {
+    TANGO_PROBE = { status: 'done', startedAt: TANGO_PROBE.startedAt, result: { error: String(e && e.message || e) } };
+  });
 
-  const body = { FechaComprobante: `${desde}T00:00:00`, FechaServicioHasta: `${hasta}T23:59:59`, ObtenerInfoAplicaciones: true };
-  const results = await Promise.all([
-    probe('ObtenerInfoMovimientosPorNroFactura', body),
-    probe('ListarMovimientos', body)
-  ]);
-  res.json({ desde, hasta, results });
+  res.json({ status: 'started', desde, hasta, hint: 'volve a pegarle en ~40s' });
 });
 
 
