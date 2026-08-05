@@ -112,12 +112,46 @@ const sbRpc    = (fn, params) => sb('POST', `rpc/${fn}`, params);
 // ─── Token Mercado Libre (se persiste en Supabase) ──────────────────
 let ML = { access: null, refresh: null, expires: 0 };
 
+// Último diagnóstico del refresh. Existe para que un token caído deje de ser
+// silencioso: se expone en /health y /ml/status y lo consume el banner de la home.
+// motivo: null | 'sin_refresh_token' | 'invalid_grant' | 'respuesta_inesperada' | 'error_red'
+let ML_ERROR = { motivo: null, detalle: null, cuando: null };
+const setMLError = (motivo, detalle) => {
+  ML_ERROR = { motivo, detalle: String(detalle || '').slice(0, 300), cuando: new Date().toISOString() };
+};
+const clearMLError = () => { ML_ERROR = { motivo: null, detalle: null, cuando: null }; };
+
+// Estado real del token. Antes /ml/status devolvía conectado=!!ML.access, o sea
+// "conectado" aunque estuviera vencido hace horas.
+function mlEstado() {
+  const vencido = !ML.access || Date.now() >= ML.expires;
+  return {
+    conectado:     !!ML.access && !vencido,
+    tiene_access:  !!ML.access,
+    tiene_refresh: !!ML.refresh,
+    vencido,
+    // Sin refresh_token el access token muere a las ~6 h y NADIE puede renovarlo:
+    // hay que reconectar a mano en /ml/auth. Para que ML entregue refresh_token, la
+    // aplicación debe tener 'offline_access' habilitado en el panel de desarrolladores
+    // (el scope en la URL de autorización no alcanza si la app no lo tiene activado).
+    requiere_reconexion: !ML.refresh || ML_ERROR.motivo === 'invalid_grant',
+    expira_en_min: ML.expires ? Math.round((ML.expires - Date.now()) / 60000) : null,
+    expira_en:     ML.expires ? Math.round((ML.expires - Date.now()) / 60000) + ' min' : 'n/a',
+    expira_iso:    ML.expires ? new Date(ML.expires).toISOString() : null,
+    error: ML_ERROR.motivo ? ML_ERROR : null
+  };
+}
+
 async function loadMLToken() {
   try {
     const r = await sbGet('workspace_config', 'select=ml_access_token,ml_refresh_token,ml_token_expires&limit=1');
     if (r?.[0]?.ml_access_token) {
       ML = { access: r[0].ml_access_token, refresh: r[0].ml_refresh_token, expires: r[0].ml_token_expires || 0 };
       console.log('✓ Token ML cargado desde Supabase');
+      if (!ML.refresh) {
+        setMLError('sin_refresh_token', 'workspace_config.ml_refresh_token está vacío.');
+        console.error('✗ ML sin refresh_token: el access token vence en ~6 h y no se puede renovar. Reconectar en /ml/auth (requiere offline_access habilitado en el panel de ML).');
+      }
     }
   } catch (e) { console.warn('loadMLToken:', e.message); }
 }
@@ -131,7 +165,13 @@ async function saveMLToken(t) {
 
 let _mlRefreshing = null;
 async function refreshML() {
-  if (!ML.refresh) return;
+  if (!ML.refresh) {
+    // Antes esto era un `return` mudo: el cron corría, no hacía nada y no dejaba
+    // rastro. El token moría cada ~6 h y el sync se cortaba sin que nadie se enterara.
+    setMLError('sin_refresh_token', 'workspace_config.ml_refresh_token está vacío.');
+    console.error('✗ ML refresh imposible: no hay refresh_token guardado. Reconectar en /ml/auth (offline_access debe estar habilitado en el panel de ML).');
+    return;
+  }
   // Single-flight: un solo refresh a la vez. El sync dispara hasta 10 llamadas
   // en paralelo; sin esto, todas refrescan con el MISMO refresh_token (que en ML
   // es de un solo uso) y se invalidan entre sí → "ML se desconecta solo".
@@ -145,15 +185,21 @@ async function refreshML() {
       const data = await r.json();
       if (data.access_token) {
         // ML rota el refresh_token; si por algún motivo no manda uno nuevo, conservamos el actual.
+        if (!data.refresh_token) console.warn('⚠ ML no devolvió refresh_token nuevo; se conserva el anterior.');
         await saveMLToken({ access: data.access_token, refresh: data.refresh_token || ML.refresh, expires: Date.now() + data.expires_in * 1000 });
+        clearMLError();
         console.log('✓ ML token refrescado');
       } else {
         // No pisamos el token con null: puede ser un error transitorio y se reintenta
         // en la próxima llamada. Si el refresh_token está realmente revocado, hay que
         // reconectar ML desde la app (/ml/auth).
-        console.error('✗ ML refresh falló (no renovó):', JSON.stringify(data));
+        const crudo = JSON.stringify(data);
+        const revocado = data.error === 'invalid_grant' || /invalid_grant/.test(crudo);
+        setMLError(revocado ? 'invalid_grant' : 'respuesta_inesperada', crudo);
+        console.error(`✗ ML refresh falló (no renovó)${revocado ? ' — refresh_token revocado, hay que reconectar en /ml/auth' : ''}:`, crudo);
       }
     } catch (e) {
+      setMLError('error_red', e.message);
       console.error('✗ ML refresh error de red:', e.message);
     }
   })().finally(() => { _mlRefreshing = null; });
@@ -267,7 +313,8 @@ app.get('/health', async (_, res) => {
   try { await sbGet('lineas_negocio', 'limit=1'); c.supabase = true; } catch (_) {}
   c.ml_token = !!ML.access && Date.now() < ML.expires;
   try { if (TF_APP_KEY) { await getTFToken(); c.tango = true; } } catch (_) {}
-  res.json({ ok: Object.values(c).every(Boolean), checks: c });
+  // `ml` trae el detalle accionable (vencido vs. sin refresh_token) que consume el banner de la home.
+  res.json({ ok: Object.values(c).every(Boolean), checks: c, ml: mlEstado() });
 });
 
 // ── Debug temporal Tango: muestra el error exacto del login ───────────
@@ -470,22 +517,47 @@ app.get('/ml/callback', async (req, res) => {
     });
     const data = await r.json();
     if (!data.access_token) return res.status(400).json(data);
-    await saveMLToken({ access: data.access_token, refresh: data.refresh_token, expires: Date.now() + data.expires_in * 1000 });
+
+    // Fallback igual al de refreshML(): si ML no manda refresh_token, NO pisamos con null
+    // el que ya teníamos. Sin esto, cada reconexión manual borraba un refresh válido.
+    const refreshPrevio = ML.refresh;
+    const refreshFinal  = data.refresh_token || refreshPrevio || null;
+    await saveMLToken({ access: data.access_token, refresh: refreshFinal, expires: Date.now() + data.expires_in * 1000 });
+    if (refreshFinal) clearMLError();
+    else setMLError('sin_refresh_token', 'ML no devolvió refresh_token en el callback (offline_access no habilitado).');
+
     syncMLVentas(30).catch(console.error); // primera sync: últimos 30 días
+
+    // Si ML no entregó refresh_token, la conexión dura ~6 h y se vuelve a caer sola.
+    // Decirlo acá y no un "✅ conectado correctamente" es la diferencia entre
+    // detectarlo ahora o dentro de seis horas, cuando faltan ventas.
+    if (!refreshFinal) {
+      return res.send(`
+        <html><body style="font-family:sans-serif;text-align:center;padding:60px;max-width:640px;margin:0 auto">
+          <h2>⚠️ Conectado, pero SIN renovación automática</h2>
+          <p>Mercado Libre devolvió el token de acceso pero <strong>no devolvió refresh_token</strong>.
+          Esta conexión se va a caer sola en unas 6 horas.</p>
+          <p style="text-align:left;background:#fff8e1;padding:16px;border-radius:8px">
+            <strong>Cómo se arregla:</strong><br>
+            1. Entrar a <code>developers.mercadolibre.com.ar</code> → tu aplicación → Editar.<br>
+            2. Habilitar <strong>offline_access</strong> en el tipo de autorización / scopes.<br>
+            3. Volver a entrar a <code>/ml/auth</code> y autorizar de nuevo.<br>
+            4. Verificar en <code>/ml/status</code> que <code>tiene_refresh</code> sea <code>true</code>.
+          </p>
+        </body></html>
+      `);
+    }
     res.send(`
       <html><body style="font-family:sans-serif;text-align:center;padding:60px">
         <h2>✅ Mercado Libre conectado correctamente</h2>
-        <p>Ya podés cerrar esta ventana y volver a la app ADARA.</p>
+        <p>Renovación automática activa. Ya podés cerrar esta ventana y volver a la app ADARA.</p>
         <script>setTimeout(() => window.close(), 3000)</script>
       </body></html>
     `);
   } catch (e) { res.status(500).send(e.message); }
 });
 
-app.get('/ml/status', (_, res) => res.json({
-  conectado:  !!ML.access,
-  expira_en:  ML.expires ? Math.round((ML.expires - Date.now()) / 60000) + ' min' : 'n/a'
-}));
+app.get('/ml/status', (_, res) => res.json(mlEstado()));
 
 // ── MERCADO LIBRE — Sync ventas ──────────────────────────────────────
 
@@ -3283,9 +3355,21 @@ cron.schedule('30 */3 * * *', async () => {
   }
 });
 
-// Cada 6 horas: renovar token ML
-cron.schedule('0 */6 * * *', async () => {
-  if (!ML.refresh) return;
+// Cada hora: renovar el token de ML.
+// Antes era cada 6 h, que es exactamente lo que dura el token: margen cero. Si un
+// refresh fallaba (red, rotación), el siguiente intento llegaba DESPUÉS del
+// vencimiento y el sync quedaba cortado hasta que alguien reconectara a mano.
+// Con 1 h hay 5 reintentos antes de que el token muera.
+cron.schedule('7 * * * *', async () => {
+  if (!ML.access && !ML.refresh) return;
+  if (!ML.refresh) {
+    console.error('⏰ Cron ML: sin refresh_token, no se puede renovar. Reconectar en /ml/auth.');
+    setMLError('sin_refresh_token', 'workspace_config.ml_refresh_token está vacío.');
+    return;
+  }
+  // Solo refresca si falta menos de 2 h para el vencimiento: evita rotar el
+  // refresh_token (que en ML es de un solo uso) más veces de las necesarias.
+  if (Date.now() < ML.expires - 2 * 3600 * 1000) return;
   console.log('⏰ Cron: refresh token ML...');
   try { await refreshML(); } catch (e) { console.error('Cron refresh:', e.message); }
 });
