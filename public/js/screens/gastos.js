@@ -21,7 +21,7 @@ let LINEA_LABEL = {};     // id -> label
 let CANALES = [];         // canales (maestro, FK de gasto_imputacion.canal)
 let CUENTAS = [];         // cuentas (para "cuenta origen intención")
 let PROVEEDORES = [];     // proveedores (opcional, puede estar vacío)
-let COMPRAS_CAP = [];     // compras activas sin consumo, candidatas a recibir un gasto capitalizable
+let COMPRAS_CAP = [];     // compras activas: candidatas a recibir un gasto capitalizable
 let FILTRO = { periodo: '', categoria: '', linea: '', estado: '', q: '' };
 
 const CATEGORIAS = [
@@ -117,9 +117,8 @@ export async function loadGastos() {
     CANALES = await sbGet('canales', 'order=codigo.asc').catch(() => []);
     CUENTAS = await sbGet('cuentas', 'order=id.asc');
     PROVEEDORES = await sbGet('proveedores', 'order=id.asc').catch(() => []);
-    // Compras a las que un gasto puede capitalizar. Se muestran las activas recientes; el
-    // backend rechaza igual las que ya tienen ventas (el costo del lote no se puede recostear
-    // hacia atrás sin reescribir el CMV ya congelado en consumo_lote).
+    // Compras a las que un gasto puede capitalizar. Si la elegida ya tuvo ventas, el preview
+    // avisa qué meses se recostean y pide confirmación antes de guardar.
     COMPRAS_CAP = await sbGet('v_compras_ap', 'estado_compra=eq.activa&order=fecha.desc&limit=60').catch(() => []);
     await recargar();
   } catch (e) {
@@ -316,6 +315,7 @@ function openModalNuevo() {
           no cuenta como gasto del mes, sale por CMV cuando vendas. El IVA sigue siendo crédito
           fiscal normal y la deuda con el proveedor no cambia.
         </div>
+        <div id="g-cap-impacto" style="display:none"></div>
       </div>
 
       <div class="gas-imp" id="g-imp-box">
@@ -572,11 +572,64 @@ function openModalNuevo() {
   $('#g-imp-eq').addEventListener('click', repartirEquitativo);
 
   // Si el gasto capitaliza, la línea la hereda de la compra: el bloque de imputación sobra.
-  $('#g-capitaliza').addEventListener('change', e => {
-    const cap = !!e.target.value;
+  $('#g-capitaliza').addEventListener('change', () => { toggleCapitaliza(); pedirImpacto(); });
+  $('#g-neto').addEventListener('input', () => { if ($('#g-capitaliza').value) pedirImpacto(); });
+  $('#g-moneda').addEventListener('change', () => { if ($('#g-capitaliza').value) pedirImpacto(); });
+  $('#g-tc').addEventListener('input', () => { if ($('#g-capitaliza').value) pedirImpacto(); });
+
+  function toggleCapitaliza() {
+    const cap = !!$('#g-capitaliza').value;
     $('#g-imp-box').style.display = cap ? 'none' : '';
     $('#g-cap-hint').style.display = cap ? '' : 'none';
-  });
+    if (!cap) $('#g-cap-impacto').style.display = 'none';
+  }
+
+  // Muestra qué pasaría antes de guardar. Si la compra ya tuvo ventas, capitalizar recostea el
+  // CMV de esas ventas y mueve meses que quizá ya miraste: por eso se pide confirmación explícita.
+  let impactoToken = 0;
+  async function pedirImpacto() {
+    const compraId = $('#g-capitaliza').value;
+    const box = $('#g-cap-impacto');
+    if (!compraId) { box.style.display = 'none'; return; }
+    const neto = parseFloat($('#g-neto').value) || 0;
+    const esUSD = $('#g-moneda').value === 'USD';
+    const tc = parseFloat($('#g-tc').value) || 0;
+    if (!(neto > 0) || (esUSD && !(tc > 0))) { box.style.display = 'none'; return; }
+    const netoArs = esUSD ? neto * tc : neto;
+
+    const mi = ++impactoToken;
+    try {
+      const r = await fetch(`/compras/${compraId}/impacto-capitalizacion?neto_ars=${encodeURIComponent(netoArs)}`);
+      const d = await r.json();
+      if (mi !== impactoToken) return;                 // llegó tarde: hay una consulta más nueva
+      if (!r.ok) throw new Error(d.error || 'error');
+
+      const filas = d.lotes.map(l =>
+        `<div class="gas-cap-row"><span>${esc(l.sku)}</span>
+         <span class="gas-cap-mono">${fmtMonto(l.costo_actual)} → <b>${fmtMonto(l.costo_nuevo)}</b></span></div>`).join('');
+      const per = (d.periodos_afectados || []).map(p =>
+        `<div class="gas-cap-row"><span>CMV de ${p.periodo}</span><span class="gas-cap-mono">+${fmtMonto(p.delta_cmv)}</span></div>`).join('');
+
+      box.innerHTML = `
+        <div class="gas-cap-box">
+          <div class="gas-cap-t">Qué va a pasar</div>
+          ${filas}
+          <div class="gas-cap-row"><span>Valor del stock</span><span class="gas-cap-mono">+${fmtMonto(d.delta_stock)}</span></div>
+          ${d.unidades_consumidas > 0 ? `
+            <div class="gas-cap-sep"></div>
+            <div class="gas-cap-warn">Esta compra ya tiene <b>${d.unidades_consumidas}</b> unidades vendidas.
+              Capitalizar recostea esas ventas y mueve el resultado de:</div>
+            ${per}
+            <label class="gas-cap-ok"><input type="checkbox" id="g-cap-confirm"> Entiendo que cambia el CMV de esos meses</label>
+          ` : `<div class="gas-cap-ok-msg">Sin ventas todavía: capitaliza limpio, no toca ningún mes.</div>`}
+        </div>`;
+      box.style.display = '';
+    } catch (e) {
+      if (mi !== impactoToken) return;
+      box.innerHTML = `<div class="gas-cap-box gas-cap-err">No se pudo calcular el impacto: ${esc(e.message)}</div>`;
+      box.style.display = '';
+    }
+  }
   addImpRow(100);   // arranca con un renglón al 100%
 
   // Guardar
@@ -618,6 +671,11 @@ function openModalNuevo() {
     if (capitaliza_compra_id && moneda === 'USD' && !(parseFloat(tcVal) > 0)) {
       window.toast('Gasto en USD que va al costo de una compra: cargá el TC', 'error'); return;
     }
+    // Si la compra ya tuvo ventas, el preview muestra un checkbox: sin tildar no se guarda.
+    const chkRecosteo = document.getElementById('g-cap-confirm');
+    if (capitaliza_compra_id && chkRecosteo && !chkRecosteo.checked) {
+      window.toast('Confirmá que entendés que cambia el CMV de esos meses', 'error'); return;
+    }
     if (!descripcion) { window.toast('Poné una descripción', 'error'); return; }
     if (!(neto > 0)) { window.toast('El monto tiene que ser mayor a 0', 'error'); return; }
     if (moneda === 'USD' && tipo_comprobante === 'sin_factura' && forma_pago === 'efectivo' && !(parseFloat(tcVal) > 0)) {
@@ -638,6 +696,7 @@ function openModalNuevo() {
       cuenta_origen_intencion,
       forma_pago,
       capitaliza_compra_id,
+      confirma_recosteo: !!(capitaliza_compra_id && chkRecosteo && chkRecosteo.checked),
     };
 
     const btn = $('#g-guardar');
@@ -688,6 +747,16 @@ function esc(s) {
 function inyectarEstilo() {
   if (document.getElementById('gas-style')) return;
   const css = `
+    .gas-cap-box{margin-top:10px;padding:12px 14px;border:1px solid #E7E5E4;border-radius:8px;background:#FAFAF9;font-size:13px}
+    .gas-cap-t{font-weight:600;margin-bottom:8px;color:#1C1917}
+    .gas-cap-row{display:flex;justify-content:space-between;gap:12px;padding:3px 0;color:#57534E}
+    .gas-cap-mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums;white-space:nowrap}
+    .gas-cap-sep{height:1px;background:#E7E5E4;margin:10px 0}
+    .gas-cap-warn{color:#854F0B;margin-bottom:6px}
+    .gas-cap-ok{display:flex;align-items:center;gap:7px;margin-top:10px;cursor:pointer;user-select:none;color:#1C1917}
+    .gas-cap-ok input{cursor:pointer;margin:0}
+    .gas-cap-ok-msg{color:#0F6E56}
+    .gas-cap-err{color:#B42318}
     .gas-mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums}
     .gas-muted{color:#78716C;font-size:13px}
     .gas-comp{color:#A8A29E;font-size:12px}
