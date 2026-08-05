@@ -185,7 +185,7 @@ function renderFacturas() {
   document.getElementById('cf-q').addEventListener('input', e => { FILTRO.q = e.target.value; renderFacturas(); });
   document.getElementById('cf-nueva').addEventListener('click', openAlta);
   document.querySelectorAll('.com-anular').forEach(b => b.addEventListener('click', e => { e.stopPropagation(); anularCompra(+b.dataset.id); }));
-  document.querySelectorAll('.com-clip').forEach(b => b.addEventListener('click', e => { e.stopPropagation(); verAdjunto(+b.dataset.adj); }));
+  document.querySelectorAll('.com-pdf').forEach(b => b.addEventListener('click', e => { e.stopPropagation(); verAdjunto(+b.dataset.adj); }));
   document.querySelectorAll('.com-asignar-fac').forEach(b => b.addEventListener('click', e => { e.stopPropagation(); asignarFactura(+b.dataset.id); }));
   document.querySelectorAll('tr.com-fila').forEach(tr => tr.addEventListener('click', () => toggleDetalle(+tr.dataset.id)));
   document.querySelectorAll('.com-adj-dl').forEach(b => b.addEventListener('click', e => { e.stopPropagation(); verAdjunto(+b.dataset.adj); }));
@@ -224,82 +224,150 @@ const TIPO_LABEL = {
 function filaDetalle(c) {
   const d = DETALLE[c.compra_id];
   const cols = 9;
-  if (!d) return `<tr class="com-det"><td colspan="${cols}"><div class="com-det-box com-muted">Cargando detalle…</div></td></tr>`;
-  if (d.error) return `<tr class="com-det"><td colspan="${cols}"><div class="com-det-box com-det-err">No se pudo cargar: ${esc(d.error)}</div></td></tr>`;
+  const wrap = inner => `<tr class="com-det"><td colspan="${cols}"><div class="com-det-box">${inner}</div></td></tr>`;
+  if (!d) return wrap(`<div class="com-det-load">Cargando detalle…</div>`);
+  if (d.error) return wrap(`<div class="com-det-err">No se pudo cargar el detalle: ${esc(d.error)}</div>`);
 
   const skuDe = id => (SKU_BY_ID[id] && SKU_BY_ID[id].codigo) || (id ? '#' + id : '—');
-  const mon = c.moneda === 'USD' ? 'US$ ' : '$ ';
-  const m = n => mon + num(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const desc = id => (SKU_BY_ID[id] || {}).descripcion || '';
+  const esUSD = c.moneda === 'USD';
+  const sim = esUSD ? 'US$ ' : '$ ';
+  const n2 = n => num(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const m = n => sim + n2(n);        // moneda de la factura
+  const a = n => '$ ' + n2(n);       // ARS (lotes siempre en ARS)
 
-  const prod = d.comps.filter(x => x.tipo === 'producto');
+  const prod   = d.comps.filter(x => x.tipo === 'producto');
   const costos = d.comps.filter(x => x.clase === 'costo' && x.tipo !== 'producto');
-  const fisc = d.comps.filter(x => x.clase === 'fiscal');
+  const ivas   = d.comps.filter(x => x.tipo === 'iva');
+  const percs  = d.comps.filter(x => x.clase === 'fiscal' && x.tipo !== 'iva');
 
-  const secProd = prod.length ? `
-    <div class="com-det-t">Productos</div>
-    <table class="com-det-t2"><tbody>
-      ${prod.map(x => `<tr>
-        <td>${esc(skuDe(x.sku_id))}</td>
-        <td class="com-muted">${esc((SKU_BY_ID[x.sku_id] || {}).descripcion || '')}</td>
-        <td style="text-align:right">${num(x.cantidad)} u</td>
-        <td style="text-align:right" class="com-mono">${m(num(x.monto) / (num(x.cantidad) || 1))}</td>
-        <td style="text-align:right" class="com-mono">${m(x.monto)}</td>
-      </tr>`).join('')}
-    </tbody></table>` : '';
+  const totProd   = prod.reduce((s, x) => s + num(x.monto), 0);
+  const totCostos = costos.reduce((s, x) => s + num(x.monto), 0);
+  const totIva    = ivas.reduce((s, x) => s + num(x.monto), 0);
+  const totPerc   = percs.reduce((s, x) => s + num(x.monto), 0);
 
-  const secCostos = costos.length ? `
-    <div class="com-det-t">Otros costos (van al lote)</div>
-    <table class="com-det-t2"><tbody>
-      ${costos.map(x => `<tr>
-        <td colspan="4">${esc(TIPO_LABEL[x.tipo] || x.tipo)}${x.descripcion ? ' · <span class="com-muted">' + esc(x.descripcion) + '</span>' : ''}</td>
-        <td style="text-align:right" class="com-mono">${m(x.monto)}</td>
-      </tr>`).join('')}
-    </tbody></table>` : '';
+  const uIni = d.lotes.reduce((s, l) => s + num(l.cantidad_inicial), 0);
+  const uAct = d.lotes.reduce((s, l) => s + num(l.cantidad_actual), 0);
+  const valorStock = d.lotes.reduce((s, l) => s + num(l.cantidad_actual) * num(l.costo_unitario), 0);
+  const vendidas = uIni - uAct;
+  const pctVend = uIni > 0 ? Math.round((vendidas / uIni) * 100) : 0;
 
-  const secFisc = fisc.length ? `
-    <div class="com-det-t">Impuestos (crédito fiscal, no son costo)</div>
-    <table class="com-det-t2"><tbody>
-      ${fisc.map(x => `<tr>
-        <td colspan="4">${esc(TIPO_LABEL[x.tipo] || x.tipo)}${x.descripcion ? ' · <span class="com-muted">' + esc(x.descripcion) + '</span>' : ''}</td>
-        <td style="text-align:right" class="com-mono">${m(x.monto)}</td>
-      </tr>`).join('')}
-    </tbody></table>` : '';
+  const prov = PROV_BY_ID[c.proveedor_id] || {};
+  const chip = (k, v) => `<div class="com-chip"><span>${k}</span><b>${v}</b></div>`;
 
-  const secLotes = d.lotes.length ? `
-    <div class="com-det-t">Lotes generados <span class="com-muted">— costo unitario final, en ARS</span></div>
-    <table class="com-det-t2"><tbody>
-      ${d.lotes.map(l => {
-        const vendidas = num(l.cantidad_inicial) - num(l.cantidad_actual);
-        return `<tr>
-          <td>${esc(skuDe(l.sku_id))}</td>
-          <td class="com-muted">${num(l.cantidad_inicial)} u · quedan ${num(l.cantidad_actual)}${vendidas > 0 ? ` · <b>${vendidas} vendidas</b>` : ''}</td>
-          <td colspan="2" style="text-align:right" class="com-mono">$ ${num(l.costo_unitario).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} /u</td>
-          <td style="text-align:right" class="com-mono">$ ${(num(l.cantidad_inicial) * num(l.costo_unitario)).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-        </tr>`;
-      }).join('')}
-    </tbody></table>` : '<div class="com-det-t com-muted">Sin lotes: esta compra no generó stock.</div>';
+  const cabecera = `
+    <div class="com-det-head">
+      <div class="com-det-title">
+        ${esc(provLabel(prov))}
+        ${prov.cuit ? `<span class="com-det-cuit">CUIT ${esc(prov.cuit)}</span>` : ''}
+      </div>
+      <div class="com-chips">
+        ${chip('Factura', c.nro_factura ? esc(c.nro_factura) : '<i>pendiente</i>')}
+        ${chip('Fecha', esc(c.fecha || ''))}
+        ${chip('Línea', esc(LINEA_LABEL[c.linea_id] || '—'))}
+        ${chip('Moneda', esc(c.moneda) + (esUSD && c.tc_blue ? ` · TC ${n2(c.tc_blue)}` : ''))}
+      </div>
+    </div>`;
 
-  const secGastos = (d.gastosCap && d.gastosCap.length) ? `
-    <div class="com-det-t">Gastos de terceros al costo de esta compra</div>
-    <table class="com-det-t2"><tbody>
-      ${d.gastosCap.map(g => `<tr>
-        <td>${esc(g.fecha)}</td>
-        <td class="com-muted">${esc(g.descripcion || '')}${g.nro_comprobante ? ' · ' + esc(g.nro_comprobante) : ''}</td>
-        <td colspan="2" style="text-align:right" class="com-muted">${esc(g.estado_pago)}</td>
-        <td style="text-align:right" class="com-mono">$ ${num(g.monto_neto).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-      </tr>`).join('')}
-    </tbody></table>` : '';
+  const tabla = (titulo, nota, filas) => !filas.length ? '' : `
+    <div class="com-card">
+      <div class="com-card-h">${titulo}${nota ? `<span class="com-card-n">${nota}</span>` : ''}</div>
+      <table class="com-card-t"><tbody>${filas.join('')}</tbody></table>
+    </div>`;
+
+  const filasProd = prod.map(x => `<tr>
+      <td class="com-c-sku">${esc(skuDe(x.sku_id))}</td>
+      <td class="com-c-desc" title="${esc(desc(x.sku_id))}">${esc(desc(x.sku_id))}</td>
+      <td class="com-c-num">${num(x.cantidad)} u</td>
+      <td class="com-c-num com-mono">${m(num(x.monto) / (num(x.cantidad) || 1))}</td>
+      <td class="com-c-num com-mono com-c-tot">${m(x.monto)}</td>
+    </tr>`);
+
+  const filasCostos = costos.map(x => `<tr>
+      <td colspan="4"><span class="com-tag com-tag-costo">${esc(TIPO_LABEL[x.tipo] || x.tipo)}</span>
+        ${x.descripcion ? `<span class="com-c-desc">${esc(x.descripcion)}</span>` : ''}</td>
+      <td class="com-c-num com-mono com-c-tot">${m(x.monto)}</td>
+    </tr>`);
+
+  const filasFisc = [...ivas, ...percs].map(x => `<tr>
+      <td colspan="4"><span class="com-tag com-tag-fisc">${esc(TIPO_LABEL[x.tipo] || x.tipo)}</span>
+        ${x.descripcion ? `<span class="com-c-desc">${esc(x.descripcion)}</span>` : ''}</td>
+      <td class="com-c-num com-mono com-c-tot">${m(x.monto)}</td>
+    </tr>`);
+
+  const filasLotes = d.lotes.map(l => {
+    const v = num(l.cantidad_inicial) - num(l.cantidad_actual);
+    const pct = num(l.cantidad_inicial) > 0 ? Math.round((v / num(l.cantidad_inicial)) * 100) : 0;
+    return `<tr>
+      <td class="com-c-sku">${esc(skuDe(l.sku_id))}</td>
+      <td class="com-c-desc">
+        <div class="com-bar"><div class="com-bar-f" style="width:${pct}%"></div></div>
+        <span class="com-bar-l">${num(l.cantidad_actual)} de ${num(l.cantidad_inicial)} en stock${v > 0 ? ` · ${v} vendida${v === 1 ? '' : 's'}` : ''}</span>
+      </td>
+      <td class="com-c-num com-mono">${a(l.costo_unitario)}<span class="com-c-u">/u</span></td>
+      <td class="com-c-num com-mono com-muted">${a(num(l.cantidad_actual) * num(l.costo_unitario))}</td>
+      <td class="com-c-num com-mono com-c-tot">${a(num(l.cantidad_inicial) * num(l.costo_unitario))}</td>
+    </tr>`;
+  });
+
+  const filasGastos = (d.gastosCap || []).map(g => `<tr>
+      <td class="com-c-sku">${esc((g.fecha || '').slice(8, 10))}/${esc((g.fecha || '').slice(5, 7))}</td>
+      <td class="com-c-desc">${esc(g.descripcion || '')}${g.nro_comprobante ? ` · ${esc(g.nro_comprobante)}` : ''}</td>
+      <td colspan="2" class="com-c-num"><span class="com-badge com-badge-${esc(g.estado_pago)}">${esc(g.estado_pago)}</span></td>
+      <td class="com-c-num com-mono com-c-tot">$ ${n2(g.monto_neto)}</td>
+    </tr>`);
+
+  const linea = (k, v, cls = '') => `<div class="com-tot-r ${cls}"><span>${k}</span><b class="com-mono">${v}</b></div>`;
+  const totales = `
+    <div class="com-card com-card-tot">
+      <div class="com-card-h">Totales</div>
+      <div class="com-tot">
+        ${linea('Productos (neto)', m(totProd))}
+        ${totCostos ? linea('+ otros costos al lote', m(totCostos)) : ''}
+        ${linea('= Costo de la mercadería', m(totProd + totCostos), 'com-tot-mid')}
+        ${totIva ? linea('IVA (crédito fiscal)', m(totIva), 'com-tot-fisc') : ''}
+        ${totPerc ? linea('Percepciones (crédito fiscal)', m(totPerc), 'com-tot-fisc') : ''}
+        ${linea('Total factura', money(c.total_facturado_ars), 'com-tot-big')}
+        <div class="com-tot-sep"></div>
+        ${linea('Pagado', money(c.pagado_ars))}
+        ${linea('Saldo pendiente', money(c.saldo_ap_ars), num(c.saldo_ap_ars) > 0 ? 'com-tot-deuda' : 'com-tot-ok')}
+        ${uIni > 0 ? `<div class="com-tot-sep"></div>
+          ${linea('Unidades', `${uAct} de ${uIni} en stock (${pctVend}% vendido)`)}
+          ${linea('Stock valorizado', a(valorStock))}` : ''}
+      </div>
+    </div>`;
 
   const adjs = ADJ[c.compra_id] || [];
-  const secAdj = adjs.length
-    ? `<div class="com-det-t">Comprobante</div>
-       <div class="com-det-adj">${adjs.map(a =>
-         `<button class="com-adj-dl" data-adj="${a.id}">📄 ${esc(a.nombre)}</button>`).join('')}</div>`
-    : `<div class="com-det-t com-muted">Sin comprobante adjunto.</div>`;
+  const comprobante = `
+    <div class="com-card">
+      <div class="com-card-h">Comprobante</div>
+      ${adjs.length
+        ? `<div class="com-det-adj">${adjs.map(x =>
+            `<button class="com-adj-dl" data-adj="${x.id}">
+               <span class="com-adj-ic">PDF</span>
+               <span class="com-adj-n">${esc(x.nombre)}</span>
+               <span class="com-adj-go">abrir ↗</span>
+             </button>`).join('')}</div>`
+        : `<div class="com-det-vacio">Esta compra no tiene comprobante adjunto.</div>`}
+    </div>`;
 
-  return `<tr class="com-det"><td colspan="${cols}"><div class="com-det-box">
-    ${secProd}${secCostos}${secFisc}${secLotes}${secGastos}${secAdj}
-  </div></td></tr>`;
+  return wrap(`
+    ${cabecera}
+    <div class="com-det-cols">
+      <div class="com-det-main">
+        ${tabla('Productos', `${prod.length} renglón${prod.length === 1 ? '' : 'es'}`, filasProd)}
+        ${tabla('Otros costos', 'se reparten en el costo de los lotes', filasCostos)}
+        ${tabla('Impuestos', 'crédito fiscal — no son costo', filasFisc)}
+        ${d.lotes.length
+          ? tabla('Lotes generados', 'costo unitario final en ARS', filasLotes)
+          : `<div class="com-card"><div class="com-card-h">Lotes</div><div class="com-det-vacio">Esta compra no generó stock.</div></div>`}
+        ${tabla('Gastos de terceros al costo de esta compra', 'cargados desde Gastos', filasGastos)}
+      </div>
+      <div class="com-det-side">
+        ${totales}
+        ${comprobante}
+      </div>
+    </div>`);
 }
 
 function filaCompra(c) {
@@ -320,7 +388,12 @@ function filaCompra(c) {
     <td style="text-align:right" class="com-mono com-muted">${money(c.pagado_ars)}</td>
     <td style="text-align:right" class="com-mono">${money(c.saldo_ap_ars)}</td>
     <td><span class="com-badge com-badge-${est}">${est}</span></td>
-    <td style="text-align:right">${(ADJ[c.compra_id] && ADJ[c.compra_id].length) ? `<button class="com-clip" data-adj="${ADJ[c.compra_id][0].id}" title="Ver factura: ${esc(ADJ[c.compra_id][0].nombre)}">📎</button>` : ''}${c.tipo_compra === 'inicial' ? '' : `<button class="com-anular" data-id="${c.compra_id}" title="Anular compra" style="font-size:12px;color:#B91C1C;background:none;border:0;cursor:pointer;font:inherit;padding:2px 4px">Anular</button>`}</td>
+    <td class="com-acc">
+      ${(ADJ[c.compra_id] && ADJ[c.compra_id].length)
+        ? `<button class="com-pdf" data-adj="${ADJ[c.compra_id][0].id}" title="Abrir ${esc(ADJ[c.compra_id][0].nombre)}"><span class="com-pdf-i">PDF</span></button>`
+        : `<span class="com-pdf-no" title="Sin comprobante adjunto">—</span>`}
+      ${c.tipo_compra === 'inicial' ? '' : `<button class="com-anular" data-id="${c.compra_id}" title="Anular compra">Anular</button>`}
+    </td>
   </tr>${abierta ? filaDetalle(c) : ''}`;
 }
 
@@ -892,24 +965,81 @@ function optProv(selId) {
 function inyectarEstilo() {
   if (document.getElementById('com-style')) return;
   const css = `
-    .com-fila{cursor:pointer}
+    /* fila clickeable + acciones */
+    .com-fila{cursor:pointer;transition:background .12s}
     .com-fila:hover{background:#FAFAF9}
-    .com-fila-open{background:#FEF9F3}
+    .com-fila-open{background:#FEF9F3;box-shadow:inset 3px 0 0 #D97706}
     .com-caret{display:inline-block;width:12px;color:#A8A29E;font-size:11px}
-    .com-det > td{padding:0 !important;background:#FEFDFB}
-    .com-det-box{padding:14px 18px;border-left:3px solid #D97706;font-size:13px}
-    .com-det-t{font-weight:600;margin:12px 0 5px;color:#1C1917}
-    .com-det-box > .com-det-t:first-child{margin-top:0}
-    .com-det-t2{width:100%;border-collapse:collapse}
-    .com-det-t2 td{padding:3px 8px 3px 0;border-bottom:1px solid #F0EEEC;vertical-align:top}
-    .com-det-t2 tr:last-child td{border-bottom:0}
-    .com-det-adj{display:flex;gap:8px;flex-wrap:wrap;margin-top:2px}
-    .com-adj-dl{background:#fff;border:1px solid #E7E5E4;border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit;font-size:13px;color:#1C1917}
-    .com-adj-dl:hover{border-color:#D97706;color:#B45309}
+    .com-acc{text-align:right;white-space:nowrap}
+    .com-pdf{background:#fff;border:1px solid #E7E5E4;border-radius:5px;padding:2px 7px;cursor:pointer;font:inherit;margin-right:6px;line-height:1.5;vertical-align:middle}
+    .com-pdf:hover{border-color:#D97706;background:#FFFBF5}
+    .com-pdf-i{font-size:10px;font-weight:700;letter-spacing:.04em;color:#B45309}
+    .com-pdf-no{display:inline-block;width:34px;color:#D6D3D1;text-align:center;margin-right:6px}
+    .com-anular{font-size:12px;color:#B91C1C;background:none;border:0;cursor:pointer;font-family:inherit;padding:2px 4px}
+    .com-anular:hover{text-decoration:underline}
+
+    /* panel de detalle */
+    .com-det > td{padding:0 !important;background:#F7F6F4;border-bottom:2px solid #E7E5E4}
+    .com-det-box{padding:16px 20px 20px}
+    .com-det-load,.com-det-err,.com-det-vacio{padding:10px 2px;color:#78716C}
     .com-det-err{color:#B42318}
+    .com-det-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;margin-bottom:14px}
+    .com-det-title{font-size:16px;font-weight:700;color:#1C1917;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+    .com-det-cuit{font-size:12px;font-weight:500;color:#78716C;font-family:'JetBrains Mono',ui-monospace,monospace}
+    .com-chips{display:flex;gap:8px;flex-wrap:wrap}
+    .com-chip{background:#fff;border:1px solid #E7E5E4;border-radius:6px;padding:4px 10px;font-size:12px;line-height:1.4}
+    .com-chip span{color:#A8A29E;display:block;font-size:10px;text-transform:uppercase;letter-spacing:.05em}
+    .com-chip b{color:#1C1917;font-weight:600}
+    .com-det-cols{display:grid;grid-template-columns:1fr 320px;gap:16px;align-items:start}
+    @media (max-width:1100px){.com-det-cols{grid-template-columns:1fr}}
+    .com-det-main{display:flex;flex-direction:column;gap:12px;min-width:0}
+    .com-det-side{display:flex;flex-direction:column;gap:12px}
+
+    /* cards */
+    .com-card{background:#fff;border:1px solid #E7E5E4;border-radius:10px;overflow:hidden}
+    .com-card-h{padding:9px 14px;background:#FCFBFA;border-bottom:1px solid #F0EEEC;font-size:12px;font-weight:700;
+      text-transform:uppercase;letter-spacing:.05em;color:#57534E;display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+    .com-card-n{font-size:11px;font-weight:500;text-transform:none;letter-spacing:0;color:#A8A29E}
+    .com-card-t{width:100%;border-collapse:collapse;font-size:13px}
+    .com-card-t td{padding:8px 14px;border-bottom:1px solid #F5F4F2;vertical-align:middle}
+    .com-card-t tr:last-child td{border-bottom:0}
+    .com-card-t tr:hover{background:#FCFCFB}
+    .com-c-sku{font-family:'JetBrains Mono',ui-monospace,monospace;font-weight:600;color:#1C1917;white-space:nowrap;width:1%}
+    .com-c-desc{color:#78716C;max-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .com-c-num{text-align:right;white-space:nowrap;width:1%;color:#57534E}
+    .com-c-tot{color:#1C1917;font-weight:600}
+    .com-c-u{color:#A8A29E;font-size:11px;margin-left:1px}
+    .com-tag{display:inline-block;font-size:12px;font-weight:600;padding:1px 8px;border-radius:4px;margin-right:8px}
+    .com-tag-costo{background:#FEF3E2;color:#B45309}
+    .com-tag-fisc{background:#EFF6FF;color:#1D4ED8}
+
+    /* barra de consumo del lote */
+    .com-bar{height:5px;background:#F0EEEC;border-radius:3px;overflow:hidden;margin-bottom:4px;max-width:220px}
+    .com-bar-f{height:100%;background:#D97706;border-radius:3px}
+    .com-bar-l{font-size:11px;color:#A8A29E}
+
+    /* totales */
+    .com-card-tot .com-tot{padding:10px 14px 12px}
+    .com-tot-r{display:flex;justify-content:space-between;gap:12px;padding:4px 0;font-size:13px;color:#57534E}
+    .com-tot-r b{color:#1C1917;font-weight:600;white-space:nowrap}
+    .com-tot-mid{border-top:1px solid #F0EEEC;margin-top:4px;padding-top:8px}
+    .com-tot-fisc{color:#1D4ED8}.com-tot-fisc b{color:#1D4ED8;font-weight:500}
+    .com-tot-big{border-top:2px solid #E7E5E4;margin-top:6px;padding-top:9px;font-size:14px;font-weight:700;color:#1C1917}
+    .com-tot-big b{font-size:15px}
+    .com-tot-sep{height:1px;background:#F0EEEC;margin:9px 0}
+    .com-tot-deuda b{color:#B45309}
+    .com-tot-ok b{color:#0F6E56}
+
+    /* comprobante */
+    .com-det-adj{display:flex;flex-direction:column;gap:6px;padding:10px 12px}
+    .com-adj-dl{display:flex;align-items:center;gap:9px;width:100%;text-align:left;background:#fff;border:1px solid #E7E5E4;
+      border-radius:7px;padding:9px 11px;cursor:pointer;font:inherit;font-size:13px;color:#1C1917;transition:all .12s}
+    .com-adj-dl:hover{border-color:#D97706;background:#FFFBF5}
+    .com-adj-ic{font-size:10px;font-weight:700;letter-spacing:.04em;color:#B45309;background:#FEF3E2;border-radius:4px;padding:3px 6px;flex:0 0 auto}
+    .com-adj-n{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .com-adj-go{font-size:11px;color:#A8A29E;flex:0 0 auto}
+    .com-adj-dl:hover .com-adj-go{color:#B45309}
     .com-mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums}
-    .com-clip{font-size:14px;background:none;border:0;cursor:pointer;padding:2px 6px;margin-right:2px}
-    .com-clip:hover{opacity:.65}
     .com-muted{color:#78716C}
     .com-sub{font-size:13px;color:#78716C;margin:-4px 0 12px}
     .com-badge{font-size:12px;padding:2px 8px;border-radius:6px}
