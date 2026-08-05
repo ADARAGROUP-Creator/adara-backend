@@ -3300,6 +3300,71 @@ cron.schedule('0 */6 * * *', async () => {
 // PostgREST no da transacción nativa: si algo falla después de crear el gasto,
 // se hace rollback best-effort borrando lo creado (gasto recién nacido, sin
 // historia que preservar).
+// ── Preview: qué pasaría si un gasto de $X capitalizara a esta compra ─────
+// El neto se reparte entre los lotes por su valor (cantidad_inicial × costo_unitario) — el
+// mismo criterio "por costo neto" del prorrateo de compras — y sube costo_unitario. Las
+// unidades ya vendidas necesitan además recostear su consumo_lote, lo que mueve el CMV de
+// meses pasados: por eso este endpoint existe, para avisar ANTES de tocar nada.
+app.get('/compras/:id/impacto-capitalizacion', async (req, res) => {
+  const round2 = n => Math.round((Number(n) || 0) * 100) / 100;
+  try {
+    const compraId = Number(req.params.id);
+    const netoARS = round2(req.query.neto_ars);
+    if (!(compraId > 0)) return res.status(400).json({ error: 'compra inválida' });
+
+    const lotes = await sbGet('lotes', `compra_id=eq.${compraId}&select=id,sku_id,cantidad_inicial,cantidad_actual,costo_unitario`);
+    if (!lotes || !lotes.length) return res.status(400).json({ error: 'Esa compra no tiene lotes' });
+
+    const base = lotes.reduce((a, l) => a + Number(l.cantidad_inicial) * Number(l.costo_unitario), 0);
+    if (!(base > 0)) return res.status(400).json({ error: 'Los lotes de esa compra tienen costo 0: no hay base para repartir' });
+
+    const skus = await sbGet('skus', `id=in.(${lotes.map(l => l.sku_id).join(',')})&select=id,codigo`);
+    const codigoDe = Object.fromEntries((skus || []).map(s => [s.id, s.codigo]));
+
+    const detalle = [];
+    const porPeriodo = {};
+    let deltaCmvTotal = 0, unidadesConsumidas = 0;
+
+    for (const l of lotes) {
+      const valorLote = Number(l.cantidad_inicial) * Number(l.costo_unitario);
+      const deltaUnit = (netoARS * (valorLote / base)) / Number(l.cantidad_inicial);
+      const consumos = await sbGet('consumo_lote', `lote_id=eq.${l.id}&select=unidades,periodo,fecha,tipo`);
+      const u = (consumos || []).reduce((a, c) => a + Number(c.unidades), 0);
+      unidadesConsumidas += u;
+      for (const c of (consumos || [])) {
+        const p = c.periodo || (c.fecha || '').slice(0, 7) || 'sin período';
+        const d = round2(Number(c.unidades) * deltaUnit);
+        porPeriodo[p] = round2((porPeriodo[p] || 0) + d);
+        deltaCmvTotal = round2(deltaCmvTotal + d);
+      }
+      detalle.push({
+        lote_id: l.id,
+        sku: codigoDe[l.sku_id] || String(l.sku_id),
+        cantidad_inicial: Number(l.cantidad_inicial),
+        cantidad_actual: Number(l.cantidad_actual),
+        costo_actual: Number(l.costo_unitario),
+        costo_nuevo: round2(Number(l.costo_unitario) + deltaUnit),
+        delta_unitario: round2(deltaUnit)
+      });
+    }
+
+    return res.json({
+      compra_id: compraId,
+      neto_ars: netoARS,
+      lotes: detalle,
+      unidades_consumidas: unidadesConsumidas,
+      periodos_afectados: Object.entries(porPeriodo)
+        .map(([periodo, delta_cmv]) => ({ periodo, delta_cmv }))
+        .sort((a, b) => a.periodo.localeCompare(b.periodo)),
+      delta_cmv_total: deltaCmvTotal,
+      delta_stock: round2(netoARS - deltaCmvTotal)
+    });
+  } catch (e) {
+    console.error('GET /compras/:id/impacto-capitalizacion:', e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/gastos', async (req, res) => {
   const RET_TIPOS  = ['ret_ganancias', 'ret_iva', 'ret_iibb', 'ret_suss', 'otro_ret'];
   const PERC_TIPOS = ['perc_iva', 'perc_iibb', 'otro_perc'];
@@ -3308,7 +3373,8 @@ app.post('/gastos', async (req, res) => {
 
   let gastoId = null;
   let movAutoId = null;
-  let lotesPrevios = null;   // costos de lote antes de capitalizar, para poder revertir
+  let lotesPrevios = null;      // costos de lote antes de capitalizar, para poder revertir
+  let consumosPrevios = null;   // idem para el CMV ya congelado en consumo_lote
   try {
     const { gasto, fiscal, imputaciones } = req.body || {};
     if (!gasto) return res.status(400).json({ error: 'Falta el objeto gasto' });
@@ -3363,14 +3429,16 @@ app.post('/gastos', async (req, res) => {
       const lotes = await sbGet('lotes', `compra_id=eq.${capitalizaCompraId}&select=id,sku_id,cantidad_inicial,cantidad_actual,costo_unitario`);
       if (!lotes || !lotes.length) return res.status(400).json({ error: 'Esa compra no tiene lotes: no hay a qué capitalizar' });
 
-      // Si ya se vendió, subir el costo del lote no alcanza: la parte consumida ya congeló su
-      // CMV en consumo_lote y re-costearla reescribiría meses pasados. Se frena y se avisa.
-      const consumidos = lotes.filter(l => Number(l.cantidad_actual) < Number(l.cantidad_inicial));
-      if (consumidos.length) {
+      // Si ya se vendió parte del lote, esas unidades congelaron su CMV en consumo_lote y hay
+      // que recostearlas también; si no, el costo tardío se repartiría sólo entre las que quedan
+      // y las últimas unidades mostrarían un margen falso (hasta negativo). El front avisa antes
+      // qué períodos se mueven — acá exigimos que lo haya confirmado.
+      const hayConsumo = lotes.some(l => Number(l.cantidad_actual) < Number(l.cantidad_inicial));
+      if (hayConsumo && !gasto.confirma_recosteo) {
         return res.status(409).json({
-          error: 'Esa compra ya tiene ventas, así que el gasto no puede capitalizar al costo. '
-               + 'Cargalo sin vincular (queda como gasto del período) o avisá para ajustarlo a mano.',
-          codigo: 'compra_con_consumo'
+          error: 'Esa compra ya tiene ventas: capitalizar recostea el CMV de esas ventas. '
+               + 'Confirmá el impacto antes de guardar.',
+          codigo: 'requiere_confirmar_recosteo'
         });
       }
       lotesACapitalizar = lotes;
@@ -3437,10 +3505,22 @@ app.post('/gastos', async (req, res) => {
       if (!(base > 0)) throw new Error('Los lotes de esa compra tienen costo 0: no hay base para repartir');
 
       lotesPrevios = lotesACapitalizar.map(l => ({ id: l.id, costo_unitario: l.costo_unitario }));
+      consumosPrevios = [];
       for (const l of lotesACapitalizar) {
         const valorLote = Number(l.cantidad_inicial) * Number(l.costo_unitario);
-        const nuevo = round2(Number(l.costo_unitario) + (netoARS * (valorLote / base)) / Number(l.cantidad_inicial));
-        await sb('PATCH', 'lotes', { costo_unitario: nuevo }, `id=eq.${l.id}`);
+        const deltaUnit = (netoARS * (valorLote / base)) / Number(l.cantidad_inicial);
+        await sb('PATCH', 'lotes', { costo_unitario: round2(Number(l.costo_unitario) + deltaUnit) }, `id=eq.${l.id}`);
+
+        // Re-costeo de lo ya consumido. Se tocan TODOS los renglones del lote, incluidos los
+        // reverso_devolucion: si una unidad volvió, su reverso tiene que usar el mismo costo
+        // que su consumo o el CMV neto queda descuadrado.
+        const consumos = await sbGet('consumo_lote', `lote_id=eq.${l.id}&select=id,costo_unitario_al_consumir`);
+        for (const c of (consumos || [])) {
+          consumosPrevios.push({ id: c.id, costo_unitario_al_consumir: c.costo_unitario_al_consumir });
+          await sb('PATCH', 'consumo_lote',
+            { costo_unitario_al_consumir: round2(Number(c.costo_unitario_al_consumir) + deltaUnit) },
+            `id=eq.${c.id}`);
+        }
       }
     }
 
@@ -3484,6 +3564,11 @@ app.post('/gastos', async (req, res) => {
   } catch (e) {
     // Rollback best-effort
     try {
+      if (consumosPrevios) {
+        for (const c of consumosPrevios) {
+          await sb('PATCH', 'consumo_lote', { costo_unitario_al_consumir: c.costo_unitario_al_consumir }, `id=eq.${c.id}`);
+        }
+      }
       if (lotesPrevios) {
         for (const l of lotesPrevios) {
           await sb('PATCH', 'lotes', { costo_unitario: l.costo_unitario }, `id=eq.${l.id}`);
