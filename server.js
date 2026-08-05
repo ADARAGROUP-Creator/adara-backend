@@ -3308,6 +3308,7 @@ app.post('/gastos', async (req, res) => {
 
   let gastoId = null;
   let movAutoId = null;
+  let lotesPrevios = null;   // costos de lote antes de capitalizar, para poder revertir
   try {
     const { gasto, fiscal, imputaciones } = req.body || {};
     if (!gasto) return res.status(400).json({ error: 'Falta el objeto gasto' });
@@ -3348,9 +3349,38 @@ app.post('/gastos', async (req, res) => {
         canal: (x.canal === '' || x.canal == null) ? null : String(x.canal),
         porcentaje: round2(x.porcentaje)
       }));
-    if (!imps.length) return res.status(400).json({ error: 'Falta al menos una imputación (línea + %)' });
+    // Gasto capitalizable: comprobante propio de un tercero cuyo NETO va al costo del lote de
+    // una compra (flete del depósito del proveedor al nuestro, despachante, TCA...). Vive acá y
+    // no como componente de la compra porque su crédito fiscal se devenga en la fecha de SU
+    // factura. No lleva imputación por línea: la hereda de la compra vía el lote.
+    const capitalizaCompraId = gasto.capitaliza_compra_id ? Number(gasto.capitaliza_compra_id) : null;
+    let lotesACapitalizar = null;
+    if (capitalizaCompraId) {
+      const compras = await sbGet('compras', `id=eq.${capitalizaCompraId}&select=id,estado,periodo,nro_factura`);
+      if (!compras || !compras.length) return res.status(400).json({ error: `No existe la compra ${capitalizaCompraId}` });
+      if (compras[0].estado !== 'activa') return res.status(400).json({ error: 'La compra está anulada' });
+
+      const lotes = await sbGet('lotes', `compra_id=eq.${capitalizaCompraId}&select=id,sku_id,cantidad_inicial,cantidad_actual,costo_unitario`);
+      if (!lotes || !lotes.length) return res.status(400).json({ error: 'Esa compra no tiene lotes: no hay a qué capitalizar' });
+
+      // Si ya se vendió, subir el costo del lote no alcanza: la parte consumida ya congeló su
+      // CMV en consumo_lote y re-costearla reescribiría meses pasados. Se frena y se avisa.
+      const consumidos = lotes.filter(l => Number(l.cantidad_actual) < Number(l.cantidad_inicial));
+      if (consumidos.length) {
+        return res.status(409).json({
+          error: 'Esa compra ya tiene ventas, así que el gasto no puede capitalizar al costo. '
+               + 'Cargalo sin vincular (queda como gasto del período) o avisá para ajustarlo a mano.',
+          codigo: 'compra_con_consumo'
+        });
+      }
+      lotesACapitalizar = lotes;
+    }
+
+    if (!imps.length && !capitalizaCompraId) {
+      return res.status(400).json({ error: 'Falta al menos una imputación (línea + %)' });
+    }
     const sumaPct = round2(imps.reduce((s, x) => s + x.porcentaje, 0));
-    if (Math.abs(sumaPct - 100) > 0.01) {
+    if (imps.length && Math.abs(sumaPct - 100) > 0.01) {
       return res.status(400).json({ error: `Las imputaciones deben sumar 100% (suman ${sumaPct}%)` });
     }
     // Canal válido (FK canales): pre-chequeo amistoso
@@ -3375,6 +3405,7 @@ app.post('/gastos', async (req, res) => {
       monto_iva,
       cuenta_origen_intencion: gasto.cuenta_origen_intencion || null,
       forma_pago: gasto.forma_pago || null,
+      capitaliza_compra_id: capitalizaCompraId,
       estado: 'activo'
     };
     const insGasto = await sbUpsert('gastos', filaGasto);
@@ -3383,13 +3414,34 @@ app.post('/gastos', async (req, res) => {
     gastoId = g.id;
 
     // 1b) Imputaciones (reparto por línea/canal). El % reparte el gasto completo.
-    await sbUpsert('gasto_imputacion', imps.map(x => ({
-      gasto_id: gastoId, linea_id: x.linea_id, canal: x.canal, porcentaje: x.porcentaje
-    })));
+    // Un gasto capitalizable puede no traerlas: su línea es la de la compra.
+    if (imps.length) {
+      await sbUpsert('gasto_imputacion', imps.map(x => ({
+        gasto_id: gastoId, linea_id: x.linea_id, canal: x.canal, porcentaje: x.porcentaje
+      })));
+    }
 
     // 2) Renglones fiscales
     if (lineasFiscales.length) {
       await sbUpsert('gasto_fiscal', lineasFiscales.map(x => ({ gasto_id: gastoId, tipo: x.tipo, monto: x.monto })));
+    }
+
+    // 2b) Capitalización: el NETO (sin IVA, que es crédito) se reparte entre los lotes de la
+    // compra por su valor actual — el mismo criterio "por costo neto" del prorrateo de compras —
+    // y sube costo_unitario. Sólo afecta consumos futuros: los pasados ya congelaron su costo en
+    // consumo_lote, y arriba nos aseguramos de que no haya ninguno.
+    if (capitalizaCompraId && lotesACapitalizar) {
+      if (esUSD && tc == null) throw new Error('Gasto en USD que capitaliza: falta el TC para llevarlo a ARS');
+      const netoARS = round2(filaGasto.monto_neto * (esUSD ? tc : 1));
+      const base = lotesACapitalizar.reduce((a, l) => a + Number(l.cantidad_inicial) * Number(l.costo_unitario), 0);
+      if (!(base > 0)) throw new Error('Los lotes de esa compra tienen costo 0: no hay base para repartir');
+
+      lotesPrevios = lotesACapitalizar.map(l => ({ id: l.id, costo_unitario: l.costo_unitario }));
+      for (const l of lotesACapitalizar) {
+        const valorLote = Number(l.cantidad_inicial) * Number(l.costo_unitario);
+        const nuevo = round2(Number(l.costo_unitario) + (netoARS * (valorLote / base)) / Number(l.cantidad_inicial));
+        await sb('PATCH', 'lotes', { costo_unitario: nuevo }, `id=eq.${l.id}`);
+      }
     }
 
     // 3) Caja automática (sin_factura efectivo)
@@ -3432,6 +3484,11 @@ app.post('/gastos', async (req, res) => {
   } catch (e) {
     // Rollback best-effort
     try {
+      if (lotesPrevios) {
+        for (const l of lotesPrevios) {
+          await sb('PATCH', 'lotes', { costo_unitario: l.costo_unitario }, `id=eq.${l.id}`);
+        }
+      }
       if (movAutoId) {
         await sb('DELETE', 'vinculos', null, `movimiento_id=eq.${movAutoId}&op_tipo=eq.gasto`);
         await sb('DELETE', 'movimientos', null, `id=eq.${movAutoId}`);
