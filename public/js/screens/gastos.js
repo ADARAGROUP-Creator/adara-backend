@@ -21,6 +21,7 @@ let LINEA_LABEL = {};     // id -> label
 let CANALES = [];         // canales (maestro, FK de gasto_imputacion.canal)
 let CUENTAS = [];         // cuentas (para "cuenta origen intención")
 let PROVEEDORES = [];     // proveedores (opcional, puede estar vacío)
+let COMPRAS_CAP = [];     // compras activas sin consumo, candidatas a recibir un gasto capitalizable
 let FILTRO = { periodo: '', categoria: '', linea: '', estado: '', q: '' };
 
 const CATEGORIAS = [
@@ -116,6 +117,10 @@ export async function loadGastos() {
     CANALES = await sbGet('canales', 'order=codigo.asc').catch(() => []);
     CUENTAS = await sbGet('cuentas', 'order=id.asc');
     PROVEEDORES = await sbGet('proveedores', 'order=id.asc').catch(() => []);
+    // Compras a las que un gasto puede capitalizar. Se muestran las activas recientes; el
+    // backend rechaza igual las que ya tienen ventas (el costo del lote no se puede recostear
+    // hacia atrás sin reescribir el CMV ya congelado en consumo_lote).
+    COMPRAS_CAP = await sbGet('v_compras_ap', 'estado_compra=eq.activa&order=fecha.desc&limit=60').catch(() => []);
     await recargar();
   } catch (e) {
     root.innerHTML = `<div class="error">No se pudieron cargar los gastos: ${e.message}</div>`;
@@ -252,6 +257,13 @@ async function anularGasto(id) {
   const motivo = prompt('Motivo de la anulación:');
   if (motivo == null) return;
   if (!motivo.trim()) { window.toast('Necesitás un motivo para anular', 'error'); return; }
+  // Un gasto capitalizado ya subió el costo de los lotes de esa compra. Anularlo sin bajar ese
+  // costo dejaría el stock sobrevaluado, y si además ya se vendió, el CMV quedó congelado con
+  // ese costo y no hay vuelta atrás. Se frena y se resuelve a mano.
+  if (g && g.capitaliza_compra_id) {
+    window.toast(`Este gasto está al costo de la compra #${g.capitaliza_compra_id}. Para anularlo hay que bajar antes el costo de esos lotes — avisá para hacerlo.`, 'error');
+    return;
+  }
   // Aviso: el mov de caja automático de sin_factura efectivo NO se revierte solo en v1.
   if (g && g.tipo_comprobante === 'sin_factura') {
     const ok = confirm('Si este gasto generó un movimiento de caja automático, ese movimiento NO se revierte solo todavía. ¿Anular igual?');
@@ -290,7 +302,23 @@ function openModalNuevo() {
 
       <div class="field"><label>Categoría</label><select class="select" id="g-cat">${optCat}</select></div>
 
-      <div class="gas-imp">
+      <div class="field">
+        <label>¿Va al costo de una compra? (opcional)</label>
+        <select class="select" id="g-capitaliza">
+          <option value="">No — es un gasto operativo normal</option>
+          ${COMPRAS_CAP.map(c => {
+            const prov = (PROVEEDORES.find(p => p.id === c.proveedor_id) || {}).nombre || 'sin proveedor';
+            return `<option value="${c.compra_id}">#${c.compra_id} · ${c.fecha} · ${esc(prov)}${c.nro_factura ? ' · ' + esc(c.nro_factura) : ''}</option>`;
+          }).join('')}
+        </select>
+        <div class="hint" id="g-cap-hint" style="display:none">
+          El <b>neto</b> se reparte entre los productos de esa compra y sube el costo de sus lotes:
+          no cuenta como gasto del mes, sale por CMV cuando vendas. El IVA sigue siendo crédito
+          fiscal normal y la deuda con el proveedor no cambia.
+        </div>
+      </div>
+
+      <div class="gas-imp" id="g-imp-box">
         <div class="gas-imp-h">
           <span>Imputación por línea / canal</span>
           <div>
@@ -542,6 +570,13 @@ function openModalNuevo() {
   }
   $('#g-imp-add').addEventListener('click', () => addImpRow());
   $('#g-imp-eq').addEventListener('click', repartirEquitativo);
+
+  // Si el gasto capitaliza, la línea la hereda de la compra: el bloque de imputación sobra.
+  $('#g-capitaliza').addEventListener('change', e => {
+    const cap = !!e.target.value;
+    $('#g-imp-box').style.display = cap ? 'none' : '';
+    $('#g-cap-hint').style.display = cap ? '' : 'none';
+  });
   addImpRow(100);   // arranca con un renglón al 100%
 
   // Guardar
@@ -569,12 +604,20 @@ function openModalNuevo() {
     if (!fecha) { window.toast('Falta la fecha', 'error'); return; }
     if (!tipo_comprobante) { window.toast('Elegí el comprobante', 'error'); return; }
     if (!categoria_codigo) { window.toast('Elegí una categoría', 'error'); return; }
-    if (imputacionesRaw.some(x => (x.porcentaje > 0 && !x.linea_id) || (x.linea_id && !(x.porcentaje > 0)))) {
-      window.toast('Cada imputación necesita línea y %', 'error'); return;
+    const capitaliza_compra_id = $('#g-capitaliza').value ? +$('#g-capitaliza').value : null;
+
+    // Un gasto capitalizable no lleva imputación por línea: la hereda de la compra vía el lote.
+    if (!capitaliza_compra_id) {
+      if (imputacionesRaw.some(x => (x.porcentaje > 0 && !x.linea_id) || (x.linea_id && !(x.porcentaje > 0)))) {
+        window.toast('Cada imputación necesita línea y %', 'error'); return;
+      }
+      if (!imputaciones.length) { window.toast('Cargá al menos una imputación (línea + %)', 'error'); return; }
+      const sumaPct = Math.round(imputaciones.reduce((s, x) => s + x.porcentaje, 0) * 100) / 100;
+      if (Math.abs(sumaPct - 100) > 0.01) { window.toast(`Las imputaciones deben sumar 100% (suman ${sumaPct}%)`, 'error'); return; }
     }
-    if (!imputaciones.length) { window.toast('Cargá al menos una imputación (línea + %)', 'error'); return; }
-    const sumaPct = Math.round(imputaciones.reduce((s, x) => s + x.porcentaje, 0) * 100) / 100;
-    if (Math.abs(sumaPct - 100) > 0.01) { window.toast(`Las imputaciones deben sumar 100% (suman ${sumaPct}%)`, 'error'); return; }
+    if (capitaliza_compra_id && moneda === 'USD' && !(parseFloat(tcVal) > 0)) {
+      window.toast('Gasto en USD que va al costo de una compra: cargá el TC', 'error'); return;
+    }
     if (!descripcion) { window.toast('Poné una descripción', 'error'); return; }
     if (!(neto > 0)) { window.toast('El monto tiene que ser mayor a 0', 'error'); return; }
     if (moneda === 'USD' && tipo_comprobante === 'sin_factura' && forma_pago === 'efectivo' && !(parseFloat(tcVal) > 0)) {
@@ -594,6 +637,7 @@ function openModalNuevo() {
       monto_iva: iva,
       cuenta_origen_intencion,
       forma_pago,
+      capitaliza_compra_id,
     };
 
     const btn = $('#g-guardar');
@@ -602,7 +646,7 @@ function openModalNuevo() {
       const r = await fetch('/gastos', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ gasto, fiscal, imputaciones })
+        body: JSON.stringify({ gasto, fiscal, imputaciones: capitaliza_compra_id ? [] : imputaciones })
       });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
