@@ -495,7 +495,14 @@ function openAlta() {
         <div class="field"><label>Descripción *</label><input class="input" id="ns-desc" placeholder="ej: Tablet Samsung Galaxy Tab A9"></div>
         <div class="com-row3">
           <div class="field" style="grid-column:span 2"><label>Familia</label><select class="select" id="ns-fam">${FAMILIAS.map(f => `<option value="${f.val}" ${f.val === 'electronica' ? 'selected' : ''}>${esc(f.label)}</option>`).join('')}</select></div>
-          <div class="field"><label>IVA (%)</label><input class="input" id="ns-iva" value="21,00"></div>
+          <div class="field"><label>Alícuota IVA</label>
+            <select class="select" id="ns-iva">
+              <option value="21" selected>21% — general</option>
+              <option value="10.5">10,5% — informática</option>
+              <option value="27">27% — servicios</option>
+              <option value="0">Exento (0%)</option>
+            </select>
+          </div>
         </div>
         <div class="modal-actions">
           <button class="btn btn-ghost" id="ns-cancel" type="button">Cancelar</button>
@@ -512,7 +519,7 @@ function openAlta() {
       const codigo = q('#ns-cod').value.trim();
       const desc = q('#ns-desc').value.trim();
       const fam = q('#ns-fam').value || null;
-      const ivaNum = parseFloat(q('#ns-iva').value.replace('%', '').replace(',', '.').trim());
+      const ivaNum = parseFloat(q('#ns-iva').value);   // el select ya entrega un número limpio
       if (!codigo) { window.toast('Falta el código', 'error'); return; }
       if (!desc) { window.toast('Falta la descripción', 'error'); return; }
       if (isNaN(ivaNum) || ivaNum < 0 || ivaNum > 100) { window.toast('IVA inválido', 'error'); return; }
@@ -544,9 +551,15 @@ function openAlta() {
   const simb = () => monActual() === 'USD' ? 'US$ ' : '$ ';
   const mon = n => simb() + num(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-  const ivaTotal = () => ITEMS.reduce((s, it) => s + num(it.cantidad) * num(it.costo) * num(it.iva), 0);
+  // IVA = el de cada producto por su alícuota + el de los gastos que vienen en ESTA factura.
+  // Una misma factura puede tener varias alícuotas (ej: productos al 10,5% + un cargo al 21%).
+  const ivaTotal = () => ITEMS.reduce((s, it) => s + num(it.cantidad) * num(it.costo) * num(it.iva), 0)
+                       + GASTOS.reduce((s, g) => s + num(g.monto) * num(g.iva), 0);
   const percepTotal = () => PERCEPS.reduce((s, p) => s + num(p.monto), 0);
   const gastosTotal = () => GASTOS.reduce((s, g) => s + num(g.monto), 0);
+  // Sólo los gastos de esta factura son deuda con este proveedor. Los de terceros van al costo
+  // del lote igual, pero se le deben al tercero (y v_compras_ap los excluye del saldo).
+  const gastosProvTotal = () => GASTOS.reduce((s, g) => s + (g.delProv ? num(g.monto) : 0), 0);
   const extrasTotal = () => ITEMS.reduce((s, it) => s + num(it.extra), 0);
 
   const pintarResumen = () => {
@@ -556,7 +569,9 @@ function openAlta() {
     const extras = extrasTotal();
     const gastos = gastosTotal();
     const costoMerc = neto + extras + gastos;       // entra al stock (costo del lote)
-    const totalFactura = neto + iva + perc;          // lo que le debés al proveedor del producto
+    // Deuda con ESTE proveedor: productos + los gastos que vienen en su factura + IVA + percepciones.
+    // Coincide con v_compras_ap, que excluye extra_directo y gasto_prorrateable (son de terceros).
+    const totalFactura = neto + gastosProvTotal() + iva + perc;
     const disp = $('#c-iva-disp'); if (disp) disp.value = mon(iva);
     const tc = num(tcInp.value);
     const equivArs = (monActual() === 'USD' && tc > 0)
@@ -622,7 +637,17 @@ function openAlta() {
     gastoBox.innerHTML = GASTOS.length ? GASTOS.map((g, i) => `
       <div class="com-item com-gasto-item" data-i="${i}">
         <input class="input com-ga-conc" placeholder="Concepto (flete, comisión…)" value="${esc(g.concepto || '')}">
-        <input class="input com-ga-monto" inputmode="decimal" placeholder="Monto" value="${esc(g.monto)}">
+        <label class="com-ga-prov-lbl" title="Tildá si el cargo viene en ESTA factura. Si es de un tercero con factura aparte, dejalo sin tildar.">
+          <input type="checkbox" class="com-ga-prov" ${g.delProv ? 'checked' : ''}>
+          <span>de esta factura</span>
+        </label>
+        <select class="select com-ga-iva" ${g.delProv ? '' : 'disabled'}>
+          <option value="0" ${num(g.iva) === 0 ? 'selected' : ''}>Sin IVA</option>
+          <option value="0.21" ${num(g.iva) === 0.21 ? 'selected' : ''}>IVA 21%</option>
+          <option value="0.105" ${num(g.iva) === 0.105 ? 'selected' : ''}>IVA 10,5%</option>
+          <option value="0.27" ${num(g.iva) === 0.27 ? 'selected' : ''}>IVA 27%</option>
+        </select>
+        <input class="input com-ga-monto" inputmode="decimal" placeholder="Monto neto" value="${esc(g.monto)}">
         <button class="com-it-del" type="button" title="Quitar">✕</button>
       </div>`).join('')
       : `<div class="com-muted" style="padding:4px 0;font-size:13px">Sin gastos prorrateables. Agregá flete, comisión o despacho a repartir.</div>`;
@@ -633,15 +658,24 @@ function openAlta() {
       const i = +row.dataset.i;
       GASTOS[i].concepto = row.querySelector('.com-ga-conc').value;
       GASTOS[i].monto = row.querySelector('.com-ga-monto').value;
+      GASTOS[i].delProv = row.querySelector('.com-ga-prov').checked;
+      // El IVA sólo aplica si el cargo está en esta factura. Si es de un tercero, su crédito
+      // entra con la factura de ese tercero, no acá — si no, se lo estaríamos debiendo al
+      // proveedor equivocado.
+      GASTOS[i].iva = GASTOS[i].delProv ? Number(row.querySelector('.com-ga-iva').value) : 0;
     });
   };
   gastoBox.addEventListener('input', e => {
     if (e.target.matches('.com-ga-conc, .com-ga-monto')) { leerGastos(); pintarResumen(); }
   });
+  gastoBox.addEventListener('change', e => {
+    if (e.target.matches('.com-ga-prov')) { leerGastos(); pintarGastos(); }
+    else if (e.target.matches('.com-ga-iva')) { leerGastos(); pintarResumen(); }
+  });
   gastoBox.addEventListener('click', e => {
     if (e.target.matches('.com-it-del')) { leerGastos(); GASTOS.splice(+e.target.closest('.com-item').dataset.i, 1); pintarGastos(); }
   });
-  $('#c-add-gasto').addEventListener('click', () => { leerGastos(); GASTOS.push({ concepto: '', monto: '' }); pintarGastos(); });
+  $('#c-add-gasto').addEventListener('click', () => { leerGastos(); GASTOS.push({ concepto: '', monto: '', iva: 0, delProv: false }); pintarGastos(); });
 
   aplicarMoneda();
   pintarPerceps();
@@ -689,7 +723,7 @@ function openAlta() {
       gastos: {
         criterio: $('#c-criterio').value,
         prorrateables: GASTOS
-          .map(g => ({ concepto: (g.concepto || '').trim(), monto: num(g.monto) }))
+          .map(g => ({ concepto: (g.concepto || '').trim(), monto: num(g.monto), del_proveedor: !!g.delProv }))
           .filter(g => g.monto > 0)
       }
     };
@@ -762,7 +796,9 @@ function inyectarEstilo() {
     .com-res-r{display:flex;justify-content:space-between;font-size:14px;padding:3px 0}
     .com-res-strong{font-weight:700;font-size:15px;border-top:1px dashed #E7E5E4;margin-top:4px;padding-top:8px}
     .com-perc-item{grid-template-columns:140px 1fr 120px 26px}
-    .com-gasto-item{grid-template-columns:1fr 120px 26px}
+    .com-gasto-item{grid-template-columns:1fr 128px 108px 120px 26px}
+    .com-ga-prov-lbl{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);cursor:pointer;user-select:none}
+    .com-ga-prov-lbl input{cursor:pointer;margin:0}
     #com-body .table-wrap{border:1px solid #E7E5E4;border-radius:12px;overflow:hidden;background:#fff}
     #com-body table.t{width:100%;border-collapse:collapse;font-size:14px}
     #com-body table.t thead th{background:#FAFAF9;color:#78716C;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;padding:11px 14px;border-bottom:1px solid #E7E5E4;text-align:left;white-space:nowrap}
