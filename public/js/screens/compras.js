@@ -15,6 +15,8 @@ let GASTOS_AP = [];   // v_gastos_ap (para cuenta corriente)
 let ADJ = {};         // adjuntos por compra: compra_id -> [{id, nombre}]
 let TAB = 'facturas';
 let FILTRO = { periodo: '', q: '' };
+let DETALLE_ID = null;   // compra con el detalle abierto (una por vez)
+let DETALLE = {};        // cache compra_id -> { comps, lotes, gastosCap }
 
 const hoyISO = () => new Date().toISOString().slice(0, 10);
 const lineaLabel = l => l.nombre || l.descripcion || l.codigo || ('Línea ' + l.id);
@@ -130,9 +132,6 @@ function renderFacturas() {
   const body = document.getElementById('com-body');
   const activas = COMPRAS.filter(c => c.estado_compra !== 'anulada' && c.tipo_compra !== 'inicial');
 
-  const comprado = activas.reduce((s, c) => s + num(c.total_facturado_ars), 0);
-  const pendiente = activas.reduce((s, c) => s + num(c.saldo_ap_ars), 0);
-
   const periodos = [...new Set(activas.map(c => c.periodo).filter(Boolean))].sort().reverse();
   const optPeriodo = '<option value="">Todos los períodos</option>' +
     periodos.map(p => `<option value="${p}" ${FILTRO.periodo === p ? 'selected' : ''}>${p}</option>`).join('');
@@ -146,6 +145,12 @@ function renderFacturas() {
     return true;
   });
 
+  // Los KPI miran lo FILTRADO, no el total: con un período elegido, decir "7 compras" arriba
+  // de una tabla que muestra 4 es confuso.
+  const comprado = filtradas.reduce((s, c) => s + num(c.total_facturado_ars), 0);
+  const pendiente = filtradas.reduce((s, c) => s + num(c.saldo_ap_ars), 0);
+  const sufijo = FILTRO.periodo ? ` · ${FILTRO.periodo}` : ' · todos';
+
   body.innerHTML = `
     <div class="toolbar" style="justify-content:space-between">
       <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -156,9 +161,9 @@ function renderFacturas() {
     </div>
 
     <div class="kpi-grid" style="margin:14px 0">
-      <div class="kpi"><div class="kpi-label">Compras</div><div class="kpi-value">${activas.length}</div></div>
-      <div class="kpi"><div class="kpi-label">Comprado</div><div class="kpi-value">${money(comprado)}</div></div>
-      <div class="kpi"><div class="kpi-label">Pendiente de pago</div><div class="kpi-value">${money(pendiente)}</div></div>
+      <div class="kpi"><div class="kpi-label">Compras${sufijo}</div><div class="kpi-value">${filtradas.length}</div></div>
+      <div class="kpi"><div class="kpi-label">Comprado${sufijo}</div><div class="kpi-value">${money(comprado)}</div></div>
+      <div class="kpi"><div class="kpi-label">Pendiente de pago${sufijo}</div><div class="kpi-value">${money(pendiente)}</div></div>
     </div>
 
     ${filtradas.length === 0
@@ -179,9 +184,122 @@ function renderFacturas() {
   document.getElementById('cf-periodo').addEventListener('change', e => { FILTRO.periodo = e.target.value; renderFacturas(); });
   document.getElementById('cf-q').addEventListener('input', e => { FILTRO.q = e.target.value; renderFacturas(); });
   document.getElementById('cf-nueva').addEventListener('click', openAlta);
-  document.querySelectorAll('.com-anular').forEach(b => b.addEventListener('click', () => anularCompra(+b.dataset.id)));
-  document.querySelectorAll('.com-clip').forEach(b => b.addEventListener('click', () => verAdjunto(+b.dataset.adj)));
-  document.querySelectorAll('.com-asignar-fac').forEach(b => b.addEventListener('click', () => asignarFactura(+b.dataset.id)));
+  document.querySelectorAll('.com-anular').forEach(b => b.addEventListener('click', e => { e.stopPropagation(); anularCompra(+b.dataset.id); }));
+  document.querySelectorAll('.com-clip').forEach(b => b.addEventListener('click', e => { e.stopPropagation(); verAdjunto(+b.dataset.adj); }));
+  document.querySelectorAll('.com-asignar-fac').forEach(b => b.addEventListener('click', e => { e.stopPropagation(); asignarFactura(+b.dataset.id); }));
+  document.querySelectorAll('tr.com-fila').forEach(tr => tr.addEventListener('click', () => toggleDetalle(+tr.dataset.id)));
+  document.querySelectorAll('.com-adj-dl').forEach(b => b.addEventListener('click', e => { e.stopPropagation(); verAdjunto(+b.dataset.adj); }));
+}
+
+// ── Detalle expandible ──────────────────────────────────────────────────
+// Se carga a demanda al abrir la fila (una compra por vez) y queda cacheado.
+async function toggleDetalle(compraId) {
+  if (DETALLE_ID === compraId) { DETALLE_ID = null; renderFacturas(); return; }
+  DETALLE_ID = compraId;
+  if (!DETALLE[compraId]) {
+    renderFacturas();   // pinta el "Cargando…" mientras trae los datos
+    try {
+      const [comps, lotes, gastosCap] = await Promise.all([
+        sbGet('compra_componentes', `compra_id=eq.${compraId}&order=id.asc`),
+        sbGet('lotes', `compra_id=eq.${compraId}&order=id.asc`),
+        sbGet('v_gastos_ap', `capitaliza_compra_id=eq.${compraId}&order=fecha.asc`).catch(() => [])
+      ]);
+      DETALLE[compraId] = { comps, lotes, gastosCap };
+    } catch (e) {
+      DETALLE[compraId] = { error: e.message };
+    }
+  }
+  renderFacturas();
+}
+
+const TIPO_LABEL = {
+  producto: 'Producto', flete: 'Flete / cargo del proveedor', seguro: 'Seguro',
+  arancel: 'Derechos', tasa_estadistica: 'Tasa estadística', despacho: 'Despacho',
+  otro_costo: 'Otro costo', gasto_prorrateable: 'Gasto de tercero (prorrateado)',
+  extra_directo: 'Extra directo', sin_factura: 'Sin factura',
+  iva: 'IVA', iibb_percepcion: 'Percepción IIBB',
+  ganancias_percepcion: 'Percepción Ganancias', otro_impuesto: 'Otro impuesto'
+};
+
+function filaDetalle(c) {
+  const d = DETALLE[c.compra_id];
+  const cols = 9;
+  if (!d) return `<tr class="com-det"><td colspan="${cols}"><div class="com-det-box com-muted">Cargando detalle…</div></td></tr>`;
+  if (d.error) return `<tr class="com-det"><td colspan="${cols}"><div class="com-det-box com-det-err">No se pudo cargar: ${esc(d.error)}</div></td></tr>`;
+
+  const skuDe = id => (SKU_BY_ID[id] && SKU_BY_ID[id].codigo) || (id ? '#' + id : '—');
+  const mon = c.moneda === 'USD' ? 'US$ ' : '$ ';
+  const m = n => mon + num(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  const prod = d.comps.filter(x => x.tipo === 'producto');
+  const costos = d.comps.filter(x => x.clase === 'costo' && x.tipo !== 'producto');
+  const fisc = d.comps.filter(x => x.clase === 'fiscal');
+
+  const secProd = prod.length ? `
+    <div class="com-det-t">Productos</div>
+    <table class="com-det-t2"><tbody>
+      ${prod.map(x => `<tr>
+        <td>${esc(skuDe(x.sku_id))}</td>
+        <td class="com-muted">${esc((SKU_BY_ID[x.sku_id] || {}).descripcion || '')}</td>
+        <td style="text-align:right">${num(x.cantidad)} u</td>
+        <td style="text-align:right" class="com-mono">${m(num(x.monto) / (num(x.cantidad) || 1))}</td>
+        <td style="text-align:right" class="com-mono">${m(x.monto)}</td>
+      </tr>`).join('')}
+    </tbody></table>` : '';
+
+  const secCostos = costos.length ? `
+    <div class="com-det-t">Otros costos (van al lote)</div>
+    <table class="com-det-t2"><tbody>
+      ${costos.map(x => `<tr>
+        <td colspan="4">${esc(TIPO_LABEL[x.tipo] || x.tipo)}${x.descripcion ? ' · <span class="com-muted">' + esc(x.descripcion) + '</span>' : ''}</td>
+        <td style="text-align:right" class="com-mono">${m(x.monto)}</td>
+      </tr>`).join('')}
+    </tbody></table>` : '';
+
+  const secFisc = fisc.length ? `
+    <div class="com-det-t">Impuestos (crédito fiscal, no son costo)</div>
+    <table class="com-det-t2"><tbody>
+      ${fisc.map(x => `<tr>
+        <td colspan="4">${esc(TIPO_LABEL[x.tipo] || x.tipo)}${x.descripcion ? ' · <span class="com-muted">' + esc(x.descripcion) + '</span>' : ''}</td>
+        <td style="text-align:right" class="com-mono">${m(x.monto)}</td>
+      </tr>`).join('')}
+    </tbody></table>` : '';
+
+  const secLotes = d.lotes.length ? `
+    <div class="com-det-t">Lotes generados <span class="com-muted">— costo unitario final, en ARS</span></div>
+    <table class="com-det-t2"><tbody>
+      ${d.lotes.map(l => {
+        const vendidas = num(l.cantidad_inicial) - num(l.cantidad_actual);
+        return `<tr>
+          <td>${esc(skuDe(l.sku_id))}</td>
+          <td class="com-muted">${num(l.cantidad_inicial)} u · quedan ${num(l.cantidad_actual)}${vendidas > 0 ? ` · <b>${vendidas} vendidas</b>` : ''}</td>
+          <td colspan="2" style="text-align:right" class="com-mono">$ ${num(l.costo_unitario).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} /u</td>
+          <td style="text-align:right" class="com-mono">$ ${(num(l.cantidad_inicial) * num(l.costo_unitario)).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+        </tr>`;
+      }).join('')}
+    </tbody></table>` : '<div class="com-det-t com-muted">Sin lotes: esta compra no generó stock.</div>';
+
+  const secGastos = (d.gastosCap && d.gastosCap.length) ? `
+    <div class="com-det-t">Gastos de terceros al costo de esta compra</div>
+    <table class="com-det-t2"><tbody>
+      ${d.gastosCap.map(g => `<tr>
+        <td>${esc(g.fecha)}</td>
+        <td class="com-muted">${esc(g.descripcion || '')}${g.nro_comprobante ? ' · ' + esc(g.nro_comprobante) : ''}</td>
+        <td colspan="2" style="text-align:right" class="com-muted">${esc(g.estado_pago)}</td>
+        <td style="text-align:right" class="com-mono">$ ${num(g.monto_neto).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+      </tr>`).join('')}
+    </tbody></table>` : '';
+
+  const adjs = ADJ[c.compra_id] || [];
+  const secAdj = adjs.length
+    ? `<div class="com-det-t">Comprobante</div>
+       <div class="com-det-adj">${adjs.map(a =>
+         `<button class="com-adj-dl" data-adj="${a.id}">📄 ${esc(a.nombre)}</button>`).join('')}</div>`
+    : `<div class="com-det-t com-muted">Sin comprobante adjunto.</div>`;
+
+  return `<tr class="com-det"><td colspan="${cols}"><div class="com-det-box">
+    ${secProd}${secCostos}${secFisc}${secLotes}${secGastos}${secAdj}
+  </div></td></tr>`;
 }
 
 function filaCompra(c) {
@@ -192,9 +310,10 @@ function filaCompra(c) {
     : (pendiente
         ? `<span class="com-badge com-badge-pendiente">factura pendiente</span> <button class="com-asignar-fac" data-id="${c.compra_id}" title="Asignar N° de factura" style="font-size:12px;color:#2563EB;background:none;border:0;cursor:pointer;font:inherit;padding:2px 4px">asignar</button>`
         : '<span class="com-muted">—</span>');
-  return `<tr>
+  const abierta = DETALLE_ID === c.compra_id;
+  return `<tr class="com-fila ${abierta ? 'com-fila-open' : ''}" data-id="${c.compra_id}" title="Ver detalle">
     <td>${ddmm(c.fecha)}</td>
-    <td>${esc(provLabel(PROV_BY_ID[c.proveedor_id]))}</td>
+    <td><span class="com-caret">${abierta ? '▾' : '▸'}</span> ${esc(provLabel(PROV_BY_ID[c.proveedor_id]))}</td>
     <td>${facturaCell}</td>
     <td class="com-muted">${esc(LINEA_LABEL[c.linea_id] || '—')}</td>
     <td style="text-align:right" class="com-mono">${money(c.total_facturado_ars)}</td>
@@ -202,7 +321,7 @@ function filaCompra(c) {
     <td style="text-align:right" class="com-mono">${money(c.saldo_ap_ars)}</td>
     <td><span class="com-badge com-badge-${est}">${est}</span></td>
     <td style="text-align:right">${(ADJ[c.compra_id] && ADJ[c.compra_id].length) ? `<button class="com-clip" data-adj="${ADJ[c.compra_id][0].id}" title="Ver factura: ${esc(ADJ[c.compra_id][0].nombre)}">📎</button>` : ''}${c.tipo_compra === 'inicial' ? '' : `<button class="com-anular" data-id="${c.compra_id}" title="Anular compra" style="font-size:12px;color:#B91C1C;background:none;border:0;cursor:pointer;font:inherit;padding:2px 4px">Anular</button>`}</td>
-  </tr>`;
+  </tr>${abierta ? filaDetalle(c) : ''}`;
 }
 
 async function asignarFactura(id) {
@@ -773,6 +892,21 @@ function optProv(selId) {
 function inyectarEstilo() {
   if (document.getElementById('com-style')) return;
   const css = `
+    .com-fila{cursor:pointer}
+    .com-fila:hover{background:#FAFAF9}
+    .com-fila-open{background:#FEF9F3}
+    .com-caret{display:inline-block;width:12px;color:#A8A29E;font-size:11px}
+    .com-det > td{padding:0 !important;background:#FEFDFB}
+    .com-det-box{padding:14px 18px;border-left:3px solid #D97706;font-size:13px}
+    .com-det-t{font-weight:600;margin:12px 0 5px;color:#1C1917}
+    .com-det-box > .com-det-t:first-child{margin-top:0}
+    .com-det-t2{width:100%;border-collapse:collapse}
+    .com-det-t2 td{padding:3px 8px 3px 0;border-bottom:1px solid #F0EEEC;vertical-align:top}
+    .com-det-t2 tr:last-child td{border-bottom:0}
+    .com-det-adj{display:flex;gap:8px;flex-wrap:wrap;margin-top:2px}
+    .com-adj-dl{background:#fff;border:1px solid #E7E5E4;border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit;font-size:13px;color:#1C1917}
+    .com-adj-dl:hover{border-color:#D97706;color:#B45309}
+    .com-det-err{color:#B42318}
     .com-mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums}
     .com-clip{font-size:14px;background:none;border:0;cursor:pointer;padding:2px 6px;margin-right:2px}
     .com-clip:hover{opacity:.65}
