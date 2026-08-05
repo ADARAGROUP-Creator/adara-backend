@@ -8,6 +8,15 @@ const FAMILIAS = [
   { val: 'mochila_individual',   label: 'Mochila individual' }
 ];
 
+// Alícuotas de IVA vigentes en Argentina que aplican a productos. Se guardan como fracción
+// (0.105), no como porcentaje (10.5). Era texto libre y permitía errores silenciosos y caros:
+// un SKU cargado al 10% en vez de 10,5% calcula mal el crédito fiscal de cada compra futura.
+const ALICUOTAS = [
+  { val: 0,    label: 'Exento (0%)' },
+  { val: 10.5, label: '10,5% — informática, bienes de capital' },
+  { val: 21,   label: '21% — general' }
+];
+
 let DATA = [];
 let FILTRO_FAM = 'all';   // 'all' | '' (sin clasificar) | nombre familia
 let BUSQ = '';
@@ -121,19 +130,11 @@ function bindRowEvents() {
       e.target.classList.toggle('empty', !val);
     });
   });
-  document.querySelectorAll('.in-iva').forEach(inp => {
-    inp.addEventListener('change', async e => {
+  document.querySelectorAll('.in-iva').forEach(sel => {
+    sel.addEventListener('change', async e => {
       const id = +e.target.dataset.id;
-      const raw = e.target.value.replace('%','').replace(',','.').trim();
-      const num = parseFloat(raw);
-      if (isNaN(num) || num < 0 || num > 100) {
-        window.toast('IVA inválido (debe ser entre 0 y 100)', 'error');
-        e.target.value = formatIva(DATA.find(x=>x.id===id).alicuota_iva);
-        return;
-      }
-      const newVal = +(num / 100).toFixed(4);
+      const newVal = +(parseFloat(e.target.value) / 100).toFixed(4);
       await updateField(id, { alicuota_iva: newVal }, e.target);
-      e.target.value = formatIva(newVal);
     });
   });
   document.querySelectorAll('.sw-activo').forEach(sw => {
@@ -184,7 +185,7 @@ function rowHTML(r) {
         </select>
       </td>
       <td class="col-iva">
-        <input class="inline-input in-iva" data-id="${r.id}" value="${formatIva(r.alicuota_iva)}">
+        <select class="inline-select in-iva" data-id="${r.id}">${opcionesIva(r.alicuota_iva)}</select>
       </td>
       <td class="col-costo">${fmtCosto(r.id)}</td>
       <td class="col-act">
@@ -233,6 +234,19 @@ function formatIva(v) {
   return pct.toFixed(2).replace('.', ',') + '%';
 }
 
+// Opciones del select de IVA para un SKU. Si el valor guardado no es ninguna de las alícuotas
+// estándar (dato viejo o cargado a mano antes del dropdown), se agrega como opción propia para
+// no pisarlo en silencio al re-renderizar la fila.
+function opcionesIva(actual) {
+  const pct = actual === null || actual === undefined ? 21 : +(parseFloat(actual) * 100).toFixed(2);
+  const lista = ALICUOTAS.some(a => Math.abs(a.val - pct) < 0.001)
+    ? ALICUOTAS
+    : [...ALICUOTAS, { val: pct, label: formatIva(pct / 100) + ' (fuera de lista)' }];
+  return lista
+    .map(a => `<option value="${a.val}" ${Math.abs(a.val - pct) < 0.001 ? 'selected' : ''}>${escapeHTML(a.label)}</option>`)
+    .join('');
+}
+
 function escapeHTML(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -262,9 +276,11 @@ function openModalNuevo() {
         </select>
       </div>
       <div class="field">
-        <label>Alícuota IVA (%)</label>
-        <input class="input" id="nf-iva" value="21,00">
-        <div class="hint">21% para electrónica argentina por defecto</div>
+        <label>Alícuota IVA</label>
+        <select class="select" id="nf-iva">
+          ${ALICUOTAS.map(a => `<option value="${a.val}" ${a.val === 21 ? 'selected' : ''}>${a.label}</option>`).join('')}
+        </select>
+        <div class="hint">Notebooks, tablets y bienes de informática van al 10,5%</div>
       </div>
       <div class="modal-actions">
         <button class="btn btn-ghost" id="nf-cancel">Cancelar</button>
@@ -283,8 +299,7 @@ function openModalNuevo() {
     const codigo = overlay.querySelector('#nf-codigo').value.trim();
     const desc = overlay.querySelector('#nf-desc').value.trim();
     const fam = overlay.querySelector('#nf-fam').value || null;
-    const ivaRaw = overlay.querySelector('#nf-iva').value.replace('%','').replace(',','.').trim();
-    const ivaNum = parseFloat(ivaRaw);
+    const ivaNum = parseFloat(overlay.querySelector('#nf-iva').value);   // el select ya entrega un número limpio
 
     if (!codigo) { window.toast('Falta el código', 'error'); return; }
     if (!desc) { window.toast('Falta la descripción', 'error'); return; }
