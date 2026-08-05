@@ -4267,9 +4267,17 @@ app.post('/compras', async (req, res) => {
     //   - extra_directo por producto: suma sólo a ese lote (p.extra, total de la línea).
     //   - prorrateables compartidos: se reparten entre todos por criterio (costo neto / unidades).
     // Todo en la moneda de la factura; el lote se congela a ARS al TC. Ver ADARA-COMPRAS-IMPORTACIONES.md.
+    // `del_proveedor`: el cargo viene EN la factura del mismo proveedor (ej: "gastos adicionales"
+    // de Invid). Entonces se guarda como tipo 'flete', que SÍ suma a su cuenta corriente. Si es de
+    // un tercero (fletero con factura aparte) va como 'gasto_prorrateable', que v_compras_ap excluye.
+    // En ambos casos el monto capitaliza al costo del lote.
     const gastosIn = (gastos && Array.isArray(gastos.prorrateables)) ? gastos.prorrateables : [];
     const prorrateables = gastosIn
-      .map(g => ({ concepto: (g && g.concepto) ? String(g.concepto).trim() : null, monto: round2(g && g.monto) }))
+      .map(g => ({
+        concepto: (g && g.concepto) ? String(g.concepto).trim() : null,
+        monto: round2(g && g.monto),
+        delProveedor: !!(g && g.del_proveedor)
+      }))
       .filter(g => g.monto > 0);
     const criterio = (gastos && gastos.criterio === 'unidades') ? 'unidades' : 'costo';
     const totalProrr = round2(prorrateables.reduce((acc, g) => acc + g.monto, 0));
@@ -4343,12 +4351,22 @@ app.post('/compras', async (req, res) => {
 
     // 3b) Costos no-proveedor: van al COSTO del lote (ya están dentro de costo_unitario) pero NO a
     //     la cuenta corriente del proveedor. Se guardan como rastro auditable. v_compras_ap los excluye.
+    //     ⚠ `clase` es una columna GENERATED ALWAYS (se deriva de `tipo`): NUNCA mandarla en el
+    //     insert o Postgres rechaza con 428C9. El criterio de reparto se deja en la descripción.
     const costoExtra = [];
     for (const p of prods) {
-      if (p.extra > 0) costoExtra.push({ compra_id: compraId, tipo: 'extra_directo', clase: 'directo', sku_id: p.sku_id, moneda, monto: p.extra, descripcion: null });
+      if (p.extra > 0) costoExtra.push({ compra_id: compraId, tipo: 'extra_directo', sku_id: p.sku_id, moneda, monto: p.extra, descripcion: null });
     }
     for (const g of prorrateables) {
-      costoExtra.push({ compra_id: compraId, tipo: 'gasto_prorrateable', clase: criterio, moneda, monto: g.monto, descripcion: g.concepto });
+      const concepto = g.concepto || 'Gasto prorrateable';
+      costoExtra.push({
+        compra_id: compraId,
+        // del proveedor de la factura → 'flete' (suma al AP) · de un tercero → 'gasto_prorrateable' (no suma)
+        tipo: g.delProveedor ? 'flete' : 'gasto_prorrateable',
+        moneda,
+        monto: g.monto,
+        descripcion: `${concepto} [reparto: ${criterio}]`
+      });
     }
     if (costoExtra.length) await sbUpsert('compra_componentes', costoExtra);
 
