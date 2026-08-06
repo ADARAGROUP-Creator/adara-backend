@@ -1,4 +1,5 @@
 import { sbGet, sbPost } from '../core/sb.js';
+import { crearSkuPicker } from '../core/skuPicker.js';
 
 // ── Pantalla: Compras (capa 2) ──────────────────────────────────────────
 // Facturas de compra de MERCADERÍA (local). A diferencia de Gastos, una compra
@@ -619,10 +620,15 @@ function openAlta() {
 
   // Ítems
   const itemsBox = $('#c-items');
+  let itemPickers = [];
   const pintarItems = () => {
+    // El picker cuelga su menú de <body>: hay que destruirlo antes de pisar el HTML
+    // o quedan menús huérfanos acumulándose con cada re-render.
+    itemPickers.forEach(p => p.destroy());
+    itemPickers = [];
     itemsBox.innerHTML = ITEMS.map((it, i) => `
       <div class="com-item" data-i="${i}">
-        <select class="select com-it-sku"><option value="">SKU…</option>${SKUS.map(s => `<option value="${s.id}" ${String(it.sku_id) === String(s.id) ? 'selected' : ''}>${esc(skuLabel(s))}</option>`).join('')}</select>
+        <div class="com-it-skuhost" data-value="${esc(it.sku_id || '')}"></div>
         <input class="input com-it-cant" inputmode="decimal" placeholder="Cant." value="${esc(it.cantidad)}">
         <input class="input com-it-costo" inputmode="decimal" placeholder="Costo unit." value="${esc(it.costo)}">
         <input class="input com-it-extra" inputmode="decimal" placeholder="Extra (flete/comis.)" value="${esc(it.extra || '')}">
@@ -635,6 +641,13 @@ function openAlta() {
         <span class="com-it-sub com-mono">${money(num(it.cantidad) * num(it.costo))}</span>
         <button class="com-it-del" type="button" title="Quitar" ${ITEMS.length === 1 ? 'style="visibility:hidden"' : ''}>✕</button>
       </div>`).join('');
+    // Cada picker deja un <input type="hidden" class="com-it-sku"> y dispara un 'change'
+    // que burbujea, así que leerItems() y el listener delegado siguen intactos.
+    itemsBox.querySelectorAll('.com-it-skuhost').forEach(hostEl => {
+      itemPickers.push(crearSkuPicker(hostEl, {
+        skus: SKUS, value: hostEl.dataset.value, hiddenClass: 'com-it-sku'
+      }));
+    });
     pintarResumen();
   };
   const leerItems = () => {
