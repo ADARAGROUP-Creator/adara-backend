@@ -3374,6 +3374,189 @@ cron.schedule('7 * * * *', async () => {
   try { await refreshML(); } catch (e) { console.error('Cron refresh:', e.message); }
 });
 
+// ── Ventas en efectivo sin comprobante: alta atómica ─────────────────────
+// canal='efectivo'. Venta + items + movimiento de caja + vínculo + FIFO, en un solo POST.
+//
+// Modelo (ver ADARA-VENTAS-EFECTIVO.md):
+//   ventas.tipo_comprobante = 'sin_comprobante'  → es_gravada (columna GENERADA) = false
+//   venta_items.alicuota_iva = 0                 → iva_linea = 0 → sin IVA débito
+//   venta_items.precio_unitario_neto = LO QUE SE COBRA, sin desglosar IVA: no hay factura
+//                                      de la cual desglosarlo, la plata es toda ingreso
+//   ventas.estado = 'entregada'                  → requisito de fn_consumir_fifo y del Resultado
+//
+// Doble candado sobre el IVA: la convención (alícuota 0) y el filtro por `es_gravada` en
+// v_control_mensual. Con los dos, una alícuota mal cargada no puede inventar débito fiscal.
+//
+// El crédito fiscal de la compra de esa mercadería NO se toca: ya se devengó en el mes de la
+// compra. Al no haber débito, el neto del mes baja; si el crédito supera al débito, el
+// excedente cae en saldo técnico a favor y arrastra solo, vía v_posicion_fiscal.
+app.post('/ventas/efectivo', async (req, res) => {
+  const round2 = n => Math.round((Number(n) || 0) * 100) / 100;
+  const periodoDe = f => String(f || '').slice(0, 7);
+
+  let ventaId = null, movId = null, fifoCorrio = false;
+  try {
+    const {
+      fecha, linea_id, items, cliente_nombre, descripcion,
+      cuenta_codigo, confirmar_mes_anterior
+    } = req.body || {};
+
+    if (!fecha || !/^\d{4}-\d{2}-\d{2}$/.test(String(fecha))) return res.status(400).json({ error: 'Falta la fecha (YYYY-MM-DD)' });
+    if (!linea_id) return res.status(400).json({ error: 'Falta la línea de negocio' });
+    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'La venta no tiene ítems' });
+
+    const filas = items
+      .filter(x => x && x.sku_id != null)
+      .map(x => ({
+        sku_id: Number(x.sku_id),
+        cantidad: Number(x.cantidad),
+        precio_unitario_neto: round2(x.precio_unitario)
+      }));
+    if (!filas.length) return res.status(400).json({ error: 'La venta no tiene ítems válidos' });
+    for (const f of filas) {
+      if (!(f.cantidad > 0)) return res.status(400).json({ error: 'La cantidad debe ser mayor a 0' });
+      if (!(f.precio_unitario_neto >= 0)) return res.status(400).json({ error: 'El precio no puede ser negativo' });
+    }
+
+    // Guardarriel de fecha (pendiente #9): sin `meses_cerrados` nada impide mover un mes ya
+    // revisado. Una venta con fecha vieja cambia stock, CMV y Resultado de ese período.
+    // No lo bloqueamos —a veces es legítimo— pero exigimos confirmación explícita.
+    const periodoActual = new Date().toISOString().slice(0, 7);
+    if (periodoDe(fecha) < periodoActual && !confirmar_mes_anterior) {
+      return res.status(409).json({
+        error: 'fecha_mes_anterior',
+        mensaje: `La fecha cae en ${periodoDe(fecha)}, un mes ya cerrado operativamente. Esto mueve stock, CMV y Resultado de ese período. Reenviá con confirmar_mes_anterior=true si es correcto.`,
+        periodo: periodoDe(fecha)
+      });
+    }
+
+    // Los SKUs tienen que existir: un sku_id inválido rompería el FIFO en silencio.
+    const idsUnicos = [...new Set(filas.map(f => f.sku_id))];
+    const skus = await sbGet('skus', `id=in.(${idsUnicos.join(',')})&select=id`);
+    if (!skus || skus.length !== idsUnicos.length) {
+      const hallados = new Set((skus || []).map(s => s.id));
+      return res.status(400).json({ error: `SKU inexistente: ${idsUnicos.filter(i => !hallados.has(i)).join(', ')}` });
+    }
+
+    // Cuenta de caja donde entra la plata. Sólo ARS: una venta en efectivo en USD necesita
+    // TC y otro tratamiento, y hoy no hay caso.
+    const codigo = cuenta_codigo || 'caja_ars';
+    const cuentas = await sbGet('cuentas', `codigo=eq.${codigo}&select=id,moneda,codigo`);
+    if (!cuentas || !cuentas.length) return res.status(400).json({ error: `No existe la cuenta '${codigo}'` });
+    if (cuentas[0].moneda !== 'ARS') return res.status(400).json({ error: `La cuenta '${codigo}' no es en ARS` });
+    const cuenta = cuentas[0];
+
+    const total = round2(filas.reduce((s, f) => s + f.precio_unitario_neto * f.cantidad, 0));
+    if (!(total > 0)) return res.status(400).json({ error: 'El total de la venta es 0' });
+
+    // 1) Venta
+    const insVenta = await sbUpsert('ventas', {
+      canal: 'efectivo',
+      linea_id: Number(linea_id),
+      fecha,
+      moneda: 'ARS',
+      tipo_comprobante: 'sin_comprobante',   // dispara es_gravada = false
+      estado: 'entregada',                    // requisito de fn_consumir_fifo
+      cliente_nombre: cliente_nombre || null
+    });
+    const v = Array.isArray(insVenta) ? insVenta[0] : insVenta;
+    if (!v || !v.id) throw new Error('No se obtuvo el id de la venta');
+    ventaId = v.id;
+
+    // 1b) Referencia legible, después del insert para que sea única sin adivinar.
+    // NUNCA numérica pelada: v_resultado_mensual hace LEFT JOIN ventas_ml por
+    // referencia_externa = ml_order_id, y una colisión arrastraría comisiones de ML.
+    const referencia = 'EFVO-' + String(ventaId).padStart(6, '0');
+    await sb('PATCH', 'ventas', { referencia_externa: referencia }, `id=eq.${ventaId}`);
+
+    // 2) Ítems — alícuota 0: sin factura no hay IVA que discriminar
+    const insItems = await sbUpsert('venta_items', filas.map(f => ({
+      venta_id: ventaId,
+      sku_id: f.sku_id,
+      cantidad: f.cantidad,
+      precio_unitario_neto: f.precio_unitario_neto,
+      alicuota_iva: 0
+    })));
+    const itemsCreados = (Array.isArray(insItems) ? insItems : [insItems]).filter(Boolean);
+
+    // 3) Entrada de caja (mismo patrón que el gasto sin factura)
+    const movRows = await sbUpsert('movimientos', {
+      cuenta_id: cuenta.id,
+      fecha,
+      monto: total,                                     // positivo: entra plata
+      origen: 'venta_efectivo',
+      referencia_externa: 'venta_efectivo-' + ventaId,  // UNIQUE(origen, referencia_externa)
+      categoria: 'cobro_venta',
+      descripcion: descripcion || `Venta en efectivo ${referencia}`,
+      linea_id: Number(linea_id),
+      conciliado_auto: false
+    });
+    const mov = Array.isArray(movRows) ? movRows[0] : movRows;
+    movId = mov.id;
+
+    // 4) Vínculo: nace conciliada, no cae en "movimientos sin conciliar"
+    await sbUpsert('vinculos', { movimiento_id: movId, op_tipo: 'venta', op_id: ventaId, monto: total });
+
+    // 5) FIFO. Va último y a propósito NO tumba la operación si falla: la función es
+    // idempotente por venta_item, así que el próximo consumo la levanta igual. Tumbar acá
+    // obligaría a deshacer lotes ya decrementados, que es peor.
+    let fifo = null, fifoError = null;
+    try {
+      const r = await sbRpc('fn_consumir_fifo', { p_desde: fecha, p_hasta: fecha });
+      fifo = Array.isArray(r) ? r[0] : r;
+      fifoCorrio = true;
+    } catch (e) { fifoError = e.message; }
+
+    // Faltante de stock: se calcula SOLO sobre los ítems de esta venta.
+    // OJO: fn_consumir_fifo(fecha, fecha) procesa todas las ventas de ese día (es su
+    // contrato y conviene: de paso costea lo que hubiera quedado pendiente). Por eso su
+    // `unidades_faltantes` es global y NO sirve para avisar acá — daría falsos positivos
+    // por faltantes de otras ventas del mismo día.
+    let avisoStock = null;
+    if (fifoCorrio && itemsCreados.length) {
+      try {
+        const ids = itemsCreados.map(i => i.id);
+        const cons = await sbGet('consumo_lote', `venta_item_id=in.(${ids.join(',')})&select=venta_item_id,unidades,tipo`);
+        const porItem = {};
+        for (const c of (cons || [])) {
+          porItem[c.venta_item_id] = (porItem[c.venta_item_id] || 0) + Number(c.unidades || 0);
+        }
+        const faltantes = itemsCreados
+          .map(i => ({ sku_id: i.sku_id, falta: round2(Number(i.cantidad) - (porItem[i.id] || 0)) }))
+          .filter(x => x.falta > 0);
+        if (faltantes.length) {
+          avisoStock = `Sin lotes suficientes para ${faltantes.map(f => `SKU ${f.sku_id} (faltan ${f.falta})`).join(', ')}. ` +
+                       `La venta quedó registrada, pero su CMV no es real completo: revisá el stock.`;
+        }
+      } catch (e) { console.warn('Chequeo de faltante FIFO:', e.message); }
+    }
+
+    return res.json({
+      ok: true,
+      id: ventaId,
+      referencia,
+      movimiento_id: movId,
+      total,
+      fifo,
+      fifo_error: fifoError,
+      aviso_stock: avisoStock
+    });
+  } catch (e) {
+    // Rollback best-effort (PostgREST no da transacción). Orden inverso al alta.
+    // Si el FIFO ya corrió no llegamos acá: es lo último y está en su propio try.
+    try {
+      if (movId) await sb('DELETE', 'vinculos', null, `movimiento_id=eq.${movId}`);
+      if (movId) await sb('DELETE', 'movimientos', null, `id=eq.${movId}`);
+      if (ventaId && !fifoCorrio) {
+        await sb('DELETE', 'venta_items', null, `venta_id=eq.${ventaId}`);
+        await sb('DELETE', 'ventas', null, `id=eq.${ventaId}`);
+      }
+    } catch (e2) { console.error('Rollback venta efectivo:', e2.message); }
+    console.error('POST /ventas/efectivo:', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Gastos: alta atómica (gasto + renglones fiscales + caja sin_factura) ──
 // Opción A (ver ADARA-GASTOS.md): el front SIEMPRE postea acá.
 //   1) Inserta el gasto.
