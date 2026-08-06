@@ -1,4 +1,5 @@
 import { sbGet, sbPost, sbPatch } from '../core/sb.js';
+import { crearSkuPicker } from '../core/skuPicker.js';
 
 // ── Pantalla: Movimientos ──────────────────────────────────────────────
 // Extracto unificado de cuentas (tabla `movimientos`, capa 4).
@@ -535,18 +536,16 @@ function openModalNuevo() {
 // Caja ARS y entra al Resultado. NO genera IVA débito porque no se factura
 // (ventas.tipo_comprobante='sin_comprobante' → es_gravada=false).
 // Todo el trabajo lo hace POST /ventas/efectivo, que es atómico. Ver ADARA-VENTAS-EFECTIVO.md.
-let SKUS_CACHE = null;
-
 async function openModalVentaEfectivo() {
-  if (!SKUS_CACHE) {
-    try {
-      SKUS_CACHE = await sbGet('skus', 'select=id,codigo,descripcion,activo&order=codigo.asc');
-    } catch (e) { window.toast('No se pudieron cargar los SKUs: ' + e.message, 'error'); return; }
-  }
-  const skus = SKUS_CACHE.filter(s => s.activo !== false);
+  // Los SKUs se traen CADA VEZ que se abre el modal, a propósito. Cachearlos en una
+  // variable de módulo hacía que un SKU dado de alta después de entrar a Movimientos
+  // no apareciera nunca: la app es SPA, no recarga la página y el caché no expiraba.
+  let skus;
+  try {
+    skus = await sbGet('skus', 'activo=eq.true&select=id,codigo,descripcion&order=codigo.asc');
+  } catch (e) { window.toast('No se pudieron cargar los SKUs: ' + e.message, 'error'); return; }
   if (!skus.length) { window.toast('No hay SKUs activos para vender', 'error'); return; }
 
-  const optSku   = '<option value="">Elegí SKU…</option>' + skus.map(s => `<option value="${s.id}">${s.codigo}${s.descripcion ? ' · ' + String(s.descripcion).slice(0, 45) : ''}</option>`).join('');
   const optLinea = '<option value="">Elegí línea…</option>' + LINEAS.map(l => `<option value="${l.id}">${LINEA_LABEL[l.id]}</option>`).join('');
 
   const overlay = document.createElement('div');
@@ -611,30 +610,38 @@ async function openModalVentaEfectivo() {
     overlay.querySelector('#vef-total').textContent = fmt(total);
   };
 
+  const pickers = [];
   const addFila = () => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td><select class="select vef-sku">${optSku}</select></td>
+      <td><div class="vef-skuhost"></div></td>
       <td><input class="input vef-cant" type="number" min="1" step="1" value="1"></td>
       <td><input class="input vef-precio" type="number" min="0" step="0.01" placeholder="0,00"></td>
       <td style="text-align:right" class="vef-sub mov-mono">$ 0,00</td>
       <td><button type="button" class="btn btn-ghost vef-del" title="Quitar">×</button></td>
     `;
     tbody.appendChild(tr);
+    // El picker deja un <input type="hidden" class="vef-sku">: el resto del código
+    // lo lee igual que cuando era un <select>.
+    const p = crearSkuPicker(tr.querySelector('.vef-skuhost'), { skus, hiddenClass: 'vef-sku' });
+    pickers.push(p);
     tr.querySelector('.vef-cant').addEventListener('input', recalc);
     tr.querySelector('.vef-precio').addEventListener('input', recalc);
     tr.querySelector('.vef-del').addEventListener('click', () => {
       if (tbody.querySelectorAll('tr').length === 1) { window.toast('La venta necesita al menos un ítem', 'error'); return; }
+      const i = pickers.indexOf(p);
+      if (i >= 0) { pickers[i].destroy(); pickers.splice(i, 1); }
       tr.remove(); recalc();
     });
     recalc();
+    return p;
   };
   addFila();
 
-  const close = () => overlay.remove();
+  const close = () => { pickers.forEach(p => p.destroy()); overlay.remove(); };
   overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
   overlay.querySelector('#vef-cancel').addEventListener('click', close);
-  overlay.querySelector('#vef-add').addEventListener('click', addFila);
+  overlay.querySelector('#vef-add').addEventListener('click', () => addFila().focus());
 
   overlay.querySelector('#vef-guardar').addEventListener('click', async () => {
     const fecha = overlay.querySelector('#vef-fecha').value;
