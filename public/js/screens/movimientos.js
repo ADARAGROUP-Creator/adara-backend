@@ -300,6 +300,7 @@ function render() {
       <select class="select" id="f-cuenta" style="width:auto">${opcionesCuenta}</select>
       <input class="input grow" id="f-q" type="text" placeholder="Buscar descripción…" value="${FILTRO.q.replace(/"/g, '&quot;')}">
       <button class="btn btn-ghost" id="btn-importar">Importar</button>
+      <button class="btn btn-ghost" id="btn-venta-efvo">+ Venta en efectivo</button>
       <button class="btn btn-primary" id="btn-nuevo">+ Movimiento de caja</button>
     </div>
 
@@ -337,6 +338,7 @@ function render() {
   document.getElementById('f-q').addEventListener('input', e => { FILTRO.q = e.target.value; render(); });
   document.getElementById('btn-nuevo').addEventListener('click', openModalNuevo);
   document.getElementById('btn-importar').addEventListener('click', openModalImportar);
+  document.getElementById('btn-venta-efvo').addEventListener('click', openModalVentaEfectivo);
   document.querySelectorAll('.pill').forEach(p => {
     p.addEventListener('click', () => { FILTRO.estado = p.dataset.estado; render(); });
   });
@@ -526,6 +528,182 @@ function openModalNuevo() {
       window.toast('Error al guardar: ' + e.message, 'error');
     }
   });
+}
+
+// ── Venta en efectivo sin comprobante ──────────────────────────────────
+// Da de alta una VENTA (no un movimiento suelto): descuenta stock por FIFO, suma a
+// Caja ARS y entra al Resultado. NO genera IVA débito porque no se factura
+// (ventas.tipo_comprobante='sin_comprobante' → es_gravada=false).
+// Todo el trabajo lo hace POST /ventas/efectivo, que es atómico. Ver ADARA-VENTAS-EFECTIVO.md.
+let SKUS_CACHE = null;
+
+async function openModalVentaEfectivo() {
+  if (!SKUS_CACHE) {
+    try {
+      SKUS_CACHE = await sbGet('skus', 'select=id,codigo,descripcion,activo&order=codigo.asc');
+    } catch (e) { window.toast('No se pudieron cargar los SKUs: ' + e.message, 'error'); return; }
+  }
+  const skus = SKUS_CACHE.filter(s => s.activo !== false);
+  if (!skus.length) { window.toast('No hay SKUs activos para vender', 'error'); return; }
+
+  const optSku   = '<option value="">Elegí SKU…</option>' + skus.map(s => `<option value="${s.id}">${s.codigo}${s.descripcion ? ' · ' + String(s.descripcion).slice(0, 45) : ''}</option>`).join('');
+  const optLinea = '<option value="">Elegí línea…</option>' + LINEAS.map(l => `<option value="${l.id}">${LINEA_LABEL[l.id]}</option>`).join('');
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal" style="max-width:720px">
+      <div class="card-title">Venta en efectivo (sin comprobante)</div>
+
+      <div class="vef-nota">
+        Descuenta stock por FIFO, suma a <strong>Caja ARS</strong> y entra al Resultado.
+        <strong>No genera IVA débito</strong> porque no se factura — el precio que cargues
+        es lo que cobrás, sin desglosar IVA.
+      </div>
+
+      <div class="vef-row2">
+        <div class="field"><label>Fecha</label>
+          <input class="input" id="vef-fecha" type="date" value="${hoyISO()}">
+        </div>
+        <div class="field"><label>Línea de negocio</label>
+          <select class="select" id="vef-linea">${optLinea}</select>
+        </div>
+      </div>
+
+      <div class="field"><label>Ítems</label>
+        <table class="t vef-items"><thead><tr>
+          <th>SKU</th>
+          <th style="width:90px">Cant.</th>
+          <th style="width:140px">Precio unit.</th>
+          <th style="width:120px;text-align:right">Subtotal</th>
+          <th style="width:36px"></th>
+        </tr></thead><tbody id="vef-tbody"></tbody></table>
+        <button type="button" class="btn btn-ghost" id="vef-add" style="margin-top:8px">+ Agregar ítem</button>
+      </div>
+
+      <div class="vef-total">Total a cobrar: <strong id="vef-total">$ 0,00</strong></div>
+
+      <div class="field"><label>Cliente / referencia <span style="opacity:.6">(opcional)</span></label>
+        <input class="input" id="vef-cliente" type="text" placeholder="Ej: Juan, mostrador">
+      </div>
+
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="vef-cancel">Cancelar</button>
+        <button class="btn btn-primary" id="vef-guardar">Registrar venta</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  inyectarEstiloVef();
+
+  const tbody = overlay.querySelector('#vef-tbody');
+  const fmt = n => '$ ' + Number(n || 0).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  const recalc = () => {
+    let total = 0;
+    tbody.querySelectorAll('tr').forEach(tr => {
+      const c = parseFloat(tr.querySelector('.vef-cant').value) || 0;
+      const p = parseFloat(tr.querySelector('.vef-precio').value) || 0;
+      const sub = c * p;
+      total += sub;
+      tr.querySelector('.vef-sub').textContent = fmt(sub);
+    });
+    overlay.querySelector('#vef-total').textContent = fmt(total);
+  };
+
+  const addFila = () => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><select class="select vef-sku">${optSku}</select></td>
+      <td><input class="input vef-cant" type="number" min="1" step="1" value="1"></td>
+      <td><input class="input vef-precio" type="number" min="0" step="0.01" placeholder="0,00"></td>
+      <td style="text-align:right" class="vef-sub mov-mono">$ 0,00</td>
+      <td><button type="button" class="btn btn-ghost vef-del" title="Quitar">×</button></td>
+    `;
+    tbody.appendChild(tr);
+    tr.querySelector('.vef-cant').addEventListener('input', recalc);
+    tr.querySelector('.vef-precio').addEventListener('input', recalc);
+    tr.querySelector('.vef-del').addEventListener('click', () => {
+      if (tbody.querySelectorAll('tr').length === 1) { window.toast('La venta necesita al menos un ítem', 'error'); return; }
+      tr.remove(); recalc();
+    });
+    recalc();
+  };
+  addFila();
+
+  const close = () => overlay.remove();
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  overlay.querySelector('#vef-cancel').addEventListener('click', close);
+  overlay.querySelector('#vef-add').addEventListener('click', addFila);
+
+  overlay.querySelector('#vef-guardar').addEventListener('click', async () => {
+    const fecha = overlay.querySelector('#vef-fecha').value;
+    const linea_id = overlay.querySelector('#vef-linea').value;
+    const cliente_nombre = overlay.querySelector('#vef-cliente').value.trim();
+
+    if (!fecha) { window.toast('Falta la fecha', 'error'); return; }
+    if (!linea_id) { window.toast('Elegí la línea de negocio', 'error'); return; }
+
+    const items = [];
+    for (const tr of tbody.querySelectorAll('tr')) {
+      const sku_id = tr.querySelector('.vef-sku').value;
+      const cantidad = parseFloat(tr.querySelector('.vef-cant').value);
+      const precio_unitario = parseFloat(tr.querySelector('.vef-precio').value);
+      if (!sku_id) { window.toast('Hay un ítem sin SKU', 'error'); return; }
+      if (!(cantidad > 0)) { window.toast('Cantidad inválida', 'error'); return; }
+      if (!(precio_unitario >= 0)) { window.toast('Precio inválido', 'error'); return; }
+      items.push({ sku_id: +sku_id, cantidad, precio_unitario });
+    }
+    if (!items.length) { window.toast('La venta no tiene ítems', 'error'); return; }
+
+    const btn = overlay.querySelector('#vef-guardar');
+    btn.disabled = true;
+
+    const enviar = async (confirmar) => {
+      const r = await fetch('/ventas/efectivo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fecha, linea_id: +linea_id, items, cliente_nombre: cliente_nombre || null, confirmar_mes_anterior: !!confirmar })
+      });
+      return { status: r.status, data: await r.json().catch(() => ({})) };
+    };
+
+    try {
+      let { status, data } = await enviar(false);
+
+      // Guardarriel de fecha: el backend frena si cae en un mes anterior.
+      if (status === 409 && data.error === 'fecha_mes_anterior') {
+        if (!confirm(data.mensaje)) { btn.disabled = false; return; }
+        ({ status, data } = await enviar(true));
+      }
+      if (status !== 200 || !data.ok) throw new Error(data.mensaje || data.error || 'Error desconocido');
+
+      window.toast(`Venta ${data.referencia} registrada · ${fmt(data.total)}`);
+      if (data.aviso_stock) window.toast(data.aviso_stock, 'error');
+      if (data.fifo_error) window.toast('La venta quedó cargada pero el costeo FIFO falló: ' + data.fifo_error, 'error');
+      close();
+      await loadMovimientos();   // recarga movimientos + vínculos + estados
+    } catch (e) {
+      window.toast('Error: ' + e.message, 'error');
+      btn.disabled = false;
+    }
+  });
+}
+
+function inyectarEstiloVef() {
+  if (document.getElementById('vef-style')) return;
+  const s = document.createElement('style');
+  s.id = 'vef-style';
+  s.textContent = `
+    .vef-nota{background:#F0F9FF;border-left:3px solid #0284C7;padding:10px 12px;border-radius:6px;font-size:12.5px;line-height:1.6;margin-bottom:14px}
+    .vef-row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .vef-items th{font-size:11px}
+    .vef-items td{padding:4px}
+    .vef-items .input,.vef-items .select{margin:0}
+    .vef-total{text-align:right;font-size:14px;margin:10px 0 4px}
+    .vef-total strong{font-family:'JetBrains Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums}
+  `;
+  document.head.appendChild(s);
 }
 
 // ── Borrar movimiento manual ───────────────────────────────────────────
