@@ -4705,13 +4705,24 @@ app.post('/compras', async (req, res) => {
       return { sku_id: p.sku_id, cantidad: p.cantidad, unitARS };
     });
 
+    // Compra SIN COMPROBANTE: la mercadería entró igual (stock y costo del lote no cambian),
+    // pero no hay crédito fiscal. Se ignoran IVA y percepciones aunque el front los mande:
+    // sin comprobante no hay nada que computar. La base además lo bloquea por trigger
+    // (fn_chk_componente_sin_factura), así que esto es la primera de dos barreras.
+    // No confundir con el componente tipo='sin_factura', que es otra cosa (la porción de
+    // una compra pagada sin comprobante, con su cuenta de origen).
+    const sinComprobante = !!compra.sin_comprobante;
+    if (sinComprobante && compra.nro_factura) {
+      return res.status(400).json({ error: 'Una compra sin comprobante no puede llevar N° de factura' });
+    }
+
     // Componentes fiscales: IVA (automático) + N percepciones (IIBB/Ganancias) por jurisdicción.
     // Se guardan en la moneda de la factura; v_compras_ap los lleva a ARS con tc_blue.
     const fisc = [];
-    const ivaMonto = round2(fiscales && fiscales.iva);
+    const ivaMonto = sinComprobante ? 0 : round2(fiscales && fiscales.iva);
     if (ivaMonto > 0) fisc.push({ tipo: 'iva', monto: ivaMonto, descripcion: null });
     const PERC_MAP = { iibb: 'iibb_percepcion', ganancias: 'ganancias_percepcion' };
-    const perceps = Array.isArray(fiscales && fiscales.percepciones) ? fiscales.percepciones : [];
+    const perceps = (!sinComprobante && Array.isArray(fiscales && fiscales.percepciones)) ? fiscales.percepciones : [];
     for (const p of perceps) {
       const tipo = PERC_MAP[p && p.tipo];
       const monto = round2(p && p.monto);
@@ -4720,8 +4731,10 @@ app.post('/compras', async (req, res) => {
       }
     }
 
-    // N° de factura → columna dedicada. Puede quedar NULL (factura diferida: se asigna luego).
-    const nroFactura = compra.nro_factura ? String(compra.nro_factura).trim() : null;
+    // N° de factura → columna dedicada. Puede quedar NULL por dos motivos DISTINTOS:
+    // factura diferida (se asigna después) o compra sin comprobante (nunca va a tener).
+    // Los distingue `sin_comprobante`; antes eran indistinguibles.
+    const nroFactura = sinComprobante ? null : (compra.nro_factura ? String(compra.nro_factura).trim() : null);
     const notas = compra.notas ? String(compra.notas).trim() : null;
 
     // 1) Cabecera
@@ -4734,6 +4747,7 @@ app.post('/compras', async (req, res) => {
       fecha: compra.fecha,
       estado: 'activa',
       nro_factura: nroFactura,
+      sin_comprobante: sinComprobante,
       notas
     });
     const c = Array.isArray(insCompra) ? insCompra[0] : insCompra;
@@ -4991,10 +5005,16 @@ app.post('/compras/:id/factura', async (req, res) => {
     const nro = req.body && req.body.nro_factura ? String(req.body.nro_factura).trim() : '';
     if (!nro) return res.status(400).json({ error: 'Falta el número de factura' });
 
-    const rows = await sbGet('compras', `id=eq.${id}&select=id,estado`);
+    const rows = await sbGet('compras', `id=eq.${id}&select=id,estado,sin_comprobante`);
     const compra = rows && rows[0];
     if (!compra) return res.status(404).json({ error: 'Compra no encontrada' });
     if (compra.estado === 'anulada') return res.status(409).json({ error: 'La compra está anulada' });
+    // Si alguna vez aparece la factura de una compra marcada sin comprobante, hay que
+    // desmarcarla primero: asignarle el número acá dejaría una compra "sin comprobante"
+    // con número y sin el crédito fiscal que le correspondería.
+    if (compra.sin_comprobante) {
+      return res.status(409).json({ error: 'La compra está marcada sin comprobante. Si apareció la factura, desmarcala primero para que se cargue con su crédito fiscal.' });
+    }
 
     await sbPatch('compras', `id=eq.${id}`, { nro_factura: nro });
     res.json({ ok: true });
