@@ -373,12 +373,17 @@ function filaDetalle(c) {
 
 function filaCompra(c) {
   const est = estadoPago(c);
-  const pendiente = c.tipo_compra === 'local' && c.estado_compra === 'activa' && !c.nro_factura;
+  // Sin comprobante ≠ factura pendiente. La primera nunca va a tener factura, así que no
+  // se le ofrece "asignar" ni cuenta como pendiente; la segunda está esperando el papel.
+  const sinComp = !!c.sin_comprobante;
+  const pendiente = c.tipo_compra === 'local' && c.estado_compra === 'activa' && !c.nro_factura && !sinComp;
   const facturaCell = c.nro_factura
     ? esc(c.nro_factura)
-    : (pendiente
-        ? `<span class="com-badge com-badge-pendiente">factura pendiente</span> <button class="com-asignar-fac" data-id="${c.compra_id}" title="Asignar N° de factura" style="font-size:12px;color:#2563EB;background:none;border:0;cursor:pointer;font:inherit;padding:2px 4px">asignar</button>`
-        : '<span class="com-muted">—</span>');
+    : (sinComp
+        ? `<span class="com-badge com-badge-sincomp" title="Compra sin comprobante: no genera crédito fiscal">sin comprobante</span>`
+        : (pendiente
+            ? `<span class="com-badge com-badge-pendiente">factura pendiente</span> <button class="com-asignar-fac" data-id="${c.compra_id}" title="Asignar N° de factura" style="font-size:12px;color:#2563EB;background:none;border:0;cursor:pointer;font:inherit;padding:2px 4px">asignar</button>`
+            : '<span class="com-muted">—</span>'));
   const abierta = DETALLE_ID === c.compra_id;
   return `<tr class="com-fila ${abierta ? 'com-fila-open' : ''}" data-id="${c.compra_id}" title="Ver detalle">
     <td>${ddmm(c.fecha)}</td>
@@ -527,6 +532,14 @@ function openAlta() {
         <div class="field"><label>Línea de negocio</label><select class="select" id="c-linea"><option value="">Elegí línea…</option>${LINEAS.map(l => `<option value="${l.id}">${esc(LINEA_LABEL[l.id])}</option>`).join('')}</select></div>
       </div>
 
+      <label class="com-sincomp"><input type="checkbox" id="c-sincomp">
+        <span><strong>Compra sin comprobante</strong> — la mercadería entra al stock igual, pero
+        <strong>no genera crédito fiscal</strong>. El precio que cargues es lo que pagaste, sin desglosar IVA.</span>
+      </label>
+      <div id="c-sincomp-nota" class="com-sincomp-nota" style="display:none">
+        Sin comprobante no hay IVA ni percepciones que computar: los ítems quedan en Exento y el bloque de impuestos se desactiva.
+      </div>
+
       <div class="com-row3">
         <div class="field"><label>Moneda</label>
           <select class="select" id="c-moneda"><option value="ARS">ARS</option><option value="USD">USD</option></select>
@@ -542,7 +555,7 @@ function openAlta() {
         <div id="c-items"></div>
       </div>
 
-      <div class="com-block">
+      <div class="com-block" id="c-block-fiscal">
         <div class="com-block-h"><span>Impuestos de la factura (crédito fiscal — no son costo)</span></div>
         <div class="field" style="max-width:240px"><label>IVA (automático)</label><input class="input" id="c-iva-disp" readonly value="$ 0,00"></div>
         <div class="com-block-h" style="margin-top:10px"><span>Percepciones (una por jurisdicción)</span><button class="btn btn-ghost com-mini" id="c-add-perc" type="button">+ percepción</button></div>
@@ -618,6 +631,26 @@ function openAlta() {
     if (p) window.toast('Proveedor listo');
   });
 
+  // Compra sin comprobante: apaga todo lo fiscal (ver ADARA-COMPRAS-IMPORTACIONES.md).
+  // El stock y el costo del lote no cambian — lo único que desaparece es el crédito.
+  let SIN_COMP = false;
+  const aplicarSinComp = () => {
+    const fac = $('#c-factura');
+    fac.disabled = SIN_COMP;
+    if (SIN_COMP) fac.value = '';
+    fac.placeholder = SIN_COMP ? 'sin comprobante' : 'A 0001-00001234';
+    $('#c-sincomp-nota').style.display = SIN_COMP ? 'block' : 'none';
+    const bloque = $('#c-block-fiscal');
+    bloque.style.opacity = SIN_COMP ? '.45' : '';
+    bloque.style.pointerEvents = SIN_COMP ? 'none' : '';
+    if (SIN_COMP) {
+      ITEMS.forEach(it => { it.iva = 0; });   // sin factura no hay IVA que discriminar
+      PERCEPS.length = 0;
+      pintarPerceps();
+    }
+    pintarItems();
+  };
+
   // Ítems
   const itemsBox = $('#c-items');
   let itemPickers = [];
@@ -632,7 +665,7 @@ function openAlta() {
         <input class="input com-it-cant" inputmode="decimal" placeholder="Cant." value="${esc(it.cantidad)}">
         <input class="input com-it-costo" inputmode="decimal" placeholder="Costo unit." value="${esc(it.costo)}">
         <input class="input com-it-extra" inputmode="decimal" placeholder="Extra (flete/comis.)" value="${esc(it.extra || '')}">
-        <select class="select com-it-iva">
+        <select class="select com-it-iva" ${SIN_COMP ? 'disabled title="Compra sin comprobante: no hay IVA que discriminar"' : ''}>
           <option value="0.21" ${num(it.iva) === 0.21 ? 'selected' : ''}>IVA 21%</option>
           <option value="0.105" ${num(it.iva) === 0.105 ? 'selected' : ''}>IVA 10,5%</option>
           <option value="0.27" ${num(it.iva) === 0.27 ? 'selected' : ''}>IVA 27%</option>
@@ -677,7 +710,9 @@ function openAlta() {
       leerItems();
       ITEMS[i].sku_id = e.target.value;
       const s = SKU_BY_ID[e.target.value];
-      if (s && s.alicuota_iva != null) ITEMS[i].iva = Number(s.alicuota_iva);
+      // La alícuota del SKU sólo aplica si hay comprobante: sin factura, todo va Exento.
+      if (SIN_COMP) ITEMS[i].iva = 0;
+      else if (s && s.alicuota_iva != null) ITEMS[i].iva = Number(s.alicuota_iva);
       pintarItems(); // refresca el % de IVA de la fila según el SKU
     } else if (e.target.matches('.com-it-iva')) {
       ITEMS[i].iva = Number(e.target.value);
@@ -882,6 +917,12 @@ function openAlta() {
   });
   $('#c-add-gasto').addEventListener('click', () => { leerGastos(); GASTOS.push({ concepto: '', monto: '', iva: 0, delProv: false }); pintarGastos(); });
 
+  $('#c-sincomp').addEventListener('change', e => {
+    leerItems(); leerPerceps();
+    SIN_COMP = e.target.checked;
+    aplicarSinComp();
+  });
+
   aplicarMoneda();
   pintarPerceps();
   pintarGastos();
@@ -916,10 +957,13 @@ function openAlta() {
         fecha,
         moneda: monedaSel.value === 'USD' ? 'USD' : 'ARS',
         tc_blue: monedaSel.value === 'USD' ? num(tcInp.value) : null,
-        nro_factura: $('#c-factura').value.trim() || null
+        nro_factura: SIN_COMP ? null : ($('#c-factura').value.trim() || null),
+        sin_comprobante: SIN_COMP
       },
       items,
-      fiscales: {
+      // Sin comprobante no se manda nada fiscal. El backend igual lo fuerza a 0 y la base
+      // lo bloquea por trigger: tres barreras para el mismo error.
+      fiscales: SIN_COMP ? { iva: 0, percepciones: [] } : {
         iva: ivaTotal(),
         percepciones: PERCEPS
           .map(p => ({ tipo: p.tipo, jurisdiccion: (p.jurisdiccion || '').trim(), monto: num(p.monto) }))
@@ -1057,6 +1101,12 @@ function inyectarEstilo() {
     .com-sub{font-size:13px;color:#78716C;margin:-4px 0 12px}
     .com-badge{font-size:12px;padding:2px 8px;border-radius:6px}
     .com-badge-pendiente{background:#FAEEDA;color:#854F0B}
+    .com-badge-sincomp{background:#EDEBE8;color:#57534E}
+    .com-sincomp{display:flex;gap:9px;align-items:flex-start;background:#F5F5F4;border:1px solid #E7E5E4;
+      border-radius:8px;padding:10px 12px;margin:0 0 14px;font-size:12.5px;line-height:1.5;cursor:pointer}
+    .com-sincomp input{margin-top:2px;flex:0 0 auto}
+    .com-sincomp-nota{background:#FFFBEB;border-left:3px solid #D97706;border-radius:6px;
+      padding:8px 11px;margin:-6px 0 14px;font-size:12px;line-height:1.5;color:#78350F}
     .com-badge-parcial{background:#E6F1FB;color:#0C447C}
     .com-badge-pagado{background:#E1F5EE;color:#0F6E56}
     .com-debe{color:#B91C1C;font-weight:600}
