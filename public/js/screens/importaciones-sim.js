@@ -25,17 +25,25 @@ let FIJOS = [];            // { concepto, monto_usd }
 let FIJOS_MODO = 'pct';    // 'pct' | 'monto'
 let FIJOS_CRIT = 'kg';     // 'kg'  | 'fob'
 let PRODS = [];            // { nombre, fob_decl_u, fob_real_u, cantidad, peso_u, derechos_pct, estadistica_pct, iva_pct, fijo_asignado, _open }
-let PAGOS = [];            // { concepto, monto, moneda, tc }
+let PAGOS = [];            // { concepto, monto, moneda, tc, cuenta }
 let _prevBolson = 0;
+// Catálogos para atar la simulación al resto del sistema (Fase 2).
+let SKUS = [], SKU_BY_ID = {}, SKU_BY_COD = {};
+let CUENTAS = [];
 
 function blankParams() {
   return { tc: '', flete_declarado_usd: '', flete_real_usd: '', seguro_pct: '', seguro_monto: '', despachante_pct: '', despachante_monto: '', iibb_pct: '', ganancias_pct: '', coima_pct: '', arancel_sim_usd: 10 };
 }
 function blankProd() {
-  return { nombre: '', fob_real_u: '', fob_decl_u: '', cantidad: '', cantidad_decl: '', peso_u: '', derechos_pct: '', derechos_pct_decl: '', estadistica_pct: '', estadistica_pct_decl: '', imp_internos_pct: '', iva_pct: 21, fijo_asignado: 0, declaro_distinto: false, _open: false };
+  // sku_id: OPCIONAL acá, OBLIGATORIO al confirmar (regla IMP-F2-2). Una simulación
+  // what-if puede ser de un producto que todavía no traés y que no tiene sentido dar de
+  // alta como SKU hasta decidir; pero sin SKU no se puede crear el lote.
+  return { nombre: '', sku_id: '', fob_real_u: '', fob_decl_u: '', cantidad: '', cantidad_decl: '', peso_u: '', derechos_pct: '', derechos_pct_decl: '', estadistica_pct: '', estadistica_pct_decl: '', imp_internos_pct: '', iva_pct: 21, fijo_asignado: 0, declaro_distinto: false, _open: false };
 }
 function blankPago() {
-  return { concepto: '', monto: '', moneda: 'USD', tc: num(P.tc) > 0 ? P.tc : '' };
+  // cuenta: de dónde sale la plata. Al confirmar, cada pago se materializa como
+  // movimiento + vínculo op_tipo='compra' (IMP-F2-5) y engancha con la conciliación.
+  return { concepto: '', monto: '', moneda: 'USD', tc: num(P.tc) > 0 ? P.tc : '', cuenta: '' };
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -64,15 +72,25 @@ function calc() {
   const bolsonManual = bolsonActual();
   const fleteDiff = fleteReal - fleteDecl;   // (real − declarado) → va al bolsón de fijos
   // Override de declaración: vacío ⇒ usa el real (sin subfacturación / sin coima).
-  const eff = (ov, real) => (ov === '' || ov === null || ov === undefined) ? num(real) : num(ov);
+  //
+  // ⚠️ El override SOLO aplica si el producto tiene `declaro_distinto` en true.
+  // Antes esta función miraba únicamente si el campo tenía algo escrito, así que un valor
+  // que quedó en el input con el check DESTILDADO seguía subdeclarando en silencio: el FOB
+  // declarado salía distinto del real sin ninguna señal en pantalla. Es el bug que reportó
+  // Sebastián el 7/8/2026 con el despacho BISHOP (Xiaomi Smart Band 10).
+  // El check es la fuente de verdad; los valores viejos quedan inertes hasta que se tilde.
+  const eff = (p, ov, real) => {
+    if (!p || !p.declaro_distinto) return num(real);
+    return (ov === '' || ov === null || ov === undefined) ? num(real) : num(ov);
+  };
 
   const rows = PRODS.map(p => {
     const cantReal = num(p.cantidad);                          // unidades que ENTRAN → stock real → costo
-    const cantDecl = eff(p.cantidad_decl, p.cantidad);         // unidades DECLARADAS en aduana → base de tributos/crédito
+    const cantDecl = eff(p, p.cantidad_decl, p.cantidad);      // unidades DECLARADAS en aduana → base de tributos/crédito
     return {
       p, cant: cantReal, cantReal, cantDecl,
       pesoT: num(p.peso_u) * cantDecl,                         // peso DECLARADO → CIF / flete aduanero
-      fobDeclT: eff(p.fob_decl_u, p.fob_real_u) * cantDecl,    // base aduanera (precio y cantidad declarados)
+      fobDeclT: eff(p, p.fob_decl_u, p.fob_real_u) * cantDecl, // base aduanera (precio y cantidad declarados)
       fobRealT: num(p.fob_real_u) * cantReal                  // base costo real (todo lo que entró)
     };
   });
@@ -106,8 +124,8 @@ function calc() {
   rows.forEach(r => {
     const p = r.p;
     // Tasas: el campo primario es el REAL; el declarado es override (vacío = real).
-    r.derechos = r.cif * eff(p.derechos_pct_decl, p.derechos_pct) / 100;       // lo que PAGÁS (declarado)
-    r.estadistica = r.cif * eff(p.estadistica_pct_decl, p.estadistica_pct) / 100;
+    r.derechos = r.cif * eff(p, p.derechos_pct_decl, p.derechos_pct) / 100;       // lo que PAGÁS (declarado)
+    r.estadistica = r.cif * eff(p, p.estadistica_pct_decl, p.estadistica_pct) / 100;
     r.impInternos = r.cif * num(p.imp_internos_pct) / 100;       // se trata como derechos
     r.baseIva = r.cif + r.derechos + r.estadistica + r.impInternos;
     r.iva = r.baseIva * num(p.iva_pct) / 100;
@@ -228,6 +246,14 @@ function repartirResto() {
 // ── Carga inicial ───────────────────────────────────────────────────────
 export async function loadImportacionesSim() {
   inyectarEstilo();
+  // Catálogos. Se recargan en cada entrada a la pantalla a propósito: un SKU dado de alta
+  // en Compras tiene que aparecer acá sin recargar la página (la app es SPA).
+  try {
+    SKUS = await sbGet('skus', 'activo=eq.true&select=id,codigo,descripcion,alicuota_iva&order=codigo.asc');
+    SKU_BY_ID = Object.fromEntries(SKUS.map(s => [String(s.id), s]));
+    SKU_BY_COD = Object.fromEntries(SKUS.map(s => [String(s.codigo).toUpperCase(), s]));
+    CUENTAS = await sbGet('cuentas', 'order=id.asc');
+  } catch (e) { console.warn('Catálogos del simulador:', e.message); }
   if (!PRODS.length && !CURRENT.id) nuevaSim(false);
   render();
 }
@@ -248,7 +274,9 @@ function nuevaSim(repaint = true) {
 // ── Serialización ───────────────────────────────────────────────────────
 function buildDatos() {
   return {
-    v: 2,
+    // v:3 — suma productos[].sku_id y pagos[].cuenta (Fase 2). Aditivo y compatible:
+    // una sim v2 se lee igual, con esos campos en vacío.
+    v: 3,
     params: {
       tc: num(P.tc), flete_declarado_usd: num(P.flete_declarado_usd), flete_real_usd: num(P.flete_real_usd),
       seguro_pct: num(P.seguro_pct), seguro_monto: num(P.seguro_monto),
@@ -262,7 +290,8 @@ function buildDatos() {
     productos: PRODS.map(p => {
       const ov = x => (x === '' || x == null) ? null : num(x);
       return {
-        nombre: p.nombre || '', fob_real_u: num(p.fob_real_u), fob_decl_u: ov(p.fob_decl_u),
+        nombre: p.nombre || '', sku_id: p.sku_id ? +p.sku_id : null,
+        fob_real_u: num(p.fob_real_u), fob_decl_u: ov(p.fob_decl_u),
         cantidad: num(p.cantidad), cantidad_decl: ov(p.cantidad_decl), peso_u: num(p.peso_u),
         derechos_pct: num(p.derechos_pct), derechos_pct_decl: ov(p.derechos_pct_decl),
         estadistica_pct: num(p.estadistica_pct), estadistica_pct_decl: ov(p.estadistica_pct_decl),
@@ -270,7 +299,7 @@ function buildDatos() {
         fijo_asignado: num(p.fijo_asignado), declaro_distinto: !!p.declaro_distinto
       };
     }),
-    pagos: PAGOS.map(pg => ({ concepto: pg.concepto || '', monto: num(pg.monto), moneda: pg.moneda === 'ARS' ? 'ARS' : 'USD', tc: num(pg.tc) }))
+    pagos: PAGOS.map(pg => ({ concepto: pg.concepto || '', monto: num(pg.monto), moneda: pg.moneda === 'ARS' ? 'ARS' : 'USD', tc: num(pg.tc), cuenta: pg.cuenta || null }))
   };
 }
 function loadDatos(d) {
@@ -292,7 +321,8 @@ function loadDatos(d) {
   PAGOS = (d.pagos || []).map(pg => ({
     concepto: pg.concepto || '', monto: pg.monto ?? '',
     moneda: pg.moneda === 'ARS' ? 'ARS' : 'USD',
-    tc: (pg.tc ?? '') === '' || num(pg.tc) === 0 ? (pa.tc ?? '') : pg.tc
+    tc: (pg.tc ?? '') === '' || num(pg.tc) === 0 ? (pa.tc ?? '') : pg.tc,
+    cuenta: pg.cuenta || ''      // v2 y anteriores no lo tenían
   }));
   _prevBolson = bolsonEfectivo();
 }
@@ -300,7 +330,8 @@ function loadDatos(d) {
 function loadProdV2(p) {
   return {
     ...blankProd(),
-    nombre: p.nombre || '', fob_real_u: p.fob_real_u ?? '', fob_decl_u: p.fob_decl_u ?? '',
+    nombre: p.nombre || '', sku_id: p.sku_id ?? '',   // ausente en v2 → vacío
+    fob_real_u: p.fob_real_u ?? '', fob_decl_u: p.fob_decl_u ?? '',
     cantidad: p.cantidad ?? '', cantidad_decl: p.cantidad_decl ?? '', peso_u: p.peso_u ?? '',
     derechos_pct: p.derechos_pct ?? '', derechos_pct_decl: p.derechos_pct_decl ?? '',
     estadistica_pct: p.estadistica_pct ?? '', estadistica_pct_decl: p.estadistica_pct_decl ?? '',
@@ -516,7 +547,49 @@ function prodsSection() {
       <div class="card-title" style="margin:0">Productos</div>
       <button class="btn btn-ghost imp-mini" data-act="addprod">+ Producto</button>
     </div>
+    <datalist id="imp-skus">${SKUS.map(s => `<option value="${esc(s.codigo)}" label="${esc(s.descripcion || '')}"></option>`).join('')}</datalist>
     <div class="imp-prods" id="imp-prods">${PRODS.map(prodCard).join('')}</div>`;
+}
+
+// Fila de vínculo con el SKU de ADARA (IMP-F2-2).
+// Va con <input list> + <datalist> y NO con el skuPicker del resto de la app: este archivo
+// re-renderiza el body entero y el picker exige montar/destruir por fila. El datalist es
+// nativo, sobrevive al re-render y no acumula listeners — que es el bug histórico de esta
+// pantalla (ver "Guardrails técnicos" en ADARA-IMPORTACIONES-SIM.md).
+// Estado del vínculo: devuelve {txt, cls} para un SKU resuelto (o no).
+function skuEstado(s, cod, ivaSim) {
+  if (s) {
+    // La alícuota del SKU y la del producto en la sim tienen que coincidir: si difieren,
+    // el crédito fiscal calculado no es el que va a corresponder al lote.
+    const ivaSku = Number(s.alicuota_iva) * (Number(s.alicuota_iva) <= 1 ? 100 : 1);
+    const choca = isFinite(ivaSku) && Math.abs(ivaSku - num(ivaSim)) > 0.01;
+    return choca
+      ? { txt: `⚠ ${esc(s.descripcion || '')} — el SKU es ${ivaSku}% y la sim ${num(ivaSim)}%`, cls: 'imp-sku-warn' }
+      : { txt: `✓ ${esc(s.descripcion || '')}`, cls: 'imp-sku-ok' };
+  }
+  return cod
+    ? { txt: '⚠ no existe ese código', cls: 'imp-sku-warn' }
+    : { txt: 'sin vincular — obligatorio para confirmar', cls: 'imp-sku-none' };
+}
+
+function pintarSkuEstado(i, cod, s) {
+  const el = document.getElementById(`imp-sku-est-${i}`);
+  if (!el) return;
+  const e = skuEstado(s, cod, PRODS[i] && PRODS[i].iva_pct);
+  el.className = 'imp-sku-est ' + e.cls;
+  el.innerHTML = e.txt;
+}
+
+function skuRow(p, i) {
+  const s = p.sku_id ? SKU_BY_ID[String(p.sku_id)] : null;
+  const val = s ? s.codigo : '';
+  const e = skuEstado(s, val, p.iva_pct);
+  return `<div class="imp-sku-row">
+    <label>SKU</label>
+    <input class="imp-in imp-sku-in" list="imp-skus" data-k="prod" data-i="${i}" data-f="_sku_cod"
+           value="${esc(val)}" placeholder="código…" autocomplete="off">
+    <span class="imp-sku-est ${e.cls}" id="imp-sku-est-${i}">${e.txt}</span>
+  </div>`;
 }
 
 function prodCard(p, i) {
@@ -544,6 +617,7 @@ function prodCard(p, i) {
       </div>
       <button class="imp-del" data-act="delprod" data-i="${i}" title="Eliminar producto">✕</button>
     </div>
+    ${skuRow(p, i)}
     <div class="imp-prod-grid">
       ${fnum('cantidad', 'Cantidad')}
       ${fnum('peso_u', 'Peso u (kg)')}
@@ -645,6 +719,10 @@ function pagosCard() {
         <option value="ARS" ${pg.moneda === 'ARS' ? 'selected' : ''}>ARS</option>
       </select>
       <input class="imp-in imp-pago-tc" id="pagotc-${i}" data-k="pago" data-i="${i}" data-f="tc" type="number" step="any" inputmode="decimal" value="${esc(pg.tc)}" placeholder="TC" ${pg.moneda === 'USD' ? 'disabled' : ''}>
+      <select class="imp-in imp-sel" data-k="pago" data-i="${i}" data-f="cuenta" title="De qué cuenta sale la plata">
+        <option value="">Cuenta…</option>
+        ${CUENTAS.map(c => `<option value="${esc(c.codigo)}" ${pg.cuenta === c.codigo ? 'selected' : ''}>${esc(c.nombre || c.codigo)}</option>`).join('')}
+      </select>
       <span class="imp-pago-usd imp-mono" id="pago-usd-${i}"></span>
       <button class="imp-del" data-act="delpago" data-i="${i}" title="Eliminar pago">✕</button>
     </div>`).join('') || `<div class="imp-muted imp-empty">Sin pagos cargados.</div>`;
@@ -654,7 +732,7 @@ function pagosCard() {
       <button class="btn btn-ghost imp-mini" data-act="addpago">+ Pago</button>
     </div>
     <div class="imp-pago-headrow">
-      <span>Concepto</span><span>Monto</span><span>Moneda</span><span>TC del pago</span><span style="text-align:right">= USD</span><span></span>
+      <span>Concepto</span><span>Monto</span><span>Moneda</span><span>TC del pago</span><span>Sale de</span><span style="text-align:right">= USD</span><span></span>
     </div>
     <div class="imp-pagos">${filas}</div>
     <div class="imp-cierre" id="imp-cierre"></div>
@@ -864,9 +942,26 @@ function bindDelegation(body) {
     }
     else if (k === 'fijo') { FIJOS[i][f] = v; if (f === 'monto_usd') { onBolsonChanged(); syncProdFijoInputs(); } }
     else if (k === 'prod') {
+      // El input del SKU trabaja con el CÓDIGO (lo que muestra el datalist); lo que se
+      // persiste es el sku_id, que es estable aunque después se renombre el código.
+      if (f === '_sku_cod') {
+        // Sin renderBody(): esto corre en cada tecla y re-renderizar perdería el foco.
+        // Se actualiza sólo el cartelito de estado de esta fila.
+        const cod = String(v || '').trim().toUpperCase();
+        const s = SKU_BY_COD[cod];
+        PRODS[i].sku_id = s ? s.id : '';
+        pintarSkuEstado(i, cod, s);
+        return;
+      }
       if (f === 'declaro_distinto') {
         PRODS[i].declaro_distinto = t.checked;
-        if (!t.checked) { PRODS[i].fob_decl_u = ''; PRODS[i].derechos_pct_decl = ''; PRODS[i].estadistica_pct_decl = ''; }
+        // Al destildar se limpian TODOS los overrides, `cantidad_decl` incluido —
+        // se había olvidado cuando se agregó el eje de cantidad (7/7/2026) y quedaba
+        // subdeclarando cantidad con el check apagado.
+        if (!t.checked) {
+          PRODS[i].fob_decl_u = ''; PRODS[i].cantidad_decl = '';
+          PRODS[i].derechos_pct_decl = ''; PRODS[i].estadistica_pct_decl = '';
+        }
         renderBody();
         return;
       }
@@ -1037,7 +1132,14 @@ function inyectarEstilo() {
     .imp-tot-sub{font-size:14px;color:#78716C;margin-top:2px}
 
     /* Pagos */
-    .imp-pago-headrow,.imp-pago-item{display:grid;grid-template-columns:1fr 130px 88px 110px 130px 32px;gap:10px;align-items:center}
+    .imp-pago-headrow,.imp-pago-item{display:grid;grid-template-columns:1fr 130px 88px 110px 150px 130px 32px;gap:10px;align-items:center}
+    .imp-sku-row{display:grid;grid-template-columns:34px 190px 1fr;gap:9px;align-items:center;margin:0 0 10px;font-size:12px}
+    .imp-sku-row label{color:#A8A29E;text-transform:uppercase;letter-spacing:.04em;font-weight:600;font-size:11px}
+    .imp-sku-in{font-family:'JetBrains Mono',ui-monospace,monospace}
+    .imp-sku-est{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .imp-sku-ok{color:#0F6E56}
+    .imp-sku-warn{color:#B45309}
+    .imp-sku-none{color:#A8A29E;font-style:italic}
     .imp-pago-headrow{font-size:11px;color:#A8A29E;text-transform:uppercase;letter-spacing:.04em;padding:0 2px 8px;font-weight:600}
     .imp-pago-item{margin-bottom:10px}
     .imp-pago-usd{text-align:right;font-size:13px;color:#0F6E56;font-weight:600}
