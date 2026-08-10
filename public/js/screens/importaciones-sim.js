@@ -643,7 +643,13 @@ function prodCard(p, i) {
 
 function resumenProductosCard() {
   return `<div class="card imp-card">
-    <div class="card-title">Costo final por producto</div>
+    <div class="imp-prods-head" style="margin:0 0 12px">
+      <div class="card-title" style="margin:0">Costo final por producto</div>
+      <div style="display:flex;gap:6px">
+        <button class="btn btn-ghost imp-mini" data-act="exp-pdf" title="Abrir una versión imprimible y guardar como PDF">↓ PDF</button>
+        <button class="btn btn-ghost imp-mini" data-act="exp-xls" title="Comparativo declarado vs real en Excel">↓ Excel</button>
+      </div>
+    </div>
     <div class="table-wrap"><table class="t imp-resumen">
       <thead><tr>
         <th>#</th><th>Producto</th>
@@ -656,6 +662,157 @@ function resumenProductosCard() {
       <tbody id="imp-resumen-body"></tbody>
     </table></div>
   </div>`;
+}
+
+// ── Exportaciones ───────────────────────────────────────────────────────
+// Las dos salen del MISMO calc() que pinta la pantalla: no hay un segundo cálculo
+// que pueda divergir de lo que estás viendo.
+
+const hoyTxt = () => new Date().toLocaleDateString('es-AR');
+const nombreArch = ext =>
+  (NOMBRE || 'simulacion').replace(/[^\wáéíóúñÁÉÍÓÚÑ .-]/g, '').trim().replace(/\s+/g, '_') + '.' + ext;
+
+// PDF: se abre una ventana con la tabla limpia y se dispara el print del navegador
+// ("Guardar como PDF"). Sin librerías ni CDN — la app no tiene build step (A15) y
+// meter una dependencia para esto sería desproporcionado.
+function exportarCostoPDF() {
+  const r = calc();
+  const filas = r.rows.map((x, i) => `<tr>
+      <td class="n">${i + 1}</td>
+      <td>${esc(x.p.nombre || '—')}</td>
+      <td class="r">${num(x.cantReal).toLocaleString('es-AR')}</td>
+      <td class="r">${usd(x.costoUnitUsd)}</td>
+      <td class="r">${ars(x.costoUnitUsd * num(P.tc))}</td>
+      <td class="r">${usd(x.costoUsd)}</td>
+      <td class="r">${ars(x.costoUsd * num(P.tc))}</td>
+    </tr>`).join('');
+  const w = window.open('', '_blank');
+  if (!w) { window.toast('El navegador bloqueó la ventana. Permití los pop-ups para este sitio.', 'error'); return; }
+  w.document.write(`<!doctype html><html lang="es"><head><meta charset="utf-8">
+    <title>${esc(NOMBRE || 'Costo final por producto')}</title>
+    <style>
+      *{box-sizing:border-box}
+      body{font-family:Arial,Helvetica,sans-serif;color:#1C1917;margin:26px;font-size:12px}
+      h1{font-size:17px;margin:0 0 3px}
+      .sub{color:#78716C;font-size:11px;margin-bottom:16px}
+      table{border-collapse:collapse;width:100%}
+      th,td{border:1px solid #D6D3D1;padding:5px 8px}
+      th{background:#F5F5F4;font-size:10px;text-transform:uppercase;letter-spacing:.04em;text-align:left}
+      td.r,th.r{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+      td.n{width:26px;color:#A8A29E}
+      tfoot td{font-weight:bold;background:#F5F5F4}
+      @page{size:A4 landscape;margin:12mm}
+    </style></head><body>
+    <h1>${esc(NOMBRE || 'Simulación de importación')}</h1>
+    <div class="sub">Costo final por producto · puesto en Argentina, neto de IVA · TC $${num(P.tc).toLocaleString('es-AR')} · ${hoyTxt()}</div>
+    <table>
+      <thead><tr><th></th><th>Producto</th><th class="r">Cant.</th><th class="r">Costo unit. USD</th>
+        <th class="r">Costo unit. ARS</th><th class="r">Costo total USD</th><th class="r">Costo total ARS</th></tr></thead>
+      <tbody>${filas}</tbody>
+      <tfoot><tr><td colspan="5">Total</td><td class="r">${usd(r.costoTotUsd)}</td><td class="r">${ars(r.costoTotUsd * num(P.tc))}</td></tr></tfoot>
+    </table>
+    </body></html>`);
+  w.document.close();
+  w.focus();
+  setTimeout(() => w.print(), 350);   // margen para que aplique el CSS antes de imprimir
+}
+
+// Excel: comparativo DECLARADO vs REAL, dos bloques lado a lado + diferencias.
+// Es un REPORTE DE CONTROL INTERNO, no un comprobante: va rotulado como tal.
+// SheetJS se carga sólo al apretar el botón (no penaliza la carga de la app) y si el
+// CDN no responde cae a CSV, que Excel abre igual.
+async function cargarSheetJS() {
+  if (window.XLSX) return window.XLSX;
+  await new Promise((ok, fail) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    s.onload = ok; s.onerror = () => fail(new Error('no se pudo cargar la librería'));
+    document.head.appendChild(s);
+  });
+  return window.XLSX;
+}
+
+function filasComparativo() {
+  const r = calc();
+  return r.rows.map((x, i) => {
+    const cantReal = num(x.cantReal), cantDecl = num(x.cantDecl);
+    // Precio unitario efectivamente declarado (ya resuelto por calc según el check).
+    const precioReal = num(x.p.fob_real_u);
+    const precioDecl = cantDecl > 0 ? x.fobDeclT / cantDecl : 0;
+    const totReal = precioReal * cantReal;
+    const totDecl = x.fobDeclT;
+    return {
+      i: i + 1, nombre: x.p.nombre || '—',
+      cantReal, precioReal, totReal,
+      cantDecl, precioDecl, totDecl,
+      difCant: cantDecl - cantReal,
+      // Negativo = se declara por debajo del real.
+      difPrecioPct: precioReal > 0 ? (precioDecl / precioReal - 1) * 100 : 0,
+      difTot: totDecl - totReal
+    };
+  });
+}
+
+async function exportarComparativo() {
+  const F = filasComparativo();
+  if (!F.length) { window.toast('No hay productos para exportar', 'error'); return; }
+
+  const tit = NOMBRE || 'Simulación de importación';
+  const encabezado = [
+    ['COMPARATIVO DECLARADO vs REAL — ' + tit],
+    ['Reporte de control interno del costeo. No es un comprobante comercial. Generado ' + hoyTxt() + ' · TC $' + num(P.tc)],
+    [],
+    ['', '', 'REAL (lo que entra)', '', '', 'DECLARADO (aduana)', '', '', 'DIFERENCIA', '', ''],
+    ['#', 'Producto', 'Cant.', 'Precio u. USD', 'Total USD', 'Cant.', 'Precio u. USD', 'Total USD', 'Δ cant.', 'Δ precio %', 'Δ total USD']
+  ];
+  const cuerpo = F.map(f => [f.i, f.nombre, f.cantReal, f.precioReal, f.totReal,
+                             f.cantDecl, f.precioDecl, f.totDecl,
+                             f.difCant, f.difPrecioPct, f.difTot]);
+  const T = F.reduce((a, f) => ({
+    cr: a.cr + f.cantReal, tr: a.tr + f.totReal,
+    cd: a.cd + f.cantDecl, td: a.td + f.totDecl
+  }), { cr: 0, tr: 0, cd: 0, td: 0 });
+  const total = ['', 'TOTAL', T.cr, '', T.tr, T.cd, '', T.td, T.cd - T.cr,
+                 T.tr > 0 ? (T.td / T.tr - 1) * 100 : 0, T.td - T.tr];
+
+  const aoa = [...encabezado, ...cuerpo, total];
+
+  try {
+    const XLSX = await cargarSheetJS();
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws['!cols'] = [{ wch: 4 }, { wch: 34 }, { wch: 9 }, { wch: 13 }, { wch: 13 },
+                   { wch: 9 }, { wch: 13 }, { wch: 13 }, { wch: 9 }, { wch: 11 }, { wch: 13 }];
+    ws['!merges'] = [
+      { s: { r: 0, c: 0 }, e: { r: 0, c: 10 } },   // título
+      { s: { r: 1, c: 0 }, e: { r: 1, c: 10 } },   // leyenda
+      { s: { r: 3, c: 2 }, e: { r: 3, c: 4 } },    // REAL
+      { s: { r: 3, c: 5 }, e: { r: 3, c: 7 } },    // DECLARADO
+      { s: { r: 3, c: 8 }, e: { r: 3, c: 10 } }    // DIFERENCIA
+    ];
+    // Formato numérico por columna (SheetJS community no aplica colores, sí formatos).
+    const prim = 5, ult = 5 + cuerpo.length;       // filas 0-based de datos + total
+    for (let r = prim; r <= ult; r++) {
+      [3, 4, 6, 7, 10].forEach(c => { const cel = ws[XLSX.utils.encode_cell({ r, c })]; if (cel) cel.z = '#,##0.00'; });
+      [2, 5, 8].forEach(c => { const cel = ws[XLSX.utils.encode_cell({ r, c })]; if (cel) cel.z = '#,##0'; });
+      const pc = ws[XLSX.utils.encode_cell({ r, c: 9 })]; if (pc) pc.z = '+0.00"%";-0.00"%";0"%"';
+    }
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Comparativo');
+    XLSX.writeFile(wb, nombreArch('xlsx'));
+    window.toast('Comparativo descargado');
+  } catch (e) {
+    // Fallback sin librería: CSV con ; (el separador que espera Excel en es-AR) y BOM.
+    const cel = v => typeof v === 'number'
+      ? String(v.toFixed(2)).replace('.', ',')
+      : '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+    const csv = '﻿' + aoa.map(f => f.map(cel).join(';')).join('\r\n');
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8;' }));
+    const a = document.createElement('a');
+    a.href = url; a.download = nombreArch('csv');
+    a.click();
+    URL.revokeObjectURL(url);
+    window.toast('Sin conexión a la librería de Excel: se descargó como CSV', 'error');
+  }
 }
 
 function totalesCard() {
@@ -993,6 +1150,8 @@ function bindDelegation(body) {
       case 'delprod': PRODS.splice(i, 1); if (!PRODS.length) PRODS = [blankProd()]; renderBody(); break;
       case 'addpago': PAGOS.push(blankPago()); renderBody(); break;
       case 'delpago': PAGOS.splice(i, 1); renderBody(); break;
+      case 'exp-pdf': exportarCostoPDF(); break;
+      case 'exp-xls': exportarComparativo(); break;
       case 'exp': {
         PRODS[i]._open = !PRODS[i]._open;
         const box = document.getElementById(`imp-det-${i}`);
