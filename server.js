@@ -3261,8 +3261,60 @@ async function tfPostRetry(endpoint, body, intentos = 3, esperaMs = 3000, timeou
 // IMPORTANTE: ListarMovimientos usa los parametros REALES de la API de Tango
 // (Desde / Hasta / Tope). Antes se mandaba FechaComprobante/FechaServicioHasta
 // (de otro endpoint), Tango los ignoraba y hacia una consulta sin filtro -> lento y con errores.
+// ── Comprobantes de Tango: guardar TODOS, sean de ML o no ────────────────────
+// Hasta el 10/8/2026 el sync pedía el detalle de cada movimiento y después tiraba
+// los que no eran de Mercado Libre. Esos son la facturación B2B (luminarias,
+// Tienda Nube, sindicatos): la única fuente que ADARA puede tener hoy de esas
+// líneas, y la razón por la que la base imponible de IIBB estaba incompleta.
+//
+// Se guarda la CABECERA FISCAL, no la venta: alcanza para la base imponible de
+// IIBB, no para el P&L (eso necesita SKU y costo → paso 3 del roadmap).
+// Ver claude/ADARA-IIBB-CONVENIO-MULTILATERAL.md §9.
+//
+// ⚠ Los nombres exactos de los campos de neto/IVA/fecha en la API de Tango no están
+// confirmados contra datos reales. Por eso se prueban varios alias Y se persiste el
+// payload crudo en `raw`: primero capturar todo, después mapear con datos en la mano.
+const tgPick = (o, ...keys) => {
+  for (const k of keys) {
+    const v = o && o[k];
+    if (v !== undefined && v !== null && v !== '') return v;
+  }
+  return null;
+};
+const tgNum = v => {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+const tgFecha = v => {
+  if (!v) return null;
+  const m = String(v).match(/^\d{4}-\d{2}-\d{2}/);
+  return m ? m[0] : null;
+};
+
+async function guardarComprobanteTango(m, D, dae) {
+  const numero = tgPick(D, 'Numero') ?? tgPick(m, 'Numero');
+  await sbUpsert('comprobantes_tango', {
+    tango_movimiento_id: String(m.MovimientoId),
+    fecha:  tgFecha(tgPick(D, 'FechaEmision', 'Fecha', 'FechaMovimiento')
+                 ?? tgPick(m, 'FechaEmision', 'Fecha', 'FechaMovimiento')),
+    letra:  tgPick(D, 'Letra') ?? tgPick(m, 'MovimientoLetra'),
+    numero: numero != null ? String(numero) : null,
+    razon_social: tgPick(D, 'RazonSocial', 'ClienteRazonSocial', 'NombreCliente', 'Cliente'),
+    cuit:   tgPick(D, 'Cuit', 'CUIT', 'ClienteCuit', 'NroDocumento'),
+    total:  tgNum(tgPick(D, 'Total') ?? tgPick(m, 'Total')),
+    neto:   tgNum(tgPick(D, 'Neto', 'ImporteNeto', 'TotalNeto', 'NetoGravado', 'SubTotal')),
+    iva:    tgNum(tgPick(D, 'IVA', 'Iva', 'ImporteIVA', 'TotalIVA')),
+    aplicacion_externa: (dae && dae.AplicacionNombre) || null,
+    external_id: (dae && dae.ExternalID) ? String(dae.ExternalID) : null,
+    raw: D,
+    actualizado_en: new Date().toISOString()
+    // es_ml y periodo son GENERATED: nunca van en el payload (428C9).
+  }, 'tango_movimiento_id');
+}
+
 async function syncTangoFacturas(desde, hasta) {
-  const stats = { total: 0, ml: 0, no_ml: 0, actualizadas: 0, por_pack: 0, sin_venta: 0, errores: 0, procesadas: 0, huerfanas: [] };
+  const stats = { total: 0, ml: 0, no_ml: 0, actualizadas: 0, por_pack: 0, sin_venta: 0, errores: 0, procesadas: 0, comp_guardados: 0, comp_errores: 0, huerfanas: [] };
 
   const lista = await tfPostRetry('ListarMovimientos', {
     Desde: `${desde}T00:00:00`, Hasta: `${hasta}T23:59:59`, Tope: 5000
@@ -3272,11 +3324,22 @@ async function syncTangoFacturas(desde, hasta) {
 
   for (const m of movs) {
     stats.procesadas++;
-    TANGO_SYNC.progress = { procesadas: stats.procesadas, total: stats.total, actualizadas: stats.actualizadas };
+    TANGO_SYNC.progress = { procesadas: stats.procesadas, total: stats.total, actualizadas: stats.actualizadas, comprobantes: stats.comp_guardados };
     try {
       const det = await tfPostRetry('ObtenerInfoMovimiento', { MovimientoId: m.MovimientoId, ObtenerInfoAplicaciones: true }, 2);
       const D = det.Data || {};
       const dae = D.DatosAplicacionExterna;
+
+      // Se guarda ANTES del filtro: el comprobante vale aunque no sea de ML.
+      // No bloquea el sync — si falla el guardado, el pegado de facturas sigue.
+      try {
+        await guardarComprobanteTango(m, D, dae);
+        stats.comp_guardados++;
+      } catch (e) {
+        stats.comp_errores++;
+        console.error('Comprobante Tango', m.MovimientoId, e.message);
+      }
+
       if (!(dae && dae.AplicacionNombre === 'Mercado Libre' && dae.ExternalID)) { stats.no_ml++; continue; }
       stats.ml++;
       const patch = {
