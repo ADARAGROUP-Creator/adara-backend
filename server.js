@@ -4001,6 +4001,20 @@ app.delete('/adjuntos/:id', async (req, res) => {
 // tabla nueva `movimientos` (capa 4), auto-clasifica el ruido (impuestos,
 // comisiones, intereses, FCI) y verifica la continuidad del saldo.
 //
+// ── Identidad propia (CB15) ─────────────────────────────────────────────
+// Las transferencias entre cuentas propias (Supervielle ↔ Mercado Pago) NO son
+// cobro de venta ni pago a proveedor: son movimiento interno de fondos y se
+// cierran solas (conciliado_auto). Cada pata aparece en el extracto de su banco
+// con la contraparte identificada por CUIT propio o razón social propia.
+// Validado con mayo 2026: 4 pares exactos Supervielle(+) ↔ MP(−) por $183M.
+// OJO con el \b alrededor del CUIT: la IDENTIFICACION de los VEP de AFIP arranca
+// con el CUIT y sigue con más dígitos ("3071747647241691903"). Sin el límite de
+// palabra, todo pago de impuestos se marcaría como transferencia interna.
+const CUIT_PROPIO  = '30717476472';
+const ES_CONTRAPARTE_PROPIA = new RegExp(
+  `\\b${CUIT_PROPIO}\\b|\\b30-71747647-2\\b|\\badara\\s*rs\\b`, 'i'
+);
+
 // Idempotencia: referencia_externa = fecha|hora|monto|saldo (el saldo corre y
 // es único por movimiento, así re-importar no duplica — UNIQUE(origen, ref)).
 // Clasificación: las líneas "ruido" quedan conciliado_auto=true (fuera de
@@ -4071,6 +4085,11 @@ app.post('/supervielle/import', upload.single('file'), async (req, res) => {
         if (/axoft|tango/.test(t)) return { categoria: 'gasto', auto: false };
         return { categoria: 'pago_proveedor', auto: false };
       }
+      // Transferencia entre cuentas propias (CB15): va antes de las reglas
+      // genéricas de transferencia, si no queda como cobro/pago inexistente.
+      if (/cr.?dito por transferencia|debin|transferencia|transf\.|trf\.|porcbu|homebanking|cred bca electronica/.test(t)
+          && ES_CONTRAPARTE_PROPIA.test(t))
+        return { categoria: 'transferencia_interna', auto: true };
       if (/cr.?dito por transferencia|debin|acreditaci.?n cheque|cheque de c.?mara|cred bca electronica/.test(t))
         return { categoria: entra ? 'cobro_venta' : 'pago_proveedor', auto: false };
       if (/transferencia|trf\.|porcbu|pago.prov/.test(t))
@@ -4124,10 +4143,20 @@ app.post('/supervielle/import', upload.single('file'), async (req, res) => {
       };
     });
 
+    // Red de seguridad contra claves repetidas dentro del mismo archivo (21000).
+    const vistos = new Set();
+    const unicos = [];
+    let colisiones = 0;
+    for (const m of movs) {
+      if (vistos.has(m.referencia_externa)) { colisiones++; continue; }
+      vistos.add(m.referencia_externa);
+      unicos.push(m);
+    }
+
     // Upsert idempotente (UNIQUE origen+referencia_externa → no duplica al re-importar)
     let importados = 0;
-    for (let i = 0; i < movs.length; i += 50) {
-      const lote = movs.slice(i, i + 50);
+    for (let i = 0; i < unicos.length; i += 50) {
+      const lote = unicos.slice(i, i + 50);
       await sbUpsert('movimientos', lote, 'origen,referencia_externa');
       importados += lote.length;
     }
@@ -4136,6 +4165,7 @@ app.post('/supervielle/import', upload.single('file'), async (req, res) => {
     res.json({
       ok: true,
       importados, auto, pendientes,
+      colisiones_en_archivo: colisiones,
       rango: { desde: fechas[0], hasta: fechas[fechas.length - 1] },
       saldo_check: { ok: saldoOk, breaks: breaks.slice(0, 5), total_breaks: breaks.length }
     });
@@ -4228,6 +4258,11 @@ app.post('/mp/import', upload.single('file'), async (req, res) => {
       if (/liquidaci.n de dinero/.test(s)) return { categoria: 'cobro_venta', auto: false };
       if (/bonificaci.n por env/.test(s)) return { categoria: 'cobro_venta', auto: false };
       if (/d.bito por deuda/.test(s)) return { categoria: 'devolucion', auto: false };
+      // Transferencia entre cuentas propias (CB15). En el AS el nombre de la
+      // contraparte viene dentro del propio TRANSACTION_TYPE
+      // (ej. "Transferencia enviada Adara Rs"). Va antes de la regla genérica.
+      if (/transferencia (enviada|recibida)/.test(s) && ES_CONTRAPARTE_PROPIA.test(s))
+        return { categoria: 'transferencia_interna', auto: true };
       if (/transferencia enviada/.test(s)) return { categoria: 'pago_proveedor', auto: false };
       if (/transferencia recibida|dinero recibido/.test(s)) return { categoria: 'cobro_venta', auto: false };
       if (/pago de suscripci|^pago |compra mercado/.test(s)) return { categoria: 'gasto', auto: false };
@@ -4270,16 +4305,33 @@ app.post('/mp/import', upload.single('file'), async (req, res) => {
         fecha: f.fecha,
         monto: f.monto,
         origen: 'mp_account_statement',
-        referencia_externa: `${f.fecha}|${f.ref}|${f.monto.toFixed(2)}|${f.saldo.toFixed(2)}`,
+        // El tipo va AL FINAL: hay código que lee el op_id como split('|')[1] y
+        // matchea LIKE '%|pid|%'. Agregarlo al final deja los campos 0-3 intactos.
+        // Sin el tipo, dos filas legítimas colisionan (liquidación y devolución
+        // del mismo pago dejan igual fecha, ref, monto y saldo) → error 21000.
+        referencia_externa: `${f.fecha}|${f.ref}|${f.monto.toFixed(2)}|${f.saldo.toFixed(2)}|${String(f.tipo).replace(/\|/g, ' ')}`,
         categoria,
         descripcion: (f.tipo + (f.ref ? ' · ' + f.ref : '')).slice(0, 300),
         conciliado_auto: esAuto
       };
     });
 
+    // Red de seguridad: si dos filas del archivo generan la misma clave, el
+    // upsert revienta con 21000. Se deduplica acá y se reporta, en vez de
+    // cortar la importación entera. Si este número no es 0, la clave quedó
+    // corta para algún caso nuevo y hay que revisarla (no ignorarlo).
+    const vistos = new Set();
+    const unicos = [];
+    let colisiones = 0;
+    for (const m of movs) {
+      if (vistos.has(m.referencia_externa)) { colisiones++; continue; }
+      vistos.add(m.referencia_externa);
+      unicos.push(m);
+    }
+
     let importados = 0;
-    for (let i = 0; i < movs.length; i += 500) {
-      const lote = movs.slice(i, i + 500);
+    for (let i = 0; i < unicos.length; i += 500) {
+      const lote = unicos.slice(i, i + 500);
       await sbUpsert('movimientos', lote, 'origen,referencia_externa');
       importados += lote.length;
     }
@@ -4288,6 +4340,7 @@ app.post('/mp/import', upload.single('file'), async (req, res) => {
     res.json({
       ok: true,
       importados, auto, pendientes,
+      colisiones_en_archivo: colisiones,
       rango: { desde: fechas[0], hasta: fechas[fechas.length - 1] },
       saldo_check: { ok: saldoOk, breaks: breaks.slice(0, 5), total_breaks: breaks.length }
     });
