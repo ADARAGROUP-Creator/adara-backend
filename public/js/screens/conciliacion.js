@@ -1,83 +1,152 @@
 import { sbGet } from '../core/sb.js';
 
-// ── Pantalla: Conciliación (capa 4) ────────────────────────────────────
-// Muestra TODOS los movimientos con su estado de conciliación y permite
-// vincular los pagos a operaciones (gasto / compra). Principio #1 de ADARA:
-// conciliación universal, nada se pierde, todo visible.
+// ── Pantalla: Conciliación ─────────────────────────────────────────────
+// Modelo de interacción: DOS LADOS con diferencia en vivo.
+//   Izquierda  = operaciones con saldo (compras, gastos, cheques emitidos)
+//   Derecha    = movimientos del extracto pendientes/parciales
+// Se marca de los dos lados, la barra de abajo muestra la diferencia y NADA se
+// escribe hasta apretar "Conciliar". Eso resuelve 1:1, 1:N, N:1 y N:M sin UI
+// especial para ninguno (ver ADARA-CONCILIACION-BANCARIA.md).
 //
-// Lo atado a ventas (cobros, liquidaciones de MP, devoluciones) se muestra con
-// la etiqueta "espera venta" — se concilia con el sync de ML, no a mano todavía.
-// Convención: vinculos.monto = MAGNITUD POSITIVA imputada (ADARA-SCHEMA.md);
-// v_movimientos_estado concilia con abs(monto) − Σ vínculos (tol. 0,02).
+// Reglas que implementa:
+// - "Espera motor ML" aplica SOLO a movimientos de Mercado Pago con categoría de
+//   venta. Toda entrada de banco es conciliación manual (antes, cualquier monto
+//   positivo caía en espera y los cobros B2B por Supervielle quedaban en limbo).
+// - La sugerencia se muestra CON SUS MOTIVOS y nunca se aplica sola: resalta,
+//   no selecciona. El CUIT puntúa aparte del monto, porque identifica al
+//   proveedor aunque el pago sea parcial.
+// - Diferencia ≠ 0 nunca bloquea: se imputa min(saldoMov, saldoOp) y lo que
+//   sobra queda parcial. Una diferencia es señal de dato faltante, no algo a
+//   justificar con un formulario.
 
 let CUENTAS = [], CUENTA_BY_ID = {};
-let MOVS = [];           // v_movimientos_estado (todos)
-let GASTOS = [];         // v_gastos_ap abiertos
-let COMPRAS = [];        // v_compras_ap con saldo
-let VINC_BY_MOV = {};    // movimiento_id -> [vinculos]
-let VINC_BY_VENTA = {};  // op_id (venta_ml = ventas_ml.id) -> [vinculos]
-let VENTAS_BY_MES = {};  // 'YYYY-MM' -> ventas_ml[] (cache, fetch on demand)
-let MES = '';            // período seleccionado (mes)
-let VISTA = 'movs';      // 'movs' | 'ventas' | 'ambas'
-let FILTRO = { cuenta: '', estado: 'por_conciliar' };
-let COLF = { fecha: '', cuenta: '', desc: '', cat: '', monto: '', estado: '', concil: '' };   // filtros col. movimientos
-let COLV = { fecha: '', orden: '', prod: '', sku: '', cobrar: '', cobrado: '', estado: '' };   // filtros col. ventas
+let MOVS = [];              // v_movimientos_estado
+let COMPRAS = [], GASTOS = [], CHEQUES = [], PROVEEDORES = [];
+let PROV_BY_ID = {};
+let VINC_BY_MOV = {};       // movimiento_id -> [vinculos]
+let MES = '';
+let FILTRO = { cuenta: '', estado: 'por_conciliar', qOps: '', qMovs: '' };
+let SEL_OPS = new Set();    // claves "tipo:id"
+let SEL_MOVS = new Set();   // ids de movimiento
+let FOCO = null;            // input enfocado + cursor, para sobrevivir al re-render
 
-const LABEL_CUENTA = {
-  supervielle_ars: 'Supervielle ARS', mp_ars: 'MP ARS', caja_ars: 'Caja ARS', caja_usd: 'Caja USD',
-};
-const CAT_LABEL = {
-  cobro_venta: 'Cobro de venta', pago_proveedor: 'Pago a proveedor', gasto: 'Gasto',
-  comision_bancaria: 'Comisión bancaria', comision_marketplace: 'Comisión marketplace',
-  impuesto: 'Impuesto', transferencia_interna: 'Transferencia interna', devolucion: 'Devolución',
-  interes: 'Interés', ajuste_manual: 'Ajuste manual', sin_clasificar: 'Sin clasificar',
-};
-const LABEL_ESTADO = { auto: 'auto', pendiente: 'pendiente', parcial: 'parcial', conciliado: 'conciliado' };
+const MES_NOM = ['', 'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
+const mesLabel = k => { if (!k) return ''; const [y, m] = k.split('-'); return `${MES_NOM[Number(m)] || m} ${y}`; };
+const round2 = n => Math.round((Number(n) || 0) * 100) / 100;
 
-const cuentaLabel = id => { const c = CUENTA_BY_ID[id]; return c ? (LABEL_CUENTA[c.codigo] || c.codigo) : '—'; };
-const monedaDe = id => { const c = CUENTA_BY_ID[id]; return c ? c.moneda : 'ARS'; };
-const money = n => '$ ' + Math.abs(Number(n) || 0).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const ddmm = f => `${(f || '').slice(8, 10)}/${(f || '').slice(5, 7)}`;
-const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-
-function fmtMonto(valor, moneda) {
-  const n = Number(valor) || 0;
-  const abs = Math.abs(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  return `${n < 0 ? '−' : '+'}${moneda === 'USD' ? 'US$ ' : '$ '}${abs}`;
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+function fmt(n, moneda) {
+  const v = Number(n) || 0;
+  const abs = Math.abs(v).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return `${v < 0 ? '−' : ''}${moneda === 'USD' ? 'US$ ' : '$ '}${abs}`;
+}
+function fmtFecha(f) {
+  if (!f) return '—';
+  const [y, m, d] = String(f).slice(0, 10).split('-');
+  return `${d}/${m}`;
+}
+const LABEL_CUENTA = { supervielle_ars: 'Supervielle', mercadopago_ars: 'Mercado Pago', caja_ars: 'Caja ARS', caja_usd: 'Caja USD' };
+function cuentaLabel(id) {
+  const c = CUENTA_BY_ID[id];
+  if (!c) return '—';
+  return LABEL_CUENTA[c.codigo] || c.nombre || c.codigo || ('Cuenta ' + id);
 }
 
-// "Espera venta/sync ML": cobros (entradas) y lo atado a una venta.
-function esEspera(m) {
-  return Number(m.monto) > 0 || m.categoria === 'cobro_venta' || m.categoria === 'devolucion';
+// ── Clasificación de movimientos ───────────────────────────────────────
+// El motor de cobros de ML solo resuelve movimientos de MP atados a una venta.
+// Una entrada en Supervielle (cobro B2B por transferencia) es trabajo manual.
+function esEsperaMotor(m) {
+  return m.origen === 'mp_account_statement'
+      && (m.categoria === 'cobro_venta' || m.categoria === 'devolucion');
 }
-// Accionable hoy: pago (salida) pendiente/parcial que no espera venta → gasto/compra.
 function esAccionable(m) {
-  return (m.estado === 'pendiente' || m.estado === 'parcial') && !esEspera(m);
+  return (m.estado === 'pendiente' || m.estado === 'parcial') && !esEsperaMotor(m);
 }
-// Bucket de la columna "Conciliación" (categoría legible para el filtro por columna).
-function concilBucket(m) {
-  if (m.estado === 'conciliado') return 'Conciliado';
-  if (m.estado === 'auto') return 'Auto';
-  if (esAccionable(m)) return 'Accionable';
-  if ((m.estado === 'pendiente' || m.estado === 'parcial') && esEspera(m)) return 'Espera venta';
-  return 'Sin acción';
+function saldoMov(m) {
+  const s = Number(m.saldo_pendiente);
+  return Math.abs(isNaN(s) ? Number(m.monto) || 0 : s);
 }
 
-// Mejor sugerencia (gasto o compra) cuyo saldo coincida con el del movimiento.
-function sugerencia(saldoMov) {
-  let best = null;
-  for (const g of GASTOS) {
-    const s = Number(g.saldo_pendiente_ars);
-    if (!(s > 0)) continue;
-    const diff = Math.abs(s - saldoMov);
-    if (diff < 0.02 && (!best || diff < best.diff)) best = { tipo: 'gasto', id: g.id, monto: s, diff, label: `Gasto · ${g.descripcion || ('#' + g.id)}` };
-  }
+// ── Operaciones con saldo (lado izquierdo) ─────────────────────────────
+// Compras, gastos y cheques emitidos se unifican en una sola lista: para
+// conciliar son lo mismo, una obligación con saldo.
+function operaciones() {
+  const out = [];
   for (const c of COMPRAS) {
-    const s = Number(c.saldo_ap_ars);
-    if (!(s > 0)) continue;
-    const diff = Math.abs(s - saldoMov);
-    if (diff < 0.02 && (!best || diff < best.diff)) best = { tipo: 'compra', id: c.compra_id, monto: s, diff, label: `Compra #${c.compra_id}` };
+    const saldo = round2(c.saldo_ap_ars);
+    if (!(saldo > 0.02)) continue;
+    const p = PROV_BY_ID[c.proveedor_id];
+    out.push({
+      key: 'compra:' + c.compra_id, op_tipo: 'compra', op_id: c.compra_id,
+      titulo: c.nro_factura || ('Compra #' + c.compra_id),
+      sub: p ? p.nombre : 'Sin proveedor',
+      cuit: p ? p.cuit : null, fecha: c.fecha, saldo, moneda: 'ARS', clase: 'compra'
+    });
   }
+  for (const g of GASTOS) {
+    const saldo = round2(g.saldo_pendiente_ars);
+    if (!(saldo > 0.02)) continue;
+    const p = PROV_BY_ID[g.proveedor_id];
+    out.push({
+      key: 'gasto:' + g.id, op_tipo: 'gasto', op_id: g.id,
+      titulo: g.descripcion || ('Gasto #' + g.id),
+      sub: p ? p.nombre : (g.nro_comprobante || 'Gasto'),
+      cuit: p ? p.cuit : null, fecha: g.fecha, saldo, moneda: 'ARS', clase: 'gasto'
+    });
+  }
+  for (const ch of CHEQUES) {
+    if (ch.estado !== 'emitido') continue;
+    const saldo = round2(Number(ch.monto) - Number(ch.conciliado_ars || 0));
+    if (!(saldo > 0.02)) continue;
+    out.push({
+      key: 'cheque:' + ch.id, op_tipo: 'cheque', op_id: ch.id,
+      titulo: 'Echeq N° ' + ch.numero,
+      sub: ch.contraparte || 'Cheque', numero: ch.numero,
+      cuit: ch.contraparte_cuit, fecha: ch.fecha_pago, saldo, moneda: ch.moneda || 'ARS', clase: 'cheque'
+    });
+  }
+  return out;
+}
+
+// ── Sugerencia: puntaje con motivos visibles ───────────────────────────
+// Un puntaje que no explica por qué no se usa dos veces. Cada señal suma y se
+// muestra como chip. El CUIT vale aunque el monto no coincida: identifica al
+// proveedor en pagos parciales, que es donde el matching por monto no llega.
+function puntaje(op, mov) {
+  const desc = (mov.descripcion || '').toLowerCase();
+  const motivos = [];
+  let pts = 0;
+
+  // Número de cheque en la descripción del débito: identificador único, la
+  // señal más fuerte que existe en todo el circuito.
+  if (op.op_tipo === 'cheque' && op.numero) {
+    const n = String(op.numero).replace(/^0+/, '');
+    if (n && desc.replace(/\D/g, '').includes(n)) { pts += 60; motivos.push('n° cheque'); }
+  }
+  const dif = Math.abs(op.saldo - saldoMov(mov));
+  if (dif <= 0.02) { pts += 50; motivos.push('monto exacto'); }
+  else if (op.saldo > 0 && dif / op.saldo <= 0.01) { pts += 25; motivos.push('≈ monto'); }
+
+  if (op.cuit && desc.replace(/\D/g, '').includes(String(op.cuit))) { pts += 30; motivos.push('CUIT'); }
+
+  if (op.fecha && mov.fecha) {
+    const d = Math.abs((new Date(mov.fecha) - new Date(op.fecha)) / 86400000);
+    if (d <= 7) { pts += 15; motivos.push('fecha'); }
+  }
+  return { pts, motivos };
+}
+
+// Mejor puntaje de cada fila contra lo que hay marcado del otro lado.
+function scoreOpContraSel(op, movsSel) {
+  let best = { pts: 0, motivos: [] };
+  for (const m of movsSel) { const s = puntaje(op, m); if (s.pts > best.pts) best = s; }
+  return best;
+}
+function scoreMovContraSel(mov, opsSel) {
+  let best = { pts: 0, motivos: [] };
+  for (const o of opsSel) { const s = puntaje(o, mov); if (s.pts > best.pts) best = s; }
   return best;
 }
 
@@ -88,455 +157,262 @@ export async function loadConciliacion() {
     CUENTAS = await sbGet('cuentas', 'order=id.asc');
     CUENTA_BY_ID = Object.fromEntries(CUENTAS.map(c => [c.id, c]));
     MOVS = await sbGet('v_movimientos_estado', 'order=fecha.desc,id.desc');
-    GASTOS = await sbGet('v_gastos_ap', 'estado_pago=in.(pendiente,parcial)&order=fecha.desc');
-    COMPRAS = await sbGet('v_compras_ap', 'saldo_ap_ars=gt.0&order=fecha.desc');
+    COMPRAS = await sbGet('v_compras_ap', 'saldo_ap_ars=gt.0.02&order=fecha.desc,compra_id.desc').catch(() => []);
+    GASTOS = await sbGet('v_gastos_ap', 'estado_pago=in.(pendiente,parcial)&order=fecha.desc,id.desc').catch(() => []);
+    CHEQUES = await sbGet('v_cheques', 'estado=eq.emitido&order=fecha_pago.asc,id.asc').catch(() => []);
+    PROVEEDORES = await sbGet('proveedores', 'order=nombre.asc').catch(() => []);
+    PROV_BY_ID = Object.fromEntries(PROVEEDORES.map(p => [p.id, p]));
     const vinc = await sbGet('vinculos', 'order=id.desc');
-    VINC_BY_MOV = {}; VINC_BY_VENTA = {};
-    for (const v of vinc) {
-      (VINC_BY_MOV[v.movimiento_id] = VINC_BY_MOV[v.movimiento_id] || []).push(v);
-      if (v.op_tipo === 'venta_ml') (VINC_BY_VENTA[String(v.op_id)] = VINC_BY_VENTA[String(v.op_id)] || []).push(v);
-    }
+    VINC_BY_MOV = {};
+    for (const v of vinc) (VINC_BY_MOV[v.movimiento_id] = VINC_BY_MOV[v.movimiento_id] || []).push(v);
   } catch (e) {
-    root.innerHTML = `<div class="error">No se pudo cargar la conciliación: ${e.message}<br><br>
-      Si dice algo de permisos sobre <b>vinculos</b>, corré en Supabase: <code>grant select on vinculos to anon, authenticated;</code></div>`;
+    root.innerHTML = `<div class="error">No se pudo cargar la conciliación: ${esc(e.message)}</div>`;
     return;
   }
-  if (!MES) MES = mesPorDefecto();
+  const meses = [...new Set(MOVS.map(m => (m.fecha || '').slice(0, 7)).filter(Boolean))].sort().reverse();
+  if (!MES || !meses.includes(MES)) MES = meses[0] || new Date().toISOString().slice(0, 7);
+  SEL_OPS.clear(); SEL_MOVS.clear();
   inyectarEstilo();
-  await ensureVentas(MES);
   render();
 }
 
-// ── Período (mes) y ventas ─────────────────────────────────────────────
-function mesPorDefecto() {
-  const ms = MOVS.map(m => (m.fecha || '').slice(0, 7)).filter(Boolean).sort();
-  return ms.length ? ms[ms.length - 1] : new Date().toISOString().slice(0, 7);
+function movsDelMes() {
+  return MOVS.filter(m => (m.fecha || '').slice(0, 7) === MES
+    && (!FILTRO.cuenta || String(m.cuenta_id) === FILTRO.cuenta));
 }
-function mesesDisponibles() {
-  const s = new Set();
-  MOVS.forEach(m => { const k = (m.fecha || '').slice(0, 7); if (k) s.add(k); });
-  Object.keys(VENTAS_BY_MES).forEach(k => s.add(k));
-  if (MES) s.add(MES);
-  return [...s].sort().reverse();
-}
-async function ensureVentas(mes) {
-  if (!mes || VENTAS_BY_MES[mes]) return;
-  try {
-    VENTAS_BY_MES[mes] = await sbGet('ventas_ml', `periodo=eq.${mes}&order=fecha.desc,id.desc`);
-  } catch (e) {
-    VENTAS_BY_MES[mes] = [];
-    if (window.toast) window.toast('No se pudieron cargar las ventas del mes: ' + e.message, 'error');
-  }
-}
-const MES_NOM = ['', 'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
-const mesLabel = k => { if (!k) return ''; const [y, m] = k.split('-'); return `${MES_NOM[Number(m)] || m} ${y}`; };
 
-// Datasets derivados del período/cuenta seleccionados.
-const enMes = f => (f || '').slice(0, 7) === MES;
-function movsBase() { return MOVS.filter(m => enMes(m.fecha) && (!FILTRO.cuenta || String(m.cuenta_id) === FILTRO.cuenta)); }
-function movsFiltrados() { return movsBase().filter(pasaEstado); }
-function ventasMes() { return VENTAS_BY_MES[MES] || []; }
-
-// Conciliación de una venta ML (vinculos op_tipo='venta_ml', op_id = ventas_ml.id).
-function ventaCobrado(v) {
-  return (VINC_BY_VENTA[String(v.id)] || []).reduce((s, x) => s + Math.abs(Number(x.monto) || 0), 0);
+function movsVisibles() {
+  const base = movsDelMes();
+  let l;
+  if (FILTRO.estado === 'por_conciliar') l = base.filter(esAccionable);
+  else if (FILTRO.estado === 'espera') l = base.filter(m => esEsperaMotor(m) && m.estado !== 'conciliado');
+  else if (FILTRO.estado === 'conciliado') l = base.filter(m => m.estado === 'conciliado');
+  else if (FILTRO.estado === 'auto') l = base.filter(m => m.estado === 'auto');
+  else l = base;
+  const q = FILTRO.qMovs.trim().toLowerCase();
+  if (q) l = l.filter(m => (m.descripcion || '').toLowerCase().includes(q) || String(Math.abs(m.monto)).includes(q));
+  // Los seleccionados no se pierden aunque cambie el filtro ni la búsqueda.
+  const vistos = new Set(l.map(m => m.id));
+  const extra = base.filter(m => SEL_MOVS.has(m.id) && !vistos.has(m.id));
+  return [...extra, ...l];
 }
-function ventaEstado(v) {
-  if (v.ml_status === 'cancelled') return 'Cancelada';
-  const cobrado = ventaCobrado(v);
-  const pc = Math.abs(Number(v.por_cobrar) || 0);
-  if (cobrado < 0.02) return 'Sin cobro';
-  if (Math.abs(cobrado - pc) < 0.02) return 'Conciliada';
-  return 'Parcial';
-}
-const VEST_CLASS = { 'Conciliada': 'conciliada', 'Parcial': 'parcial', 'Sin cobro': 'sincobro', 'Cancelada': 'cancelada' };
 
-function pasaEstado(m) {
-  if (FILTRO.estado === 'por_conciliar') return m.estado === 'pendiente' || m.estado === 'parcial';
-  if (FILTRO.estado === 'todos') return true;
-  return m.estado === FILTRO.estado;
+function opsVisibles() {
+  let l = operaciones();
+  const q = FILTRO.qOps.trim().toLowerCase();
+  if (q) l = l.filter(o => (o.titulo + ' ' + o.sub).toLowerCase().includes(q));
+  return l;
 }
 
 function render() {
   const root = document.getElementById('app-screens');
-  const mb = movsBase();
-  const mf = movsFiltrados();
-  const ventas = ventasMes();
+  const base = movsDelMes();
+  const ops = opsVisibles();
+  const movs = movsVisibles();
 
-  const verMovs = VISTA === 'movs' || VISTA === 'ambas';
-  const verVentas = VISTA === 'ventas' || VISTA === 'ambas';
+  const nAccion = base.filter(esAccionable).length;
+  const nEspera = base.filter(m => esEsperaMotor(m) && m.estado !== 'conciliado').length;
+  const nConcil = base.filter(m => m.estado === 'conciliado').length;
+  const nAuto = base.filter(m => m.estado === 'auto').length;
+  const montoAccion = base.filter(esAccionable).reduce((s, m) => s + saldoMov(m), 0);
 
-  // KPIs (movimientos del mes/cuenta)
-  const nPorConciliar = mb.filter(m => m.estado === 'pendiente' || m.estado === 'parcial').length;
-  const nConciliados = mb.filter(m => m.estado === 'conciliado').length;
-  const nAuto = mb.filter(m => m.estado === 'auto').length;
-  const montoAConciliar = mb.filter(esAccionable).reduce((s, m) => s + Math.abs(Number(m.saldo_pendiente) || 0), 0);
+  const meses = [...new Set(MOVS.map(m => (m.fecha || '').slice(0, 7)).filter(Boolean))].sort().reverse();
+  const optMes = meses.map(k => `<option value="${k}" ${k === MES ? 'selected' : ''}>${mesLabel(k)}</option>`).join('');
+  const optCuenta = ['<option value="">Todas las cuentas</option>']
+    .concat(CUENTAS.map(c => `<option value="${c.id}" ${FILTRO.cuenta === String(c.id) ? 'selected' : ''}>${cuentaLabel(c.id)}</option>`)).join('');
 
-  // Toolbar
-  const opcionesCuenta = ['<option value="">Todas las cuentas</option>']
-    .concat(CUENTAS.map(c => `<option value="${c.id}" ${FILTRO.cuenta === String(c.id) ? 'selected' : ''}>${cuentaLabel(c.id)}</option>`))
-    .join('');
-  const opcionesMes = mesesDisponibles()
-    .map(k => `<option value="${k}" ${k === MES ? 'selected' : ''}>${mesLabel(k)}</option>`).join('');
-  const vbtn = (v, l) => `<button class="${VISTA === v ? 'active' : ''}" data-vista="${v}">${l}</button>`;
+  const pill = (v, l, n) => `<button class="pill ${FILTRO.estado === v ? 'active' : ''}" data-estado="${v}">${l} <span class="num">${n}</span></button>`;
 
-  // Filtros por columna: helpers de armado
-  const uniq = arr => [...new Set(arr.filter(x => x != null && x !== ''))].sort((a, b) => String(a).localeCompare(String(b), 'es'));
-  const selF = (col, opts) => `<select class="cf" data-col="${col}"><option value="">(todas)</option>${opts.map(o => `<option ${COLF[col] === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
-  const inpF = (col, ph) => `<input class="cf" data-col="${col}" type="text" placeholder="${ph}" value="${esc(COLF[col])}">`;
-  const selV = (col, opts) => `<select class="vf" data-col="${col}"><option value="">(todas)</option>${opts.map(o => `<option ${COLV[col] === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
-  const inpV = (col, ph) => `<input class="vf" data-col="${col}" type="text" placeholder="${ph}" value="${esc(COLV[col])}">`;
+  // Objetos seleccionados (para puntuar el otro lado y totalizar)
+  const opsSel = ops.filter(o => SEL_OPS.has(o.key));
+  const movsSel = movs.filter(m => SEL_MOVS.has(m.id));
+  const totOps = round2(opsSel.reduce((s, o) => s + o.saldo, 0));
+  const totMovs = round2(movsSel.reduce((s, m) => s + saldoMov(m), 0));
+  const dif = round2(totMovs - totOps);
 
-  const optsCuenta = uniq(mf.map(m => cuentaLabel(m.cuenta_id)));
-  const optsCat = uniq(mf.map(m => CAT_LABEL[m.categoria] || m.categoria));
-  const optsEstadoM = uniq(mf.map(m => LABEL_ESTADO[m.estado] || m.estado));
-  const optsConcil = uniq(mf.map(concilBucket));
-  const optsVEstado = uniq(ventas.map(ventaEstado));
+  const filaOp = o => {
+    const sel = SEL_OPS.has(o.key);
+    const s = movsSel.length ? scoreOpContraSel(o, movsSel) : { pts: 0, motivos: [] };
+    const sug = s.pts >= 25;
+    return `<label class="cc-row${sel ? ' is-sel' : ''}${sug && !sel ? ' is-sug' : ''}" data-op="${o.key}">
+      <input type="checkbox" class="cc-ck cc-ck-op" data-key="${o.key}" ${sel ? 'checked' : ''}>
+      <span class="cc-main">
+        <span class="cc-t">${esc(o.titulo)} <span class="cc-tag cc-tag-${o.clase}">${o.op_tipo}</span></span>
+        <span class="cc-s">${esc(o.sub)} · ${fmtFecha(o.fecha)}${s.motivos.length ? ' · ' + s.motivos.map(x => `<b class="cc-why">${x}</b>`).join(' ') : ''}</span>
+      </span>
+      <span class="cc-m">${fmt(o.saldo, o.moneda)}</span>
+    </label>`;
+  };
 
-  const pill = (val, label, n) => `<button class="pill ${FILTRO.estado === val ? 'active' : ''}" data-estado="${val}">${label} <span class="num">${n}</span></button>`;
-  const pills = [
-    pill('por_conciliar', 'Por conciliar', nPorConciliar),
-    pill('conciliado', 'Conciliados', nConciliados),
-    pill('auto', 'Auto', nAuto),
-    pill('todos', 'Todos', mb.length),
-  ].join('');
+  const filaMov = m => {
+    const sel = SEL_MOVS.has(m.id);
+    const s = opsSel.length ? scoreMovContraSel(m, opsSel) : { pts: 0, motivos: [] };
+    const sug = s.pts >= 25;
+    const espera = esEsperaMotor(m);
+    const vs = VINC_BY_MOV[m.id] || [];
+    const chips = vs.map(v => `<span class="cc-chip">${v.op_tipo} #${v.op_id} <b class="cc-x" data-unlink="${v.id}">✕</b></span>`).join(' ');
+    return `<label class="cc-row${sel ? ' is-sel' : ''}${sug && !sel ? ' is-sug' : ''}${espera ? ' is-espera' : ''}" data-mov="${m.id}">
+      <input type="checkbox" class="cc-ck cc-ck-mov" data-id="${m.id}" ${sel ? 'checked' : ''} ${espera ? 'disabled' : ''}>
+      <span class="cc-main">
+        <span class="cc-t">${esc((m.descripcion || '').slice(0, 78))}</span>
+        <span class="cc-s">${fmtFecha(m.fecha)} · ${esc(cuentaLabel(m.cuenta_id))}${espera ? ' · <b class="cc-esp">espera motor ML</b>' : ''}${s.motivos.length ? ' · ' + s.motivos.map(x => `<b class="cc-why">${x}</b>`).join(' ') : ''} ${chips}</span>
+      </span>
+      <span class="cc-m ${Number(m.monto) < 0 ? 'cc-neg' : 'cc-pos'}">${fmt(m.monto, CUENTA_BY_ID[m.cuenta_id]?.moneda)}</span>
+    </label>`;
+  };
 
-  const panelMovs = !verMovs ? '' : `
-    <div class="con-panel">
-      ${VISTA === 'ambas' ? `<div class="con-panel-title">Movimientos bancarios</div>` : ''}
-      <div class="pills">${pills}</div>
-      ${mf.length === 0
-        ? `<div class="empty">No hay movimientos en este período.</div>`
-        : `<div class="con-bar"><span class="con-count" id="c-count"></span>
-             <button class="con-clear" id="c-clear">Limpiar filtros</button></div>
-           <div class="table-wrap"><table class="t" id="c-tabla">
-            <thead>
-              <tr><th style="width:58px">Fecha</th><th style="width:104px">Cuenta</th><th>Descripción</th>
-                <th style="width:120px">Categoría</th><th style="width:140px;text-align:right">Monto</th>
-                <th style="width:90px">Estado</th><th style="width:240px">Conciliación</th></tr>
-              <tr class="con-filtros">
-                <th>${inpF('fecha', 'dd/mm')}</th><th>${selF('cuenta', optsCuenta)}</th><th>${inpF('desc', 'buscar…')}</th>
-                <th>${selF('cat', optsCat)}</th><th>${inpF('monto', 'monto')}</th><th>${selF('estado', optsEstadoM)}</th><th>${selF('concil', optsConcil)}</th>
-              </tr>
-            </thead>
-            <tbody id="c-tbody"></tbody>
-          </table></div>
-          <div class="empty" id="c-empty" style="display:none">Sin resultados para los filtros aplicados.</div>`}
-    </div>`;
-
-  const panelVentas = !verVentas ? '' : `
-    <div class="con-panel">
-      ${VISTA === 'ambas' ? `<div class="con-panel-title">Ventas facturadas</div>` : ''}
-      ${ventas.length === 0
-        ? `<div class="empty">No hay ventas en este período.</div>`
-        : `<div class="con-bar"><span class="con-count" id="v-count"></span>
-             <button class="con-clear" id="v-clear">Limpiar filtros</button></div>
-           <div class="table-wrap"><table class="t" id="v-tabla">
-            <thead>
-              <tr><th style="width:58px">Fecha</th><th style="width:128px">Orden</th><th>Producto</th>
-                <th style="width:70px">SKU</th><th style="width:130px;text-align:right">Por cobrar</th>
-                <th style="width:130px;text-align:right">Cobrado</th><th style="width:104px">Estado</th></tr>
-              <tr class="con-filtros">
-                <th>${inpV('fecha', 'dd/mm')}</th><th>${inpV('orden', 'orden')}</th><th>${inpV('prod', 'buscar…')}</th>
-                <th>${inpV('sku', 'sku')}</th><th>${inpV('cobrar', 'monto')}</th><th>${inpV('cobrado', 'monto')}</th><th>${selV('estado', optsVEstado)}</th>
-              </tr>
-            </thead>
-            <tbody id="v-tbody"></tbody>
-          </table></div>
-          <div class="empty" id="v-empty" style="display:none">Sin resultados para los filtros aplicados.</div>`}
-    </div>`;
-
-  root.innerHTML = `
-    <div class="toolbar con-top">
-      <div class="con-mesctl"><span class="con-lbl">Período</span>
-        <select class="select" id="c-mes" style="width:auto">${opcionesMes}</select></div>
-      <select class="select" id="c-cuenta" style="width:auto">${opcionesCuenta}</select>
-      <div class="con-views">${vbtn('movs', 'Movimientos')}${vbtn('ventas', 'Ventas')}${vbtn('ambas', 'Ambas')}</div>
-    </div>
-
-    ${verMovs ? `<div class="kpi-grid" style="margin:14px 0">
-      <div class="kpi"><div class="kpi-label">Por conciliar (mes)</div><div class="kpi-value">${nPorConciliar}</div></div>
-      <div class="kpi"><div class="kpi-label">Monto a conciliar (pagos)</div><div class="kpi-value">${money(montoAConciliar)}</div></div>
-      <div class="kpi"><div class="kpi-label">Conciliados (mes)</div><div class="kpi-value">${nConciliados}</div></div>
-    </div>` : ''}
-
-    <div class="con-panels ${VISTA === 'ambas' ? 'con-dual' : ''}">
-      ${panelMovs}
-      ${panelVentas}
-    </div>
-  `;
-
-  document.getElementById('c-mes').addEventListener('change', async e => { MES = e.target.value; await ensureVentas(MES); render(); });
-  document.getElementById('c-cuenta').addEventListener('change', e => { FILTRO.cuenta = e.target.value; render(); });
-  root.querySelectorAll('.con-views button').forEach(b => b.addEventListener('click', () => { VISTA = b.dataset.vista; render(); }));
-  root.querySelectorAll('.pill').forEach(p => p.addEventListener('click', () => { FILTRO.estado = p.dataset.estado; render(); }));
-
-  // Filtros por columna: repintan SOLO el tbody respectivo (no se pierde el foco).
-  root.querySelectorAll('.cf').forEach(el => {
-    const ev = el.tagName === 'SELECT' ? 'change' : 'input';
-    el.addEventListener(ev, e => { COLF[e.target.dataset.col] = e.target.value; pintarFilas(); });
-  });
-  root.querySelectorAll('.vf').forEach(el => {
-    const ev = el.tagName === 'SELECT' ? 'change' : 'input';
-    el.addEventListener(ev, e => { COLV[e.target.dataset.col] = e.target.value; pintarVentas(); });
-  });
-  const clr = document.getElementById('c-clear');
-  if (clr) clr.addEventListener('click', () => { COLF = { fecha: '', cuenta: '', desc: '', cat: '', monto: '', estado: '', concil: '' }; render(); });
-  const clrv = document.getElementById('v-clear');
-  if (clrv) clrv.addEventListener('click', () => { COLV = { fecha: '', orden: '', prod: '', sku: '', cobrar: '', cobrado: '', estado: '' }; render(); });
-
-  // Delegación de eventos (sólo la tabla de movimientos tiene acciones)
-  const tabla = document.getElementById('c-tabla');
-  if (tabla) tabla.addEventListener('click', onTablaClick);
-
-  if (verMovs) pintarFilas();
-  if (verVentas) pintarVentas();
-}
-
-// Filtro por columna: ¿el movimiento pasa los filtros de la fila estilo Excel?
-function pasaColumnas(m) {
-  if (COLF.cuenta && cuentaLabel(m.cuenta_id) !== COLF.cuenta) return false;
-  if (COLF.cat && (CAT_LABEL[m.categoria] || m.categoria) !== COLF.cat) return false;
-  if (COLF.estado && (LABEL_ESTADO[m.estado] || m.estado) !== COLF.estado) return false;
-  if (COLF.concil && concilBucket(m) !== COLF.concil) return false;
-  if (COLF.fecha) {
-    const hay = ((m.fecha || '') + ' ' + ddmm(m.fecha)).toLowerCase();
-    if (!hay.includes(COLF.fecha.toLowerCase())) return false;
-  }
-  if (COLF.desc && !String(m.descripcion || '').toLowerCase().includes(COLF.desc.toLowerCase())) return false;
-  if (COLF.monto) {
-    const q = COLF.monto.replace(',', '.').replace(/[^\d.]/g, '');
-    if (q && !Math.abs(Number(m.monto) || 0).toFixed(2).includes(q)) return false;
-  }
-  return true;
-}
-
-// Repinta únicamente las filas de movimientos según los filtros de columna.
-function pintarFilas() {
-  const tbody = document.getElementById('c-tbody');
-  if (!tbody) return;
-  const filtrados = movsFiltrados();
-  const visibles = filtrados.filter(pasaColumnas);
-  tbody.innerHTML = visibles.map(filaHTML).join('');
-  const cnt = document.getElementById('c-count');
-  if (cnt) cnt.textContent = `Mostrando ${visibles.length.toLocaleString('es-AR')} de ${filtrados.length.toLocaleString('es-AR')}`;
-  const empty = document.getElementById('c-empty');
-  if (empty) empty.style.display = visibles.length ? 'none' : 'block';
-}
-
-// Filtro por columna de la tabla de ventas.
-function pasaColumnasV(v) {
-  if (COLV.estado && ventaEstado(v) !== COLV.estado) return false;
-  if (COLV.fecha) { const h = ((v.fecha || '') + ' ' + ddmm(v.fecha)).toLowerCase(); if (!h.includes(COLV.fecha.toLowerCase())) return false; }
-  if (COLV.orden && !String(v.ml_order_id || '').includes(COLV.orden)) return false;
-  if (COLV.prod && !String(v.titulo || '').toLowerCase().includes(COLV.prod.toLowerCase())) return false;
-  if (COLV.sku && !String(v.sku || '').toLowerCase().includes(COLV.sku.toLowerCase())) return false;
-  if (COLV.cobrar) { const q = COLV.cobrar.replace(',', '.').replace(/[^\d.]/g, ''); if (q && !Math.abs(Number(v.por_cobrar) || 0).toFixed(2).includes(q)) return false; }
-  if (COLV.cobrado) { const q = COLV.cobrado.replace(',', '.').replace(/[^\d.]/g, ''); if (q && !ventaCobrado(v).toFixed(2).includes(q)) return false; }
-  return true;
-}
-
-// Repinta únicamente las filas de ventas según los filtros de columna.
-function pintarVentas() {
-  const tbody = document.getElementById('v-tbody');
-  if (!tbody) return;
-  const todas = ventasMes();
-  const visibles = todas.filter(pasaColumnasV);
-  tbody.innerHTML = visibles.map(filaVentaHTML).join('');
-  const cnt = document.getElementById('v-count');
-  if (cnt) cnt.textContent = `Mostrando ${visibles.length.toLocaleString('es-AR')} de ${todas.length.toLocaleString('es-AR')}`;
-  const empty = document.getElementById('v-empty');
-  if (empty) empty.style.display = visibles.length ? 'none' : 'block';
-}
-
-function filaVentaHTML(v) {
-  const est = ventaEstado(v);
-  const cobrado = ventaCobrado(v);
-  const dev = v.devuelta ? `<span class="con-vdev">devuelta</span>` : '';
-  return `<tr>
-    <td>${ddmm(v.fecha)}</td>
-    <td class="con-mono" title="${esc(v.ml_order_id || '')}">${esc(v.ml_order_id || '—')}</td>
-    <td>${esc(v.titulo || '—')}${dev}</td>
-    <td class="con-mono">${esc(v.sku || '—')}</td>
-    <td style="text-align:right" class="con-mono">${money(v.por_cobrar)}</td>
-    <td style="text-align:right" class="con-mono">${cobrado > 0.02 ? money(cobrado) : '<span class="con-dash">—</span>'}</td>
-    <td><span class="con-vchip con-vchip-${VEST_CLASS[est]}">${est}</span></td>
-  </tr>`;
-}
-
-function filaHTML(m) {
-  const moneda = monedaDe(m.cuenta_id);
-  const neg = Number(m.monto) < 0;
-  const est = m.estado;
-  return `<tr>
-    <td>${ddmm(m.fecha)}</td>
-    <td>${cuentaLabel(m.cuenta_id)}</td>
-    <td>${esc(m.descripcion || '—')}</td>
-    <td><span class="con-cat">${esc(CAT_LABEL[m.categoria] || m.categoria)}</span></td>
-    <td style="text-align:right" class="con-mono ${neg ? 'con-neg' : 'con-pos'}">${fmtMonto(m.monto, moneda)}</td>
-    <td><span class="con-badge con-badge-${est}">${LABEL_ESTADO[est] || est}</span></td>
-    <td>${accionHTML(m)}</td>
-  </tr>`;
-}
-
-function chipLabel(v, m) {
-  if (v.op_tipo === 'transferencia') {
-    return String(v.op_id) === String(m.id) ? 'Transf. interna (sin par)' : `↔ Transf. mov #${v.op_id}`;
-  }
-  return `${CAT_LABEL[v.op_tipo] || v.op_tipo} #${v.op_id}`;
-}
-
-function accionHTML(m) {
-  const vinc = VINC_BY_MOV[m.id] || [];
-  const chips = vinc.map(v => `<span class="con-chip">${esc(chipLabel(v, m))} · ${money(v.monto)}
-      <button class="con-x" data-accion="desvincular" data-id="${v.id}" title="Desvincular">✕</button></span>`).join('');
-
-  const transfBtn = `<button class="btn btn-ghost con-mini" data-accion="transf" data-mov="${m.id}">Transf. interna</button>`;
-
-  if (esAccionable(m)) {
-    const saldo = Math.abs(Number(m.saldo_pendiente) || 0);
-    const sug = sugerencia(saldo);
-    const spark = sug
-      ? `<button class="con-spark-btn" data-accion="aceptar" data-mov="${m.id}" data-tipo="${sug.tipo}" data-op="${sug.id}" data-monto="${sug.monto}" title="Aceptar: ${esc(sug.label)} · ${money(sug.monto)}">✨</button>`
-      : '';
-    return `${chips}<div class="con-acts">${spark}<button class="btn btn-ghost con-mini" data-accion="pick" data-mov="${m.id}">Vincular</button>${transfBtn}</div>`;
-  }
-  if ((m.estado === 'pendiente' || m.estado === 'parcial') && esEspera(m)) {
-    return `${chips}<div class="con-acts"><span class="con-wait">espera venta</span>${transfBtn}</div>`;
-  }
-  if (m.estado === 'conciliado') return chips || '<span class="con-ok">✓</span>';
-  return chips || '<span class="con-dash">—</span>';
-}
-
-function onTablaClick(e) {
-  const btn = e.target.closest('[data-accion]');
-  if (!btn) return;
-  const a = btn.dataset.accion;
-  if (a === 'aceptar') vincular(btn.dataset.mov, btn.dataset.tipo, btn.dataset.op, Number(btn.dataset.monto));
-  else if (a === 'pick') openPicker(btn.dataset.mov);
-  else if (a === 'transf') openTransferencia(btn.dataset.mov);
-  else if (a === 'desvincular') desvincular(btn.dataset.id);
-}
-
-function openPicker(movId) {
-  const m = MOVS.find(x => String(x.id) === String(movId));
-  if (!m) return;
-  const saldoMov = Math.abs(Number(m.saldo_pendiente) || 0);
-
-  const candidatos = [
-    ...GASTOS.map(g => ({ tipo: 'gasto', id: g.id, saldo: Number(g.saldo_pendiente_ars), label: g.descripcion || ('Gasto #' + g.id), sub: `Gasto · ${ddmm(g.fecha)} · ${g.categoria_codigo || ''}` })),
-    ...COMPRAS.map(c => ({ tipo: 'compra', id: c.compra_id, saldo: Number(c.saldo_ap_ars), label: `Compra #${c.compra_id}`, sub: `Compra · ${ddmm(c.fecha)} · ${c.tipo_compra || ''}` })),
-  ].filter(o => o.saldo > 0).sort((a, b) => Math.abs(a.saldo - saldoMov) - Math.abs(b.saldo - saldoMov));
-
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.innerHTML = `
-    <div class="modal">
-      <div class="card-title">Vincular movimiento</div>
-      <p class="con-sub"><b>${esc(m.descripcion || '')}</b> · saldo ${money(saldoMov)}.
-        Se imputa el menor entre el saldo del movimiento y el de la operación.</p>
-      ${candidatos.length === 0
-        ? `<div class="empty">No hay gastos ni compras con saldo pendiente.</div>`
-        : `<div class="con-pick">${candidatos.map(o => {
-            const exacto = Math.abs(o.saldo - saldoMov) < 0.02;
-            const imputa = Math.min(saldoMov, o.saldo);
-            return `<div class="con-pick-row ${exacto ? 'exacto' : ''}">
-              <div><div class="con-pick-lbl">${esc(o.label)} ${exacto ? '<span class="con-tag">coincide</span>' : ''}</div>
-                <div class="con-pick-sub">${esc(o.sub)} · saldo ${money(o.saldo)}</div></div>
-              <button class="btn btn-primary con-mini" data-op="${o.id}" data-tipo="${o.tipo}" data-monto="${imputa}">Imputar ${money(imputa)}</button>
-            </div>`;
-          }).join('')}</div>`}
-      <div class="modal-actions"><button class="btn btn-ghost" id="c-cancel">Cancelar</button></div>
-    </div>`;
-  document.body.appendChild(overlay);
-  const close = () => overlay.remove();
-  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
-  overlay.querySelector('#c-cancel').addEventListener('click', close);
-  overlay.querySelectorAll('.con-pick-row button').forEach(b =>
-    b.addEventListener('click', () => { close(); vincular(movId, b.dataset.tipo, b.dataset.op, Number(b.dataset.monto)); }));
-}
-
-function openTransferencia(movId) {
-  const m = MOVS.find(x => String(x.id) === String(movId));
-  if (!m) return;
-  const mag = Math.abs(Number(m.monto) || 0);
-  const signo = Math.sign(Number(m.monto) || 0);
-
-  // Contrapartes: otra cuenta, signo opuesto, aún sin conciliar. Más cercanas primero.
-  const cands = MOVS
-    .filter(x => String(x.id) !== String(m.id)
-      && String(x.cuenta_id) !== String(m.cuenta_id)
-      && Math.sign(Number(x.monto) || 0) === -signo
-      && (x.estado === 'pendiente' || x.estado === 'parcial'))
-    .map(x => ({ x, diff: Math.abs(Math.abs(Number(x.monto) || 0) - mag) }))
-    .sort((a, b) => a.diff - b.diff)
-    .slice(0, 50)
-    .map(o => o.x);
-
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.innerHTML = `
-    <div class="modal">
-      <div class="card-title">Transferencia interna</div>
-      <p class="con-sub"><b>${esc(m.descripcion || '')}</b> · ${cuentaLabel(m.cuenta_id)} · ${fmtMonto(m.monto, monedaDe(m.cuenta_id))}<br>
-        Elegí el movimiento contrario (la otra pata de la transferencia). Ambos quedan conciliados y no impactan el P&amp;L.</p>
-      ${cands.length === 0
-        ? `<div class="empty">No hay movimientos de otra cuenta con signo opuesto sin conciliar.</div>`
-        : `<div class="con-pick">${cands.map(o => {
-            const exacto = Math.abs(Math.abs(Number(o.monto) || 0) - mag) < 0.02;
-            return `<div class="con-pick-row ${exacto ? 'exacto' : ''}">
-              <div><div class="con-pick-lbl">${esc(o.descripcion || ('#' + o.id))} ${exacto ? '<span class="con-tag">coincide</span>' : ''}</div>
-                <div class="con-pick-sub">${cuentaLabel(o.cuenta_id)} · ${ddmm(o.fecha)} · ${fmtMonto(o.monto, monedaDe(o.cuenta_id))}</div></div>
-              <button class="btn btn-primary con-mini" data-emp="${o.id}">Emparejar</button>
-            </div>`;
-          }).join('')}</div>`}
-      <div class="modal-actions">
-        <button class="btn btn-ghost" id="t-sinpar">Marcar interna sin contrapartida</button>
-        <button class="btn btn-ghost" id="t-cancel">Cancelar</button>
+  let barra = '';
+  if (opsSel.length || movsSel.length) {
+    let estado, clase, acciones;
+    if (!opsSel.length || !movsSel.length) {
+      estado = 'Marcá al menos uno de cada lado'; clase = 'cc-bar-wait'; acciones = '';
+    } else if (Math.abs(dif) <= 0.02) {
+      estado = 'Cierra exacto ✓'; clase = 'cc-bar-ok';
+      acciones = `<button class="btn btn-primary" id="cc-go">Conciliar</button>`;
+    } else if (dif < 0) {
+      estado = `Pago parcial · queda ${fmt(-dif, 'ARS')} pendiente en la operación`; clase = 'cc-bar-warn';
+      acciones = `<button class="btn btn-primary" id="cc-go">Conciliar parcial</button>`;
+    } else {
+      estado = `Sobran ${fmt(dif, 'ARS')} sin asignar en el movimiento`; clase = 'cc-bar-warn';
+      acciones = `<button class="btn btn-primary" id="cc-go">Conciliar igual</button>`;
+    }
+    barra = `<div class="cc-bar ${clase}">
+      <div class="cc-bar-l">
+        <span>Operaciones <b>${fmt(totOps, 'ARS')}</b> <i>(${opsSel.length})</i></span>
+        <span>Movimientos <b>${fmt(totMovs, 'ARS')}</b> <i>(${movsSel.length})</i></span>
+        <span class="cc-bar-dif">${esc(estado)}</span>
+      </div>
+      <div class="cc-bar-r">
+        <button class="btn btn-ghost" id="cc-clear">Limpiar</button>
+        ${acciones}
       </div>
     </div>`;
-  document.body.appendChild(overlay);
-  const close = () => overlay.remove();
-  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
-  overlay.querySelector('#t-cancel').addEventListener('click', close);
-  overlay.querySelector('#t-sinpar').addEventListener('click', () => {
-    if (!confirm('¿Marcar como transferencia interna sin contrapartida en el sistema? Quedará conciliada sola.')) return;
-    close(); transfInterna(m.id, null);
-  });
-  overlay.querySelectorAll('.con-pick-row button').forEach(b =>
-    b.addEventListener('click', () => { close(); transfInterna(m.id, b.dataset.emp); }));
+  }
+
+  root.innerHTML = `
+    <div class="toolbar">
+      <select class="select" id="c-mes" style="width:auto;text-transform:capitalize">${optMes}</select>
+      <select class="select" id="c-cuenta" style="width:auto">${optCuenta}</select>
+      <div class="grow"></div>
+    </div>
+
+    <div class="kpi-grid" style="margin:14px 0">
+      <div class="kpi"><div class="kpi-label">Accionable</div><div class="kpi-value">${nAccion}</div></div>
+      <div class="kpi"><div class="kpi-label">Monto a conciliar</div><div class="kpi-value">${fmt(montoAccion, 'ARS')}</div></div>
+      <div class="kpi"><div class="kpi-label">Operaciones con saldo</div><div class="kpi-value">${operaciones().length}</div></div>
+      <div class="kpi"><div class="kpi-label">Espera motor ML</div><div class="kpi-value">${nEspera}</div></div>
+    </div>
+
+    <div class="pills">
+      ${pill('por_conciliar', 'Por conciliar', nAccion)}
+      ${pill('espera', 'Espera ML', nEspera)}
+      ${pill('conciliado', 'Conciliados', nConcil)}
+      ${pill('auto', 'Auto', nAuto)}
+      ${pill('todos', 'Todos', base.length)}
+    </div>
+
+    <div class="cc-grid">
+      <div class="cc-col">
+        <div class="cc-head">
+          <span>Operaciones con saldo <i>${ops.length}</i></span>
+          <input class="input cc-q" id="c-q-ops" placeholder="Buscar…" value="${esc(FILTRO.qOps)}">
+        </div>
+        <div class="cc-list">${ops.length ? ops.map(filaOp).join('') : '<div class="empty">No hay operaciones con saldo.</div>'}</div>
+      </div>
+      <div class="cc-col">
+        <div class="cc-head">
+          <span>Extracto <i>${movs.length}</i></span>
+          <input class="input cc-q" id="c-q-movs" placeholder="Buscar…" value="${esc(FILTRO.qMovs)}">
+        </div>
+        <div class="cc-list">${movs.length ? movs.map(filaMov).join('') : '<div class="empty">No hay movimientos para este filtro.</div>'}</div>
+      </div>
+    </div>
+
+    ${barra}
+  `;
+
+  document.getElementById('c-mes').addEventListener('change', e => { MES = e.target.value; SEL_OPS.clear(); SEL_MOVS.clear(); render(); });
+  document.getElementById('c-cuenta').addEventListener('change', e => { FILTRO.cuenta = e.target.value; render(); });
+  // Re-render completo en cada tecla perdería el foco y el cursor: se restauran.
+  const bindQ = (id, campo) => {
+    const el = document.getElementById(id);
+    el.addEventListener('input', e => {
+      FILTRO[campo] = e.target.value;
+      FOCO = { id, pos: e.target.selectionStart };
+      render();
+    });
+  };
+  bindQ('c-q-ops', 'qOps');
+  bindQ('c-q-movs', 'qMovs');
+  if (FOCO) {
+    const el = document.getElementById(FOCO.id);
+    if (el) { el.focus(); try { el.setSelectionRange(FOCO.pos, FOCO.pos); } catch (_) {} }
+    FOCO = null;
+  }
+  document.querySelectorAll('.pill').forEach(p => p.addEventListener('click', () => { FILTRO.estado = p.dataset.estado; render(); }));
+  document.querySelectorAll('.cc-ck-op').forEach(ck => ck.addEventListener('change', () => {
+    ck.checked ? SEL_OPS.add(ck.dataset.key) : SEL_OPS.delete(ck.dataset.key); render();
+  }));
+  document.querySelectorAll('.cc-ck-mov').forEach(ck => ck.addEventListener('change', () => {
+    const id = Number(ck.dataset.id);
+    ck.checked ? SEL_MOVS.add(id) : SEL_MOVS.delete(id); render();
+  }));
+  document.querySelectorAll('.cc-x').forEach(b => b.addEventListener('click', e => {
+    e.preventDefault(); e.stopPropagation(); desvincular(b.dataset.unlink);
+  }));
+  const clear = document.getElementById('cc-clear');
+  if (clear) clear.addEventListener('click', () => { SEL_OPS.clear(); SEL_MOVS.clear(); render(); });
+  const go = document.getElementById('cc-go');
+  if (go) go.addEventListener('click', () => conciliarSeleccion(opsSel, movsSel, dif));
 }
 
-async function transfInterna(movimiento_a, movimiento_b) {
-  window.toast('Emparejando…');
-  try {
-    const r = await fetch('/transferencia-interna', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(movimiento_b ? { movimiento_a, movimiento_b } : { movimiento_a })
-    });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
-    window.toast('Transferencia interna conciliada');
-    await loadConciliacion();
-  } catch (e) {
-    window.toast('Error: ' + e.message, 'error');
-  }
-}
+// ── Escritura ──────────────────────────────────────────────────────────
+// Asignación greedy: cada movimiento se reparte entre las operaciones marcadas
+// hasta agotarse. Se imputa siempre min(saldoMov, saldoOp), así ninguna de las
+// dos puntas queda sobre-imputada. Lo que sobra queda parcial, a propósito.
+async function conciliarSeleccion(opsSel, movsSel, dif) {
+  if (!opsSel.length || !movsSel.length) return;
 
-async function vincular(movimiento_id, op_tipo, op_id, monto) {
-  window.toast('Vinculando…');
-  try {
-    const r = await fetch('/vincular', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ movimiento_id, op_tipo, op_id, monto })
-    });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
-    window.toast('Vinculado');
-    await loadConciliacion();
-  } catch (e) {
-    window.toast('Error al vincular: ' + e.message, 'error');
+  const detalle = Math.abs(dif) <= 0.02
+    ? 'La diferencia cierra en cero.'
+    : (dif < 0
+        ? `Van a quedar ${fmt(-dif, 'ARS')} pendientes en la operación (pago parcial).`
+        : `Van a quedar ${fmt(dif, 'ARS')} sin asignar en el movimiento. Si esperabas que cerrara, puede faltar cargar una factura.`);
+  if (!confirm(`Conciliar ${opsSel.length} operación/es con ${movsSel.length} movimiento/s.\n\n${detalle}\n\n¿Confirmás?`)) return;
+
+  const rest = new Map(opsSel.map(o => [o.key, o.saldo]));
+  const plan = [];
+  for (const m of movsSel) {
+    let disp = saldoMov(m);
+    for (const o of opsSel) {
+      if (disp <= 0.02) break;
+      const r = rest.get(o.key);
+      if (!(r > 0.02)) continue;
+      const imp = round2(Math.min(disp, r));
+      plan.push({ movimiento_id: m.id, op_tipo: o.op_tipo, op_id: o.op_id, monto: imp });
+      rest.set(o.key, round2(r - imp));
+      disp = round2(disp - imp);
+    }
   }
+  if (!plan.length) return;
+
+  window.toast(`Conciliando ${plan.length} vínculo/s…`);
+  const errores = [];
+  for (const v of plan) {
+    try {
+      const r = await fetch('/vincular', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(v)
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+    } catch (e) { errores.push(`${v.op_tipo} #${v.op_id}: ${e.message}`); }
+  }
+  if (errores.length) {
+    window.toast(`Se conciliaron ${plan.length - errores.length} de ${plan.length}. Errores: ${errores[0]}`, 'error');
+  } else {
+    window.toast(`Conciliado · ${plan.length} vínculo/s`);
+  }
+  await loadConciliacion();
 }
 
 async function desvincular(id) {
@@ -555,59 +431,46 @@ async function desvincular(id) {
 function inyectarEstilo() {
   if (document.getElementById('con-style')) return;
   const css = `
-    .con-mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums}
-    .con-pos{color:#15803D}
-    .con-neg{color:#B91C1C}
-    .con-cat{font-size:12px;color:#57534E;background:#F5F5F4;padding:2px 8px;border-radius:6px}
-    .con-badge{font-size:12px;padding:2px 8px;border-radius:6px}
-    .con-badge-pendiente{background:#FAEEDA;color:#854F0B}
-    .con-badge-parcial{background:#E6F1FB;color:#0C447C}
-    .con-badge-conciliado{background:#E1F5EE;color:#0F6E56}
-    .con-badge-auto{background:#F1EFE8;color:#5F5E5A}
-    .con-acts{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-    .con-mini{padding:5px 11px;font-size:13px}
-    .con-spark-btn{border:1px solid #0F6E56;background:#E1F5EE;color:#0F6E56;border-radius:6px;cursor:pointer;font-size:14px;padding:3px 8px;line-height:1}
-    .con-spark-btn:hover{background:#0F6E56;color:#fff}
-    .con-wait{font-size:12px;color:#857a5c;background:#FAF6EC;border:1px dashed #E3D9BE;border-radius:6px;padding:2px 8px}
-    .con-ok{color:#0F6E56;font-weight:600}
-    .con-dash{color:#A8A29E}
-    .con-chip{font-size:12px;background:#F1EFE8;color:#44403C;border-radius:6px;padding:3px 8px;display:inline-flex;align-items:center;gap:6px;margin:0 4px 4px 0}
-    .con-x{border:0;background:transparent;color:#A8A29E;cursor:pointer;font-size:13px;line-height:1;padding:0}
-    .con-x:hover{color:#B91C1C}
-    .con-sub{font-size:13px;color:#78716C;margin:-4px 0 12px}
-    .con-pick{display:flex;flex-direction:column;gap:6px;max-height:340px;overflow:auto}
-    .con-pick-row{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 10px;border:1px solid #E7E5E4;border-radius:8px}
-    .con-pick-row.exacto{border-color:#0F6E56;background:#E1F5EE}
-    .con-pick-lbl{font-size:13px;font-weight:500}
-    .con-pick-sub{font-size:12px;color:#78716C;margin-top:2px}
-    .con-tag{font-size:11px;color:#0F6E56;background:#fff;border:1px solid #0F6E56;border-radius:6px;padding:0 6px;font-weight:400;margin-left:4px}
-    .con-bar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:12px 0 6px}
-    .con-count{font-size:13px;color:#78716C}
-    .con-clear{border:1px solid #E7E5E4;background:#fff;color:#57534E;border-radius:6px;cursor:pointer;font-size:12px;padding:5px 11px}
-    .con-clear:hover{border-color:#B91C1C;color:#B91C1C}
-    .con-filtros th{padding:4px 6px;background:#FAFAF9;border-top:1px solid #E7E5E4}
-    .con-filtros .cf{width:100%;box-sizing:border-box;font-size:12px;padding:4px 6px;border:1px solid #E7E5E4;border-radius:6px;background:#fff;font-family:inherit;color:#1C1917}
-    .con-filtros .cf:focus{outline:none;border-color:#0F6E56;box-shadow:0 0 0 2px rgba(15,110,86,.13)}
-    .con-filtros .vf{width:100%;box-sizing:border-box;font-size:12px;padding:4px 6px;border:1px solid #E7E5E4;border-radius:6px;background:#fff;font-family:inherit;color:#1C1917}
-    .con-filtros .vf:focus{outline:none;border-color:#0F6E56;box-shadow:0 0 0 2px rgba(15,110,86,.13)}
-    .con-top{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-    .con-mesctl{display:flex;align-items:center;gap:8px}
-    .con-lbl{font-size:12px;color:#78716C}
-    .con-views{display:inline-flex;border:1px solid #E7E5E4;border-radius:8px;overflow:hidden}
-    .con-views button{border:0;background:#fff;color:#57534E;font-size:13px;padding:7px 13px;cursor:pointer;font-family:inherit;border-right:1px solid #E7E5E4}
-    .con-views button:last-child{border-right:0}
-    .con-views button.active{background:#0F6E56;color:#fff}
-    .con-panels{margin-top:4px}
-    .con-dual{display:flex;gap:16px;align-items:flex-start}
-    .con-dual > .con-panel{flex:1;min-width:0}
-    .con-panel-title{font-size:14px;font-weight:600;color:#1C1917;margin:0 0 8px}
-    .con-vchip{font-size:12px;padding:2px 8px;border-radius:6px;white-space:nowrap}
-    .con-vchip-conciliada{background:#E1F5EE;color:#0F6E56}
-    .con-vchip-parcial{background:#E6F1FB;color:#0C447C}
-    .con-vchip-sincobro{background:#FAEEDA;color:#854F0B}
-    .con-vchip-cancelada{background:#F3E7E7;color:#9B5151}
-    .con-vdev{font-size:11px;background:#F1EFE8;color:#9A3412;border-radius:6px;padding:1px 6px;margin-left:6px}
-    @media(max-width:1100px){.con-dual{flex-direction:column}.con-dual > .con-panel{width:100%}}
+    .cc-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px;padding-bottom:80px}
+    .cc-col{border:1px solid #E7E5E4;border-radius:10px;overflow:hidden;background:#fff}
+    .cc-head{display:flex;align-items:center;gap:10px;padding:9px 12px;background:#FAFAF9;border-bottom:1px solid #E7E5E4;font-size:13px;font-weight:600;color:#44403C}
+    .cc-head i{font-style:normal;color:#A8A29E;font-weight:400}
+    .cc-q{margin-left:auto;max-width:190px;padding:5px 9px;font-size:13px}
+    .cc-list{max-height:520px;overflow:auto}
+    .cc-row{display:flex;align-items:flex-start;gap:9px;padding:8px 12px;border-bottom:1px solid #F5F5F4;cursor:pointer;font-size:13px}
+    .cc-row:hover{background:#FAFAF9}
+    .cc-row.is-sel{background:#E1F5EE}
+    .cc-row.is-sug{background:#FEFCE8}
+    .cc-row.is-espera{opacity:.55;cursor:default}
+    .cc-ck{margin-top:3px;flex:none}
+    .cc-main{flex:1;min-width:0}
+    .cc-t{display:block;color:#1C1917;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .cc-s{display:block;font-size:11.5px;color:#A8A29E;margin-top:2px}
+    .cc-why{color:#0F6E56;font-weight:600}
+    .cc-esp{color:#854F0B;font-weight:600}
+    .cc-m{flex:none;font-variant-numeric:tabular-nums;font-size:13px;color:#44403C;text-align:right}
+    .cc-neg{color:#B91C1C}
+    .cc-pos{color:#15803D}
+    .cc-tag{font-size:10px;text-transform:uppercase;letter-spacing:.03em;padding:1px 6px;border-radius:5px;margin-left:4px;vertical-align:1px}
+    .cc-tag-compra{background:#E6F1FB;color:#0C447C}
+    .cc-tag-gasto{background:#F1EFE8;color:#57534E}
+    .cc-tag-cheque{background:#FAEEDA;color:#854F0B}
+    .cc-chip{display:inline-block;background:#F1EFE8;color:#57534E;border-radius:5px;padding:0 6px;font-size:11px;margin-left:3px}
+    .cc-x{cursor:pointer;color:#A8A29E;margin-left:2px}
+    .cc-x:hover{color:#B91C1C}
+    .cc-bar{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:40;
+            display:flex;align-items:center;justify-content:space-between;gap:14px;
+            padding:11px 16px;border-radius:10px;border:1px solid #E7E5E4;background:#fff;
+            box-shadow:0 4px 20px rgba(0,0,0,.14);width:min(1100px,calc(100% - 48px))}
+    .cc-bar-l{display:flex;gap:18px;font-size:13px;color:#57534E;flex-wrap:wrap}
+    .cc-bar-l b{color:#1C1917;font-variant-numeric:tabular-nums}
+    .cc-bar-l i{font-style:normal;color:#A8A29E}
+    .cc-bar-r{display:flex;gap:8px;flex:none}
+    .cc-bar-dif{font-weight:600}
+    .cc-bar-ok .cc-bar-dif{color:#0F6E56}
+    .cc-bar-warn .cc-bar-dif{color:#854F0B}
+    .cc-bar-wait .cc-bar-dif{color:#A8A29E}
+    @media (max-width:900px){.cc-grid{grid-template-columns:1fr}.cc-bar{width:calc(100% - 24px);flex-wrap:wrap}}
   `;
   const style = document.createElement('style');
   style.id = 'con-style';
