@@ -36,6 +36,17 @@ let VENTA_LINEA = {};      // ventas_ml.id -> linea_negocio_id (línea heredada)
 let GASTO_LINEA = {};      // gasto id -> linea_id
 let COMPRA_LINEA = {};     // compra_id -> linea_id
 
+// ── Cheques (pestaña) ──────────────────────────────────────────────────
+// Los cheques NO se mezclan en la lista del extracto: van en pestaña aparte.
+// Si un cheque emitido apareciera como movimiento, la misma plata se vería dos
+// veces (al emitirlo y al debitarse). Emitir no mueve plata: cambia el acreedor.
+let TAB = 'extracto';      // 'extracto' | 'cheques'
+let CHEQUES = [];          // v_cheques
+let CHQ_IMPUT = {};        // cheque_id -> [{op_tipo, op_id, monto}]
+let AP_COMPRAS = [];       // compras con saldo, para imputar
+let PROVEEDORES = [];      // catálogo
+let COMPRA_INFO = {};      // compra_id -> {nro_factura, proveedor_id}
+
 // Etiqueta linda por código de cuenta (fallback al código si no está mapeado)
 const LABEL_CUENTA = {
   supervielle_ars: 'Supervielle ARS',
@@ -229,8 +240,18 @@ export async function loadMovimientos() {
     // Líneas heredadas de gastos / compras (para mostrarlas bloqueadas).
     const gastos = await sbGet('v_gastos_ap', 'select=id,linea_id').catch(() => []);
     GASTO_LINEA = Object.fromEntries(gastos.map(g => [g.id, g.linea_id]));
-    const compras = await sbGet('v_compras_ap', 'select=compra_id,linea_id').catch(() => []);
+    const compras = await sbGet('v_compras_ap', 'select=compra_id,linea_id,nro_factura,proveedor_id').catch(() => []);
     COMPRA_LINEA = Object.fromEntries(compras.map(c => [c.compra_id, c.linea_id]));
+    // Etiquetas de TODAS las compras (no solo las que tienen saldo): una factura
+    // ya cancelada por cheque sale del AP pendiente pero el chip la sigue nombrando.
+    COMPRA_INFO = Object.fromEntries(compras.map(c => [c.compra_id, c]));
+    // Cheques: pestaña propia. Tolerante a que las tablas todavía no existan.
+    CHEQUES = await sbGet('v_cheques', 'order=fecha_pago.asc,id.asc').catch(() => []);
+    const imps = await sbGet('cheque_imputaciones', 'order=id.asc').catch(() => []);
+    CHQ_IMPUT = {};
+    for (const i of imps) (CHQ_IMPUT[i.cheque_id] = CHQ_IMPUT[i.cheque_id] || []).push(i);
+    AP_COMPRAS = await sbGet('v_compras_ap', 'saldo_ap_ars=gt.0.02&order=fecha.desc,compra_id.desc').catch(() => []);
+    PROVEEDORES = await sbGet('proveedores', 'order=nombre.asc').catch(() => []);
   } catch (e) {
     root.innerHTML = `<div class="error">No se pudieron cargar los movimientos: ${e.message}</div>`;
     return;
@@ -243,7 +264,20 @@ export async function loadMovimientos() {
   render();
 }
 
+function tabsHTML() {
+  const t = (id, label, n) => `<button class="mov-tab ${TAB === id ? 'is-on' : ''}" data-tab="${id}">${label}${n != null ? ` <span class="mov-tab-n">${n}</span>` : ''}</button>`;
+  const aVencer = CHEQUES.filter(c => c.estado === 'emitido').length;
+  return `<div class="mov-tabs">${t('extracto', 'Extracto')}${t('cheques', 'Cheques', aVencer)}</div>`;
+}
+
+function bindTabs() {
+  document.querySelectorAll('.mov-tab').forEach(b => {
+    b.addEventListener('click', () => { TAB = b.dataset.tab; render(); });
+  });
+}
+
 function render() {
+  if (TAB === 'cheques') return renderCheques();
   const root = document.getElementById('app-screens');
 
   // Base: respeta MES (extracto) + cuenta + búsqueda (NO el estado, que es la pill)
@@ -296,6 +330,7 @@ function render() {
     : '<option value="">—</option>';
 
   root.innerHTML = `
+    ${tabsHTML()}
     <div class="toolbar">
       <select class="select" id="f-mes" style="width:auto;text-transform:capitalize">${opcionesMes}</select>
       <select class="select" id="f-cuenta" style="width:auto">${opcionesCuenta}</select>
@@ -334,6 +369,7 @@ function render() {
   `;
 
   // Bindings
+  bindTabs();
   document.getElementById('f-mes').addEventListener('change', e => { MES = e.target.value; FILTRO.estado = ''; render(); });
   document.getElementById('f-cuenta').addEventListener('change', e => { FILTRO.cuenta = e.target.value; render(); });
   document.getElementById('f-q').addEventListener('input', e => { FILTRO.q = e.target.value; render(); });
@@ -833,6 +869,299 @@ async function importarExtracto(file, source) {
   }
 }
 
+// ── Pestaña Cheques ────────────────────────────────────────────────────
+// Un cheque entregado cancela la deuda con el proveedor aunque la plata todavía
+// no haya salido. Por eso `v_compras_ap.en_cheque_ars` descuenta del saldo AP y
+// el débito real aparece recién en el extracto, vinculado con op_tipo='cheque'.
+
+const ESTADO_CHQ = {
+  emitido:   { label: 'A vencer',  clase: 'chq-emitido' },
+  debitado:  { label: 'Debitado',  clase: 'chq-debitado' },
+  rechazado: { label: 'Rechazado', clase: 'chq-rechazado' },
+  anulado:   { label: 'Anulado',   clase: 'chq-anulado' }
+};
+
+function fmtFecha(f) {
+  if (!f) return '—';
+  const [y, m, d] = String(f).slice(0, 10).split('-');
+  return `${d}/${m}/${y}`;
+}
+
+function diasPara(f) {
+  const hoy = new Date(hoyISO() + 'T00:00:00');
+  const v = new Date(String(f).slice(0, 10) + 'T00:00:00');
+  return Math.round((v - hoy) / 86400000);
+}
+
+function compraLabel(c) {
+  const prov = PROVEEDORES.find(p => p.id === c.proveedor_id);
+  return `${prov ? prov.nombre : 'Sin proveedor'} · ${c.nro_factura || ('Compra #' + c.compra_id)}`;
+}
+
+function renderCheques() {
+  const root = document.getElementById('app-screens');
+  const emitidos = CHEQUES.filter(c => c.tipo === 'emitido');
+
+  const aVencer   = emitidos.filter(c => c.estado === 'emitido');
+  const totalVenc = aVencer.reduce((a, c) => a + Number(c.monto || 0), 0);
+  const sinImput  = emitidos.reduce((a, c) => a + Number(c.sin_imputar || 0), 0);
+  const vencidos  = aVencer.filter(c => diasPara(c.fecha_pago) < 0);
+
+  // Próximos vencimientos agrupados por fecha: la base del flujo de fondos.
+  const porFecha = {};
+  for (const c of aVencer) porFecha[c.fecha_pago] = (porFecha[c.fecha_pago] || 0) + Number(c.monto || 0);
+  const fechas = Object.keys(porFecha).sort();
+
+  const filas = emitidos.map(c => {
+    const est = ESTADO_CHQ[c.estado] || { label: c.estado, clase: '' };
+    const dias = diasPara(c.fecha_pago);
+    const alerta = c.estado === 'emitido' && dias < 0;
+    const imps = CHQ_IMPUT[c.id] || [];
+    const detalle = imps.length
+      ? imps.map(i => {
+          const co = COMPRA_INFO[i.op_id];
+          const txt = i.op_tipo === 'compra'
+            ? (co && co.nro_factura ? co.nro_factura : 'Compra #' + i.op_id)
+            : 'Gasto #' + i.op_id;
+          return `<span class="chq-chip">${esc(txt)}</span>`;
+        }).join(' ')
+      : `<span class="chq-chip chq-chip-warn">sin imputar</span>`;
+    return `<tr${alerta ? ' class="chq-alerta"' : ''}>
+      <td>${esc(c.numero)}</td>
+      <td>${esc(c.contraparte || '—')}</td>
+      <td>${fmtFecha(c.fecha_emision)}</td>
+      <td>${fmtFecha(c.fecha_pago)}${c.estado === 'emitido' ? `<div class="chq-dias">${dias < 0 ? `venció hace ${-dias} d` : `en ${dias} d`}</div>` : ''}</td>
+      <td style="text-align:right">${fmtMonto(Number(c.monto), c.moneda)}</td>
+      <td>${detalle}</td>
+      <td><span class="chq-badge ${est.clase}">${est.label}</span></td>
+      <td><button class="btn-icon chq-del" data-id="${c.id}" title="Eliminar">✕</button></td>
+    </tr>`;
+  }).join('');
+
+  root.innerHTML = `
+    ${tabsHTML()}
+    <div class="toolbar">
+      <div class="grow"></div>
+      <button class="btn btn-primary" id="btn-nuevo-cheque">+ Cheque emitido</button>
+    </div>
+
+    <div class="kpi-grid" style="margin:14px 0">
+      <div class="kpi"><div class="kpi-label">A vencer</div><div class="kpi-value">${aVencer.length}</div></div>
+      <div class="kpi"><div class="kpi-label">Total a pagar</div><div class="kpi-value">${fmtMonto(totalVenc, 'ARS')}</div></div>
+      <div class="kpi"><div class="kpi-label">Sin imputar</div><div class="kpi-value">${fmtMonto(sinImput, 'ARS')}</div></div>
+      <div class="kpi"><div class="kpi-label">Vencidos sin debitar</div><div class="kpi-value">${vencidos.length}</div></div>
+    </div>
+
+    ${fechas.length ? `<div class="chq-flujo">
+      <div class="chq-flujo-t">Próximos vencimientos</div>
+      ${fechas.map(f => `<div class="chq-flujo-r"><span>${fmtFecha(f)}</span><b>${fmtMonto(porFecha[f], 'ARS')}</b></div>`).join('')}
+    </div>` : ''}
+
+    ${emitidos.length === 0
+      ? `<div class="empty">Todavía no cargaste cheques. Se cargan los que tengan fecha de pago desde el 1/7/2026.</div>`
+      : `<div class="table-wrap"><table class="t">
+          <thead><tr>
+            <th style="width:90px">N°</th>
+            <th>Beneficiario</th>
+            <th style="width:96px">Emisión</th>
+            <th style="width:120px">Pago</th>
+            <th style="width:150px;text-align:right">Monto</th>
+            <th style="width:220px">Imputado a</th>
+            <th style="width:104px">Estado</th>
+            <th style="width:44px"></th>
+          </tr></thead>
+          <tbody>${filas}</tbody>
+        </table></div>`}
+  `;
+
+  bindTabs();
+  document.getElementById('btn-nuevo-cheque').addEventListener('click', openModalCheque);
+  document.querySelectorAll('.chq-del').forEach(b => b.addEventListener('click', () => borrarCheque(b.dataset.id)));
+}
+
+function openModalCheque() {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  const optsProv = '<option value="">Elegí el beneficiario…</option>'
+    + PROVEEDORES.map(p => `<option value="${p.id}">${esc(p.nombre)}</option>`).join('');
+  const cuentaSup = CUENTAS.find(c => c.codigo === 'supervielle_ars');
+
+  overlay.innerHTML = `
+    <div class="modal">
+      <div class="card-title">Nuevo cheque emitido</div>
+
+      <div class="chq-2col">
+        <div class="field"><label>N° de echeq</label>
+          <input class="input" id="chq-num" type="text" placeholder="00000037">
+        </div>
+        <div class="field"><label>Importe</label>
+          <input class="input" id="chq-monto" type="number" step="0.01" placeholder="0.00">
+        </div>
+      </div>
+
+      <div class="chq-2col">
+        <div class="field"><label>Fecha de emisión</label>
+          <input class="input" id="chq-fe" type="date" value="${hoyISO()}">
+        </div>
+        <div class="field"><label>Fecha de pago</label>
+          <input class="input" id="chq-fp" type="date">
+        </div>
+      </div>
+
+      <div class="field"><label>Beneficiario</label>
+        <select class="select" id="chq-prov">${optsProv}</select>
+      </div>
+
+      <div class="chq-2col">
+        <div class="field"><label>CMC7 <span class="chq-hint">opcional</span></label>
+          <input class="input" id="chq-cmc7" type="text">
+        </div>
+        <div class="field"><label>ID Coelsa <span class="chq-hint">opcional</span></label>
+          <input class="input" id="chq-coelsa" type="text">
+        </div>
+      </div>
+
+      <div class="field"><label>Motivo <span class="chq-hint">como figura en el echeq</span></label>
+        <input class="input" id="chq-motivo" type="text" placeholder="FA NRO 000500268567">
+      </div>
+
+      <div class="chq-imp-box">
+        <div class="chq-imp-t">Imputar a facturas pendientes</div>
+        <div id="chq-imp-list"><div class="chq-hint">Elegí primero el beneficiario.</div></div>
+        <div class="chq-imp-tot" id="chq-imp-tot"></div>
+      </div>
+
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="chq-cancel">Cancelar</button>
+        <button class="btn btn-primary" id="chq-save">Guardar</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  const close = () => overlay.remove();
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  overlay.querySelector('#chq-cancel').addEventListener('click', close);
+
+  const $ = id => overlay.querySelector('#' + id);
+
+  // Las facturas del proveedor, ordenadas por cercanía al monto del cheque:
+  // el caso normal (el cheque paga una factura entera) queda primero.
+  function pintarFacturas() {
+    const provId = Number($('chq-prov').value) || 0;
+    const monto = Number($('chq-monto').value) || 0;
+    const lista = $('chq-imp-list');
+    if (!provId) { lista.innerHTML = `<div class="chq-hint">Elegí primero el beneficiario.</div>`; totalizar(); return; }
+    const facturas = AP_COMPRAS
+      .filter(c => c.proveedor_id === provId)
+      .sort((a, b) => Math.abs(Number(a.saldo_ap_ars) - monto) - Math.abs(Number(b.saldo_ap_ars) - monto));
+    if (!facturas.length) {
+      lista.innerHTML = `<div class="chq-hint">Este proveedor no tiene facturas con saldo. El cheque queda sin imputar (anticipo) y lo aplicás cuando cargues la factura.</div>`;
+      totalizar(); return;
+    }
+    lista.innerHTML = facturas.map(c => {
+      const saldo = Number(c.saldo_ap_ars);
+      const exacto = monto > 0 && Math.abs(saldo - monto) <= 0.02;
+      return `<label class="chq-imp-row${exacto ? ' is-sug' : ''}">
+        <input type="checkbox" class="chq-imp-ck" data-id="${c.compra_id}" data-saldo="${saldo}" ${exacto ? 'checked' : ''}>
+        <span class="chq-imp-lbl">${esc(compraLabel(c))}${exacto ? ' <b class="chq-sug">monto exacto</b>' : ''}</span>
+        <span class="chq-imp-monto">${fmtMonto(saldo, 'ARS')}</span>
+      </label>`;
+    }).join('');
+    lista.querySelectorAll('.chq-imp-ck').forEach(ck => ck.addEventListener('change', totalizar));
+    totalizar();
+  }
+
+  function seleccion() {
+    return [...overlay.querySelectorAll('.chq-imp-ck:checked')]
+      .map(ck => ({ op_tipo: 'compra', op_id: Number(ck.dataset.id), monto: Number(ck.dataset.saldo) }));
+  }
+
+  // Si lo imputado supera el cheque, se recorta el último renglón: nunca se
+  // imputa más de lo que el cheque cancela.
+  function totalizar() {
+    const monto = Number($('chq-monto').value) || 0;
+    const sel = seleccion();
+    const suma = sel.reduce((a, x) => a + x.monto, 0);
+    const dif = Math.round((monto - suma) * 100) / 100;
+    const box = $('chq-imp-tot');
+    if (!sel.length) { box.innerHTML = monto > 0 ? `<span class="chq-dif-warn">Sin imputar: ${fmtMonto(monto, 'ARS')}</span>` : ''; return; }
+    if (Math.abs(dif) <= 0.02) box.innerHTML = `<span class="chq-dif-ok">Cierra exacto ✓</span>`;
+    else if (dif > 0) box.innerHTML = `<span class="chq-dif-warn">Queda sin imputar ${fmtMonto(dif, 'ARS')}</span>`;
+    else box.innerHTML = `<span class="chq-dif-bad">Lo imputado supera el cheque en ${fmtMonto(-dif, 'ARS')} — se va a recortar</span>`;
+  }
+
+  $('chq-prov').addEventListener('change', pintarFacturas);
+  $('chq-monto').addEventListener('input', pintarFacturas);
+
+  $('chq-save').addEventListener('click', async () => {
+    const numero = $('chq-num').value.trim();
+    const monto = Number($('chq-monto').value) || 0;
+    const fe = $('chq-fe').value, fp = $('chq-fp').value;
+    if (!numero)   return window.toast('Falta el N° de echeq', 'error');
+    if (!(monto > 0)) return window.toast('El importe debe ser mayor a 0', 'error');
+    if (!fe || !fp) return window.toast('Faltan las fechas', 'error');
+    if (fp < fe)   return window.toast('La fecha de pago no puede ser anterior a la de emisión', 'error');
+
+    const prov = PROVEEDORES.find(p => p.id === Number($('chq-prov').value));
+
+    // Recorte: la suma imputada nunca supera el monto del cheque.
+    let restante = monto;
+    const imps = [];
+    for (const s of seleccion()) {
+      if (restante <= 0.02) break;
+      imps.push({ ...s, monto: Math.min(s.monto, restante) });
+      restante = Math.round((restante - Math.min(s.monto, restante)) * 100) / 100;
+    }
+
+    try {
+      const r = await fetch('/cheques', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cheque: {
+            tipo: 'emitido', numero, monto,
+            fecha_emision: fe, fecha_pago: fp,
+            moneda: 'ARS',
+            cmc7: $('chq-cmc7').value.trim() || null,
+            id_coelsa: $('chq-coelsa').value.trim() || null,
+            proveedor_id: prov ? prov.id : null,
+            contraparte_nombre: prov ? prov.nombre : null,
+            contraparte_cuit: prov ? prov.cuit : null,
+            cuenta_id: cuentaSup ? cuentaSup.id : null,
+            motivo: $('chq-motivo').value.trim() || null
+          },
+          imputaciones: imps
+        })
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+      close();
+      window.toast(data.sin_imputar > 0.02
+        ? `Cheque guardado · sin imputar ${fmtMonto(data.sin_imputar, 'ARS')}`
+        : 'Cheque guardado');
+      await loadMovimientos();
+    } catch (e) {
+      window.toast('Error al guardar: ' + e.message, 'error');
+    }
+  });
+}
+
+async function borrarCheque(id) {
+  const c = CHEQUES.find(x => String(x.id) === String(id));
+  if (!c) return;
+  if (!confirm(`¿Eliminar el cheque N° ${c.numero} por ${fmtMonto(Number(c.monto), c.moneda)}?\n\nSe borran también sus imputaciones y la deuda con el proveedor vuelve a quedar abierta.`)) return;
+  try {
+    const r = await fetch('/cheques/' + id, { method: 'DELETE' });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+    window.toast('Cheque eliminado');
+    await loadMovimientos();
+  } catch (e) {
+    window.toast('No se pudo eliminar: ' + e.message, 'error');
+  }
+}
+
 // ── Utilidades ─────────────────────────────────────────────────────────
 function esc(s) {
   return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -884,6 +1213,45 @@ function inyectarEstilo() {
     .imp-src-fmt{font-size:12px;color:#57534E;line-height:1.5;margin-bottom:8px}
     .imp-note{font-size:12px;color:#854F0B;background:#FAEEDA;border-radius:6px;padding:6px 8px;margin-bottom:8px}
     .imp-pick{font-size:13px}
+
+    /* ── Pestañas + cheques ── */
+    .mov-tabs{display:flex;gap:4px;border-bottom:1px solid #E7E5E4;margin-bottom:14px}
+    .mov-tab{background:transparent;border:0;border-bottom:2px solid transparent;padding:9px 16px;cursor:pointer;font:inherit;font-size:14px;color:#78716C;margin-bottom:-1px}
+    .mov-tab:hover{color:#44403C}
+    .mov-tab.is-on{color:#0F6E56;border-bottom-color:#0F6E56;font-weight:600}
+    .mov-tab-n{background:#F1EFE8;color:#57534E;border-radius:10px;padding:1px 7px;font-size:12px;margin-left:2px}
+    .mov-tab.is-on .mov-tab-n{background:#E1F5EE;color:#0F6E56}
+
+    .chq-badge{display:inline-block;padding:2px 9px;border-radius:10px;font-size:12px;font-weight:500}
+    .chq-emitido{background:#FAEEDA;color:#854F0B}
+    .chq-debitado{background:#E1F5EE;color:#0F6E56}
+    .chq-rechazado{background:#FEE2E2;color:#B91C1C}
+    .chq-anulado{background:#F1EFE8;color:#78716C}
+    .chq-dias{font-size:11px;color:#A8A29E}
+    .chq-alerta{background:#FEF6F6}
+    .chq-alerta .chq-dias{color:#B91C1C;font-weight:600}
+    .chq-chip{display:inline-block;background:#F5F5F4;color:#57534E;border-radius:6px;padding:1px 7px;font-size:12px;margin:1px 2px 1px 0}
+    .chq-chip-warn{background:#FAEEDA;color:#854F0B}
+    .chq-flujo{margin:0 0 14px;padding:10px 12px;background:#FAFAF9;border:1px solid #E7E5E4;border-radius:8px}
+    .chq-flujo-t{font-size:12px;color:#78716C;margin-bottom:6px}
+    .chq-flujo-r{display:flex;justify-content:space-between;gap:10px;font-size:13px;padding:2px 0}
+
+    .chq-imp-box{margin-top:14px;border:1px solid #E7E5E4;border-radius:10px;padding:12px 14px}
+    .chq-imp-t{font-weight:600;font-size:14px;margin-bottom:8px}
+    .chq-imp-row{display:flex;align-items:center;gap:9px;padding:6px 8px;border-radius:6px;cursor:pointer;font-size:13px}
+    .chq-imp-row:hover{background:#FAFAF9}
+    .chq-imp-row.is-sug{background:#E1F5EE}
+    .chq-imp-lbl{flex:1}
+    .chq-imp-monto{font-variant-numeric:tabular-nums;color:#57534E}
+    .chq-sug{color:#0F6E56;font-size:11px;font-weight:600}
+    .chq-imp-tot{margin-top:8px;font-size:13px;text-align:right}
+    .chq-dif-ok{color:#0F6E56;font-weight:600}
+    .chq-dif-warn{color:#854F0B}
+    .chq-dif-bad{color:#B91C1C;font-weight:600}
+    .chq-hint{font-size:12px;color:#A8A29E;font-weight:400}
+    .chq-2col{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
+    .btn-icon{border:0;background:transparent;color:#A8A29E;cursor:pointer;font-size:15px;padding:2px 7px;border-radius:6px;line-height:1}
+    .btn-icon:hover{background:#FEE2E2;color:#B91C1C}
   `;
   const style = document.createElement('style');
   style.id = 'mov-style';
