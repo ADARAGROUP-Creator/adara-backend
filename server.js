@@ -4001,6 +4001,90 @@ app.delete('/adjuntos/:id', async (req, res) => {
 // tabla nueva `movimientos` (capa 4), auto-clasifica el ruido (impuestos,
 // comisiones, intereses, FCI) y verifica la continuidad del saldo.
 //
+// ── Cheques (echeq) ────────────────────────────────────────────────────
+// Alta ATÓMICA (A16): el cheque y sus imputaciones a facturas entran juntos.
+// Emitir un cheque NO genera movimiento: cambia el acreedor. El movimiento nace
+// cuando el banco lo debita y se vincula con op_tipo='cheque'.
+app.post('/cheques', async (req, res) => {
+  const round2 = n => Math.round((Number(n) || 0) * 100) / 100;
+  let chequeId = null;
+  try {
+    const { cheque, imputaciones } = req.body || {};
+    if (!cheque) return res.status(400).json({ error: 'Falta el objeto cheque' });
+
+    for (const f of ['numero', 'monto', 'fecha_emision', 'fecha_pago']) {
+      if (cheque[f] === undefined || cheque[f] === null || cheque[f] === '') {
+        return res.status(400).json({ error: `Falta ${f}` });
+      }
+    }
+    const monto = round2(cheque.monto);
+    if (!(monto > 0)) return res.status(400).json({ error: 'El monto debe ser mayor a 0' });
+    if (String(cheque.fecha_pago) < String(cheque.fecha_emision)) {
+      return res.status(400).json({ error: 'La fecha de pago no puede ser anterior a la de emisión' });
+    }
+
+    // Las imputaciones nunca pueden superar el monto del cheque.
+    const imps = (Array.isArray(imputaciones) ? imputaciones : [])
+      .filter(x => x && x.op_id != null && Number(x.monto) > 0)
+      .map(x => ({ op_tipo: x.op_tipo === 'gasto' ? 'gasto' : 'compra', op_id: Number(x.op_id), monto: round2(x.monto) }));
+    const sumaImp = round2(imps.reduce((a, x) => a + x.monto, 0));
+    if (sumaImp - monto > 0.02) {
+      return res.status(400).json({ error: `Las imputaciones ($${sumaImp}) superan el monto del cheque ($${monto})` });
+    }
+
+    const fila = {
+      tipo: cheque.tipo === 'recibido' ? 'recibido' : 'emitido',
+      numero: String(cheque.numero).trim(),
+      cmc7: cheque.cmc7 ? String(cheque.cmc7).trim() : null,
+      id_coelsa: cheque.id_coelsa ? String(cheque.id_coelsa).trim() : null,
+      moneda: cheque.moneda || 'ARS',
+      monto,
+      fecha_emision: cheque.fecha_emision,
+      fecha_pago: cheque.fecha_pago,
+      estado: 'emitido',
+      proveedor_id: cheque.proveedor_id || null,
+      contraparte_nombre: cheque.contraparte_nombre || null,
+      contraparte_cuit: cheque.contraparte_cuit || null,
+      cuenta_id: cheque.cuenta_id || null,
+      motivo: cheque.motivo || null,
+      notas: cheque.notas || null
+    };
+
+    const creado = await sb('POST', 'cheques', fila);
+    chequeId = Array.isArray(creado) ? creado[0]?.id : creado?.id;
+    if (!chequeId) throw new Error('No se pudo crear el cheque');
+
+    if (imps.length) {
+      await sb('POST', 'cheque_imputaciones', imps.map(x => ({ ...x, cheque_id: chequeId })));
+    }
+
+    res.json({ ok: true, cheque_id: chequeId, imputaciones: imps.length, sin_imputar: round2(monto - sumaImp) });
+  } catch (e) {
+    // Rollback best-effort: si fallaron las imputaciones, el cheque no queda huérfano.
+    if (chequeId) { try { await sb('DELETE', 'cheques', null, `id=eq.${chequeId}`); } catch (_) {} }
+    console.error('POST /cheques:', e);
+    const dup = /duplicate key|23505/.test(e.message || '');
+    res.status(dup ? 409 : 500).json({ error: dup ? 'Ya existe un cheque con ese número o CMC7' : e.message });
+  }
+});
+
+// Borrado: solo si no tiene el débito ya conciliado (ahí hay que desvincular primero).
+app.delete('/cheques/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const vinc = await sbGet('vinculos', `op_tipo=eq.cheque&op_id=eq.${id}&select=id`);
+    if (vinc?.length) {
+      return res.status(409).json({ error: 'El cheque tiene un movimiento conciliado. Desvinculalo primero.' });
+    }
+    await sb('DELETE', 'cheque_imputaciones', null, `cheque_id=eq.${id}`);
+    await sb('DELETE', 'cheques', null, `id=eq.${id}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /cheques:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Identidad propia (CB15) ─────────────────────────────────────────────
 // Las transferencias entre cuentas propias (Supervielle ↔ Mercado Pago) NO son
 // cobro de venta ni pago a proveedor: son movimiento interno de fondos y se
