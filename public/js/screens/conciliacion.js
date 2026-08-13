@@ -24,10 +24,12 @@ let MOVS = [];              // v_movimientos_estado
 let COMPRAS = [], GASTOS = [], CHEQUES = [], PROVEEDORES = [];
 let PROV_BY_ID = {};
 let VINC_BY_MOV = {};       // movimiento_id -> [vinculos]
+let COMPLETITUD = [];       // v_completitud_mensual
 let MES = '';
 let FILTRO = { cuenta: '', estado: 'por_conciliar', qOps: '', qMovs: '' };
 let SEL_OPS = new Set();    // claves "tipo:id"
 let SEL_MOVS = new Set();   // ids de movimiento
+let EXPANDIDO = new Set();  // grupos desplegados
 let FOCO = null;            // input enfocado + cursor, para sobrevivir al re-render
 
 const MES_NOM = ['', 'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
@@ -162,6 +164,7 @@ export async function loadConciliacion() {
     CHEQUES = await sbGet('v_cheques', 'estado=eq.emitido&order=fecha_pago.asc,id.asc').catch(() => []);
     PROVEEDORES = await sbGet('proveedores', 'order=nombre.asc').catch(() => []);
     PROV_BY_ID = Object.fromEntries(PROVEEDORES.map(p => [p.id, p]));
+    COMPLETITUD = await sbGet('v_completitud_mensual', 'order=periodo.asc').catch(() => []);
     const vinc = await sbGet('vinculos', 'order=id.desc');
     VINC_BY_MOV = {};
     for (const v of vinc) (VINC_BY_MOV[v.movimiento_id] = VINC_BY_MOV[v.movimiento_id] || []).push(v);
@@ -179,6 +182,44 @@ export async function loadConciliacion() {
 function movsDelMes() {
   return MOVS.filter(m => (m.fecha || '').slice(0, 7) === MES
     && (!FILTRO.cuenta || String(m.cuenta_id) === FILTRO.cuenta));
+}
+
+// ── Agrupación: la fila es la OPERACIÓN, no la línea ───────────────────
+// Una transferencia de Supervielle viene con sus impuestos como lineas sueltas
+// (mismo timestamp), y un cobro de MP con su bonificación de envío y su
+// retención (mismo op_id). `grupo_key` en la base ya resuelve la clave por
+// origen. Seleccionar el grupo selecciona todas sus lineas: los impuestos
+// viajan con la operación que los generó y heredan su linea de negocio.
+function agrupar(movs) {
+  const map = new Map();
+  for (const m of movs) {
+    const k = m.grupo_key || ('mov-' + m.id);
+    let g = map.get(k);
+    if (!g) {
+      g = { key: k, lineas: [], fecha: m.fecha, cuenta_id: m.cuenta_id, neto: 0, saldo: 0, origen: m.origen };
+      map.set(k, g);
+    }
+    g.lineas.push(m);
+    g.neto = round2(g.neto + Number(m.monto || 0));
+    g.saldo = round2(g.saldo + saldoMov(m));
+    if (m.fecha < g.fecha) g.fecha = m.fecha;
+  }
+  for (const g of map.values()) {
+    g.principal = g.lineas.reduce((a, b) => Math.abs(Number(b.monto)) > Math.abs(Number(a.monto)) ? b : a);
+    g.motivo = motivoBloqueo(g);
+  }
+  return [...map.values()];
+}
+
+// Por qué un pendiente no se puede cerrar todavía. No bloquea el cierre del mes
+// (el P&L se arma con facturas, no con el extracto), pero identifica QUÉ carga
+// falta y de quién depende.
+function motivoBloqueo(g) {
+  const d = (g.principal.descripcion || '').toLowerCase();
+  if (/deb\. en cta\. comex|cta\. comex/.test(d)) return 'Falta cargar la importación';
+  if (g.origen === 'supervielle' && g.neto > 0 && g.principal.categoria === 'cobro_venta')
+    return 'Falta la venta B2B (Tango)';
+  return null;
 }
 
 function movsVisibles() {
@@ -208,7 +249,10 @@ function render() {
   const root = document.getElementById('app-screens');
   const base = movsDelMes();
   const ops = opsVisibles();
-  const movs = movsVisibles();
+  const grupos = agrupar(movsVisibles());
+  const listos = grupos.filter(g => !g.motivo);
+  const trabados = grupos.filter(g => g.motivo);
+  const comp = COMPLETITUD.find(c => c.periodo === MES) || null;
 
   const nAccion = base.filter(esAccionable).length;
   const nEspera = base.filter(m => esEsperaMotor(m) && m.estado !== 'conciliado').length;
@@ -225,9 +269,10 @@ function render() {
 
   // Objetos seleccionados (para puntuar el otro lado y totalizar)
   const opsSel = ops.filter(o => SEL_OPS.has(o.key));
-  const movsSel = movs.filter(m => SEL_MOVS.has(m.id));
+  const gruposSel = grupos.filter(g => SEL_MOVS.has(g.key));
+  const movsSel = gruposSel.flatMap(g => g.lineas);
   const totOps = round2(opsSel.reduce((s, o) => s + o.saldo, 0));
-  const totMovs = round2(movsSel.reduce((s, m) => s + saldoMov(m), 0));
+  const totMovs = round2(gruposSel.reduce((s, g) => s + g.saldo, 0));
   const dif = round2(totMovs - totOps);
 
   const filaOp = o => {
@@ -244,20 +289,26 @@ function render() {
     </label>`;
   };
 
-  const filaMov = m => {
-    const sel = SEL_MOVS.has(m.id);
+  const filaGrupo = g => {
+    const m = g.principal;
+    const sel = SEL_MOVS.has(g.key);
     const s = opsSel.length ? scoreMovContraSel(m, opsSel) : { pts: 0, motivos: [] };
     const sug = s.pts >= 25;
-    const espera = esEsperaMotor(m);
-    const vs = VINC_BY_MOV[m.id] || [];
+    const espera = g.lineas.every(esEsperaMotor);
+    const vs = g.lineas.flatMap(x => VINC_BY_MOV[x.id] || []);
     const chips = vs.map(v => `<span class="cc-chip">${v.op_tipo} #${v.op_id} <b class="cc-x" data-unlink="${v.id}">✕</b></span>`).join(' ');
-    return `<label class="cc-row${sel ? ' is-sel' : ''}${sug && !sel ? ' is-sug' : ''}${espera ? ' is-espera' : ''}" data-mov="${m.id}">
-      <input type="checkbox" class="cc-ck cc-ck-mov" data-id="${m.id}" ${sel ? 'checked' : ''} ${espera ? 'disabled' : ''}>
+    const multi = g.lineas.length > 1
+      ? `<span class="cc-multi" data-exp="${esc(g.key)}">${g.lineas.length} líneas ▾</span>` : '';
+    const detalle = (g.lineas.length > 1 && EXPANDIDO.has(g.key))
+      ? `<span class="cc-sub">${g.lineas.map(x => `<span class="cc-subr"><i>${esc((x.descripcion || '').slice(0, 52))}</i><b>${fmt(x.monto, 'ARS')}</b></span>`).join('')}</span>` : '';
+    return `<label class="cc-row${sel ? ' is-sel' : ''}${sug && !sel ? ' is-sug' : ''}${espera ? ' is-espera' : ''}${g.motivo ? ' is-trabado' : ''}" data-g="${esc(g.key)}">
+      <input type="checkbox" class="cc-ck cc-ck-mov" data-key="${esc(g.key)}" ${sel ? 'checked' : ''} ${espera ? 'disabled' : ''}>
       <span class="cc-main">
-        <span class="cc-t">${esc((m.descripcion || '').slice(0, 78))}</span>
-        <span class="cc-s">${fmtFecha(m.fecha)} · ${esc(cuentaLabel(m.cuenta_id))}${espera ? ' · <b class="cc-esp">espera motor ML</b>' : ''}${s.motivos.length ? ' · ' + s.motivos.map(x => `<b class="cc-why">${x}</b>`).join(' ') : ''} ${chips}</span>
+        <span class="cc-t">${esc((m.descripcion || '').slice(0, 74))} ${multi}</span>
+        <span class="cc-s">${fmtFecha(g.fecha)} · ${esc(cuentaLabel(g.cuenta_id))}${espera ? ' · <b class="cc-esp">espera motor ML</b>' : ''}${g.motivo ? ` · <b class="cc-trab">⚠ ${esc(g.motivo)}</b>` : ''}${s.motivos.length ? ' · ' + s.motivos.map(x => `<b class="cc-why">${x}</b>`).join(' ') : ''} ${chips}</span>
+        ${detalle}
       </span>
-      <span class="cc-m ${Number(m.monto) < 0 ? 'cc-neg' : 'cc-pos'}">${fmt(m.monto, CUENTA_BY_ID[m.cuenta_id]?.moneda)}</span>
+      <span class="cc-m ${g.neto < 0 ? 'cc-neg' : 'cc-pos'}">${fmt(g.neto, CUENTA_BY_ID[g.cuenta_id]?.moneda)}</span>
     </label>`;
   };
 
@@ -300,7 +351,7 @@ function render() {
       <div class="kpi"><div class="kpi-label">Accionable</div><div class="kpi-value">${nAccion}</div></div>
       <div class="kpi"><div class="kpi-label">Monto a conciliar</div><div class="kpi-value">${fmt(montoAccion, 'ARS')}</div></div>
       <div class="kpi"><div class="kpi-label">Operaciones con saldo</div><div class="kpi-value">${operaciones().length}</div></div>
-      <div class="kpi"><div class="kpi-label">Espera motor ML</div><div class="kpi-value">${nEspera}</div></div>
+      <div class="kpi"><div class="kpi-label">Explicado del mes</div><div class="kpi-value">${comp ? comp.pct_explicado + '%' : '—'}</div></div>
     </div>
 
     <div class="pills">
@@ -321,10 +372,14 @@ function render() {
       </div>
       <div class="cc-col">
         <div class="cc-head">
-          <span>Extracto <i>${movs.length}</i></span>
+          <span>Extracto <i>${grupos.length} operaciones</i></span>
           <input class="input cc-q" id="c-q-movs" placeholder="Buscar…" value="${esc(FILTRO.qMovs)}">
         </div>
-        <div class="cc-list">${movs.length ? movs.map(filaMov).join('') : '<div class="empty">No hay movimientos para este filtro.</div>'}</div>
+        <div class="cc-list">${grupos.length
+          ? listos.map(filaGrupo).join('') + (trabados.length
+              ? `<div class="cc-sep">Falta cargar la operación · ${trabados.length} · ${fmt(trabados.reduce((a, g) => a + g.saldo, 0), 'ARS')}</div>` + trabados.map(filaGrupo).join('')
+              : '')
+          : '<div class="empty">No hay movimientos para este filtro.</div>'}</div>
       </div>
     </div>
 
@@ -354,8 +409,14 @@ function render() {
     ck.checked ? SEL_OPS.add(ck.dataset.key) : SEL_OPS.delete(ck.dataset.key); render();
   }));
   document.querySelectorAll('.cc-ck-mov').forEach(ck => ck.addEventListener('change', () => {
-    const id = Number(ck.dataset.id);
-    ck.checked ? SEL_MOVS.add(id) : SEL_MOVS.delete(id); render();
+    const k = ck.dataset.key;
+    ck.checked ? SEL_MOVS.add(k) : SEL_MOVS.delete(k); render();
+  }));
+  document.querySelectorAll('.cc-multi').forEach(b => b.addEventListener('click', e => {
+    e.preventDefault(); e.stopPropagation();
+    const k = b.dataset.exp;
+    EXPANDIDO.has(k) ? EXPANDIDO.delete(k) : EXPANDIDO.add(k);
+    render();
   }));
   document.querySelectorAll('.cc-x').forEach(b => b.addEventListener('click', e => {
     e.preventDefault(); e.stopPropagation(); desvincular(b.dataset.unlink);
@@ -363,40 +424,46 @@ function render() {
   const clear = document.getElementById('cc-clear');
   if (clear) clear.addEventListener('click', () => { SEL_OPS.clear(); SEL_MOVS.clear(); render(); });
   const go = document.getElementById('cc-go');
-  if (go) go.addEventListener('click', () => conciliarSeleccion(opsSel, movsSel, dif));
+  if (go) go.addEventListener('click', () => conciliarSeleccion(opsSel, gruposSel, dif));
 }
 
 // ── Escritura ──────────────────────────────────────────────────────────
 // Asignación greedy: cada movimiento se reparte entre las operaciones marcadas
 // hasta agotarse. Se imputa siempre min(saldoMov, saldoOp), así ninguna de las
 // dos puntas queda sobre-imputada. Lo que sobra queda parcial, a propósito.
-async function conciliarSeleccion(opsSel, movsSel, dif) {
-  if (!opsSel.length || !movsSel.length) return;
+async function conciliarSeleccion(opsSel, gruposSel, dif) {
+  if (!opsSel.length || !gruposSel.length) return;
 
   const detalle = Math.abs(dif) <= 0.02
     ? 'La diferencia cierra en cero.'
     : (dif < 0
         ? `Van a quedar ${fmt(-dif, 'ARS')} pendientes en la operación (pago parcial).`
         : `Van a quedar ${fmt(dif, 'ARS')} sin asignar en el movimiento. Si esperabas que cerrara, puede faltar cargar una factura.`);
-  if (!confirm(`Conciliar ${opsSel.length} operación/es con ${movsSel.length} movimiento/s.\n\n${detalle}\n\n¿Confirmás?`)) return;
+  const nLineas = gruposSel.reduce((a, g) => a + g.lineas.length, 0);
+  if (!confirm(`Conciliar ${opsSel.length} operación/es con ${gruposSel.length} movimiento/s del extracto (${nLineas} líneas).\n\n${detalle}\n\n¿Confirmás?`)) return;
 
+  // Reparto greedy: cada linea del extracto se distribuye entre las operaciones
+  // marcadas imputando min(saldoLinea, saldoOp). Los impuestos de una operación
+  // se imputan junto con ella, que es como ocurrieron en la realidad.
   const rest = new Map(opsSel.map(o => [o.key, o.saldo]));
   const plan = [];
-  for (const m of movsSel) {
-    let disp = saldoMov(m);
-    for (const o of opsSel) {
-      if (disp <= 0.02) break;
-      const r = rest.get(o.key);
-      if (!(r > 0.02)) continue;
-      const imp = round2(Math.min(disp, r));
-      plan.push({ movimiento_id: m.id, op_tipo: o.op_tipo, op_id: o.op_id, monto: imp });
-      rest.set(o.key, round2(r - imp));
-      disp = round2(disp - imp);
+  for (const g of gruposSel) {
+    for (const m of g.lineas) {
+      let disp = saldoMov(m);
+      if (!(disp > 0.02)) continue;
+      for (const o of opsSel) {
+        if (disp <= 0.02) break;
+        const r = rest.get(o.key);
+        if (!(r > 0.02)) continue;
+        const imp = round2(Math.min(disp, r));
+        plan.push({ movimiento_id: m.id, op_tipo: o.op_tipo, op_id: o.op_id, monto: imp });
+        rest.set(o.key, round2(r - imp));
+        disp = round2(disp - imp);
+      }
     }
   }
   if (!plan.length) return;
 
-  window.toast(`Conciliando ${plan.length} vínculo/s…`);
   const errores = [];
   for (const v of plan) {
     try {
@@ -405,14 +472,39 @@ async function conciliarSeleccion(opsSel, movsSel, dif) {
       });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data.error || (r.status + ' ' + r.statusText));
+      // Estado local: con miles de filas, recargar todo desde la base en cada
+      // conciliación son segundos de espera por item. Se actualiza en memoria.
+      (VINC_BY_MOV[v.movimiento_id] = VINC_BY_MOV[v.movimiento_id] || [])
+        .push({ id: data.id || ('tmp-' + Date.now() + Math.random()), ...v });
+      aplicarLocal(v);
     } catch (e) { errores.push(`${v.op_tipo} #${v.op_id}: ${e.message}`); }
   }
-  if (errores.length) {
-    window.toast(`Se conciliaron ${plan.length - errores.length} de ${plan.length}. Errores: ${errores[0]}`, 'error');
-  } else {
-    window.toast(`Conciliado · ${plan.length} vínculo/s`);
+
+  SEL_OPS.clear(); SEL_MOVS.clear();
+  render();
+  if (errores.length) window.toast(`${plan.length - errores.length} de ${plan.length} OK. Error: ${errores[0]}`, 'error');
+  else window.toast(`Conciliado · ${plan.length} vínculo/s`);
+}
+
+// Descuenta el vínculo del saldo en memoria, del lado del movimiento y del lado
+// de la operación, para no volver a pedirle todo a la base.
+function aplicarLocal(v) {
+  const m = MOVS.find(x => x.id === v.movimiento_id);
+  if (m) {
+    m.monto_vinculado = round2(Number(m.monto_vinculado || 0) + v.monto);
+    m.saldo_pendiente = round2(Math.abs(Number(m.monto)) - m.monto_vinculado);
+    m.estado = Math.abs(m.saldo_pendiente) < 0.02 ? 'conciliado' : 'parcial';
   }
-  await loadConciliacion();
+  if (v.op_tipo === 'compra') {
+    const c = COMPRAS.find(x => x.compra_id === v.op_id);
+    if (c) c.saldo_ap_ars = round2(Number(c.saldo_ap_ars) - v.monto);
+  } else if (v.op_tipo === 'gasto') {
+    const g = GASTOS.find(x => x.id === v.op_id);
+    if (g) g.saldo_pendiente_ars = round2(Number(g.saldo_pendiente_ars) - v.monto);
+  } else if (v.op_tipo === 'cheque') {
+    const ch = CHEQUES.find(x => x.id === v.op_id);
+    if (ch) ch.conciliado_ars = round2(Number(ch.conciliado_ars || 0) + v.monto);
+  }
 }
 
 async function desvincular(id) {
@@ -470,6 +562,14 @@ function inyectarEstilo() {
     .cc-bar-ok .cc-bar-dif{color:#0F6E56}
     .cc-bar-warn .cc-bar-dif{color:#854F0B}
     .cc-bar-wait .cc-bar-dif{color:#A8A29E}
+    .cc-multi{font-size:11px;color:#0C447C;background:#E6F1FB;border-radius:5px;padding:0 6px;cursor:pointer}
+    .cc-sub{display:block;margin-top:5px;padding-left:8px;border-left:2px solid #E7E5E4}
+    .cc-subr{display:flex;justify-content:space-between;gap:10px;font-size:11.5px;color:#78716C;padding:1px 0}
+    .cc-subr i{font-style:normal}
+    .cc-subr b{font-variant-numeric:tabular-nums;font-weight:500}
+    .cc-sep{padding:7px 12px;background:#FAEEDA;color:#854F0B;font-size:12px;font-weight:600;border-bottom:1px solid #E7E5E4}
+    .cc-trab{color:#854F0B;font-weight:600}
+    .cc-row.is-trabado{background:#FFFDF7}
     @media (max-width:900px){.cc-grid{grid-template-columns:1fr}.cc-bar{width:calc(100% - 24px);flex-wrap:wrap}}
   `;
   const style = document.createElement('style');
