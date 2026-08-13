@@ -230,6 +230,15 @@ function movsDelMes() {
 // retención (mismo op_id). `grupo_key` en la base ya resuelve la clave por
 // origen. Seleccionar el grupo selecciona todas sus lineas: los impuestos
 // viajan con la operación que los generó y heredan su linea de negocio.
+// Las líneas accesorias (impuesto al débito, percepciones, comisiones) NO son
+// parte del comprobante del proveedor: no se imputan contra la operación, solo
+// heredan su línea de negocio. Si se imputaran, consumirían saldo de la factura
+// y la línea principal quedaría corta por el monto del impuesto — para siempre.
+function esAccesorio(m, g) {
+  return m.id !== g.principal.id
+      && tipoAccesorio(m, Math.abs(Number(g.principal.monto))) !== null;
+}
+
 function agrupar(movs) {
   const map = new Map();
   for (const m of movs) {
@@ -316,7 +325,11 @@ function render() {
   const gruposSel = grupos.filter(g => SEL_MOVS.has(g.key));
   const movsSel = gruposSel.flatMap(g => g.lineas);
   const totOps = round2(opsSel.reduce((s, o) => s + o.saldo, 0));
-  const totMovs = round2(gruposSel.reduce((s, g) => s + g.saldo, 0));
+  // Lo imputable excluye accesorios: contra la factura va la línea principal.
+  const totMovs = round2(gruposSel.reduce((s, g) =>
+    s + g.lineas.filter(x => !esAccesorio(x, g)).reduce((a, x) => a + saldoMov(x), 0), 0));
+  const totAccesorio = round2(gruposSel.reduce((s, g) =>
+    s + g.lineas.filter(x => esAccesorio(x, g)).reduce((a, x) => a + saldoMov(x), 0), 0));
   const dif = round2(totMovs - totOps);
 
   if (gruposSel.length) {
@@ -385,7 +398,10 @@ function render() {
     } else if (!opsSel.length || !movsSel.length) {
       estado = 'Marcá al menos uno de cada lado'; clase = 'cc-bar-wait'; acciones = '';
     } else if (Math.abs(dif) <= 0.02) {
-      estado = 'Cierra exacto ✓'; clase = 'cc-bar-ok';
+      estado = totAccesorio > 0.02
+        ? `Cierra exacto ✓ · ${fmt(totAccesorio, 'ARS')} de impuestos van a la misma línea`
+        : 'Cierra exacto ✓';
+      clase = 'cc-bar-ok';
       acciones = `<button class="btn btn-primary" id="cc-go">Conciliar</button>`;
     } else if (dif < 0) {
       estado = `Pago parcial · queda ${fmt(-dif, 'ARS')} pendiente en la operación`; clase = 'cc-bar-warn';
@@ -423,6 +439,8 @@ function render() {
       <select class="select" id="c-mes" style="width:auto;text-transform:capitalize">${optMes}</select>
       <select class="select" id="c-cuenta" style="width:auto">${optCuenta}</select>
       <div class="grow"></div>
+      <button class="btn btn-ghost" id="cc-add-gasto">+ Gasto</button>
+      <button class="btn btn-ghost" id="cc-add-compra">+ Compra</button>
     </div>
 
     <div class="kpi-grid" style="margin:14px 0">
@@ -509,6 +527,12 @@ function render() {
   if (go) go.addEventListener('click', () => conciliarSeleccion(opsSel, gruposSel, dif));
   const ng = document.getElementById('cc-nuevo-gasto');
   if (ng) ng.addEventListener('click', () => nuevoGastoDesde(gruposSel[0]));
+  // Alta disponible siempre: si hay un movimiento marcado precarga desde él,
+  // si no abre en blanco. Igual aparece a la derecha para vincular después.
+  document.getElementById('cc-add-gasto')
+    .addEventListener('click', () => nuevoGastoDesde(gruposSel.length === 1 ? gruposSel[0] : null));
+  document.getElementById('cc-add-compra')
+    .addEventListener('click', () => nuevaCompraDesde(gruposSel.length === 1 ? gruposSel[0] : null));
   const nc = document.getElementById('cc-nueva-compra');
   if (nc) nc.addEventListener('click', () => nuevaCompraDesde(gruposSel[0]));
 }
@@ -535,7 +559,7 @@ async function conciliarSeleccion(opsSel, gruposSel, dif) {
         : (accesorios.length
             ? `${fmt(dif, 'ARS')} corresponden a ${accesorios.join(' + ')}.\nQuedan imputados a la misma línea de negocio que la operación.`
             : `Van a quedar ${fmt(dif, 'ARS')} sin asignar en el movimiento. Si esperabas que cerrara, puede faltar cargar una factura.`));
-  const nLineas = gruposSel.reduce((a, g) => a + g.lineas.length, 0);
+  const nLineas = gruposSel.reduce((a, g) => a + g.lineas.filter(x => !esAccesorio(x, g)).length, 0);
   if (!confirm(`Conciliar ${opsSel.length} operación/es con ${gruposSel.length} movimiento/s del extracto (${nLineas} líneas).\n\n${detalle}\n\n¿Confirmás?`)) return;
 
   // Reparto greedy: cada linea del extracto se distribuye entre las operaciones
@@ -545,6 +569,7 @@ async function conciliarSeleccion(opsSel, gruposSel, dif) {
   const plan = [];
   for (const g of gruposSel) {
     for (const m of g.lineas) {
+      if (esAccesorio(m, g)) continue;   // no consume saldo de la factura
       let disp = saldoMov(m);
       if (!(disp > 0.02)) continue;
       for (const o of opsSel) {
@@ -582,8 +607,8 @@ async function conciliarSeleccion(opsSel, gruposSel, dif) {
   const conLinea = opsSel.filter(o => o.linea_id && Number(o.n_lineas || 1) === 1);
   if (conLinea.length === 1) {
     const lid = conLinea[0].linea_id;
-    const huerfanas = gruposSel.flatMap(g => g.lineas)
-      .filter(x => saldoMov(x) > 0.02 && !(VINC_BY_MOV[x.id] || []).length && x.linea_id !== lid);
+    const huerfanas = gruposSel.flatMap(g => g.lineas.filter(x => esAccesorio(x, g)))
+      .filter(x => x.linea_id !== lid);
     for (const x of huerfanas) {
       try {
         await sbPatch('movimientos', `id=eq.${x.id}`, { linea_id: lid });
@@ -628,16 +653,15 @@ function aplicarLocal(v) {
 // la línea PRINCIPAL, no del neto del grupo: los impuestos bancarios (impuesto
 // al débito, IIBB acreditaciones) no forman parte de la factura del proveedor.
 async function nuevoGastoDesde(g) {
-  if (!g) return;
-  const m = g.principal;
-  const cta = CUENTA_BY_ID[g.cuenta_id] || {};
-  const desc = (m.descripcion || '').replace(/\s+/g, ' ').trim();
+  const m = g ? g.principal : null;
+  const cta = g ? (CUENTA_BY_ID[g.cuenta_id] || {}) : {};
+  const desc = m ? (m.descripcion || '').replace(/\s+/g, ' ').trim() : '';
   // Proveedor por CUIT si el detalle lo trae.
   const digitos = desc.replace(/\D/g, '');
   const prov = PROVEEDORES.find(p => p.cuit && digitos.includes(String(p.cuit)));
 
   await abrirAltaGasto({
-    fecha: String(m.fecha).slice(0, 10),
+    fecha: m ? String(m.fecha).slice(0, 10) : '',
     // La descripción NO se copia del extracto: si el gasto se llama igual que el
     // movimiento, las dos columnas muestran el mismo texto y no se distinguen.
     // Se usa el nombre del proveedor si se detectó; si no, la escribe la persona.
@@ -645,7 +669,7 @@ async function nuevoGastoDesde(g) {
     referencia_banco: desc.slice(0, 90),
     // El extracto trae el TOTAL pagado (IVA incluido). El formulario lo desagrega:
     // pasarlo como "neto" inflaba el gasto un 21% y obligaba a partirlo a mano.
-    total_pagado: Math.abs(Number(m.monto)),
+    total_pagado: m ? Math.abs(Number(m.monto)) : null,
     iva_rate: 0.21,
     moneda: cta.moneda || 'ARS',
     pago: PAGO_POR_CUENTA[cta.codigo] || '',
@@ -666,17 +690,16 @@ async function nuevoGastoDesde(g) {
 // CF6, el costo nace en la factura por lote. El pago se muestra como referencia
 // para cuadrar, no como dato a copiar.
 async function nuevaCompraDesde(g) {
-  if (!g) return;
-  const m = g.principal;
-  const desc = (m.descripcion || '').replace(/\s+/g, ' ').trim();
+  const m = g ? g.principal : null;
+  const desc = m ? (m.descripcion || '').replace(/\s+/g, ' ').trim() : '';
   const digitos = desc.replace(/\D/g, '');
   const prov = PROVEEDORES.find(p => p.cuit && digitos.includes(String(p.cuit)));
 
   await abrirAltaCompra({
-    fecha: String(m.fecha).slice(0, 10),
+    fecha: m ? String(m.fecha).slice(0, 10) : '',
     proveedor_id: prov ? prov.id : null,
-    monto: Math.abs(Number(m.monto)).toFixed(2),
-    monto_fmt: fmt(Math.abs(Number(m.monto)), 'ARS'),
+    monto: m ? Math.abs(Number(m.monto)).toFixed(2) : null,
+    monto_fmt: m ? fmt(Math.abs(Number(m.monto)), 'ARS') : null,
     descripcion: desc.slice(0, 90)
   }, async () => {
     PROVEEDORES = await sbGet('proveedores', 'order=nombre.asc').catch(() => PROVEEDORES);
