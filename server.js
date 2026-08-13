@@ -4220,6 +4220,10 @@ app.post('/supervielle/import', upload.single('file'), async (req, res) => {
         fecha: f.fecha,
         monto: f.monto,
         origen: 'supervielle',
+        // op_ref agrupa las lineas de una misma operación. En Supervielle la clave
+        // es la HORA: la transferencia y sus impuestos (deb/cred, IIBB) comparten
+        // timestamp exacto. Junto con la fecha arma `grupo_key` en la base.
+        op_ref: f.hora || null,
         referencia_externa: `${f.fecha}|${f.hora}|${f.monto.toFixed(2)}|${f.saldo.toFixed(2)}`,
         categoria,
         descripcion: desc,
@@ -4389,6 +4393,9 @@ app.post('/mp/import', upload.single('file'), async (req, res) => {
         fecha: f.fecha,
         monto: f.monto,
         origen: 'mp_account_statement',
+        // op_ref = REFERENCE_ID: lo comparten el cobro, la bonificación de envío,
+        // la retención y la devolución de una misma venta (regla O10).
+        op_ref: f.ref || null,
         // El tipo va AL FINAL: hay código que lee el op_id como split('|')[1] y
         // matchea LIKE '%|pid|%'. Agregarlo al final deja los campos 0-3 intactos.
         // Sin el tipo, dos filas legítimas colisionan (liquidación y devolución
