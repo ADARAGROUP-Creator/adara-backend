@@ -2,8 +2,9 @@ import { sbGet } from '../core/sb.js';
 
 // ── Pantalla: Conciliación ─────────────────────────────────────────────
 // Modelo de interacción: DOS LADOS con diferencia en vivo.
-//   Izquierda  = operaciones con saldo (compras, gastos, cheques emitidos)
-//   Derecha    = movimientos del extracto pendientes/parciales
+//   Izquierda  = extracto: la plata que se movió, agrupada por operación
+//   Derecha    = contrapartes con saldo (compras, gastos, cheques emitidos)
+// El extracto manda: es la fuente de verdad y es como se trabaja hoy en papel.
 // Se marca de los dos lados, la barra de abajo muestra la diferencia y NADA se
 // escribe hasta apretar "Conciliar". Eso resuelve 1:1, 1:N, N:1 y N:M sin UI
 // especial para ninguno (ver ADARA-CONCILIACION-BANCARIA.md).
@@ -135,7 +136,10 @@ function puntaje(op, mov) {
 
   if (op.fecha && mov.fecha) {
     const d = Math.abs((new Date(mov.fecha) - new Date(op.fecha)) / 86400000);
-    if (d <= 7) { pts += 15; motivos.push('fecha'); }
+    // La fecha sola no es señal: casi todo cae dentro de la ventana y ensuciaba
+    // cada fila con un chip inútil. Solo desempata cuando ya hay otra señal.
+    if (d <= 7 && pts > 0) { pts += 15; motivos.push('fecha'); }
+    else if (d <= 7) pts += 5;
   }
   return { pts, motivos };
 }
@@ -250,7 +254,7 @@ function render() {
   const base = movsDelMes();
   const ops = opsVisibles();
   const grupos = agrupar(movsVisibles());
-  const listos = grupos.filter(g => !g.motivo);
+  let listos = grupos.filter(g => !g.motivo);
   const trabados = grupos.filter(g => g.motivo);
   const comp = COMPLETITUD.find(c => c.periodo === MES) || null;
 
@@ -269,11 +273,28 @@ function render() {
 
   // Objetos seleccionados (para puntuar el otro lado y totalizar)
   const opsSel = ops.filter(o => SEL_OPS.has(o.key));
+  // Marcar de un lado REORDENA el otro por afinidad y sube el mejor candidato
+  // arriba de todo. Sin esto la sugerencia era invisible: podía estar 30 filas
+  // más abajo. Resalta y acerca; nunca selecciona.
+  let opsOrden = ops, mejorOp = 0, mejorMov = 0;
   const gruposSel = grupos.filter(g => SEL_MOVS.has(g.key));
   const movsSel = gruposSel.flatMap(g => g.lineas);
   const totOps = round2(opsSel.reduce((s, o) => s + o.saldo, 0));
   const totMovs = round2(gruposSel.reduce((s, g) => s + g.saldo, 0));
   const dif = round2(totMovs - totOps);
+
+  if (gruposSel.length) {
+    const conPts = ops.map(o => ({ o, p: scoreOpContraSel(o, gruposSel.flatMap(g => g.lineas)).pts }));
+    conPts.sort((a, b) => b.p - a.p);
+    opsOrden = conPts.map(x => x.o);
+    mejorOp = conPts.length ? conPts[0].p : 0;
+  }
+  if (opsSel.length) {
+    const conPts = listos.map(g => ({ g, p: scoreMovContraSel(g.principal, opsSel).pts }));
+    conPts.sort((a, b) => b.p - a.p);
+    listos = conPts.map(x => x.g);
+    mejorMov = conPts.length ? conPts[0].p : 0;
+  }
 
   const filaOp = o => {
     const sel = SEL_OPS.has(o.key);
@@ -365,21 +386,23 @@ function render() {
     <div class="cc-grid">
       <div class="cc-col">
         <div class="cc-head">
-          <span>Operaciones con saldo <i>${ops.length}</i></span>
-          <input class="input cc-q" id="c-q-ops" placeholder="Buscar…" value="${esc(FILTRO.qOps)}">
-        </div>
-        <div class="cc-list">${ops.length ? ops.map(filaOp).join('') : '<div class="empty">No hay operaciones con saldo.</div>'}</div>
-      </div>
-      <div class="cc-col">
-        <div class="cc-head">
           <span>Extracto <i>${grupos.length} operaciones</i></span>
           <input class="input cc-q" id="c-q-movs" placeholder="Buscar…" value="${esc(FILTRO.qMovs)}">
         </div>
+        ${opsSel.length && mejorMov < 25 ? '<div class="cc-nosug">Sin sugerencia: ningún movimiento del filtro coincide por monto ni CUIT.</div>' : ''}
         <div class="cc-list">${grupos.length
           ? listos.map(filaGrupo).join('') + (trabados.length
               ? `<div class="cc-sep">Falta cargar la operación · ${trabados.length} · ${fmt(trabados.reduce((a, g) => a + g.saldo, 0), 'ARS')}</div>` + trabados.map(filaGrupo).join('')
               : '')
           : '<div class="empty">No hay movimientos para este filtro.</div>'}</div>
+      </div>
+      <div class="cc-col">
+        <div class="cc-head">
+          <span>Operaciones con saldo <i>${ops.length}</i></span>
+          <input class="input cc-q" id="c-q-ops" placeholder="Buscar…" value="${esc(FILTRO.qOps)}">
+        </div>
+        ${gruposSel.length && mejorOp < 25 ? '<div class="cc-nosug">Sin sugerencia: ninguna operación coincide por monto ni CUIT.</div>' : ''}
+        <div class="cc-list">${opsOrden.length ? opsOrden.map(filaOp).join('') : '<div class="empty">No hay operaciones con saldo.</div>'}</div>
       </div>
     </div>
 
@@ -562,6 +585,7 @@ function inyectarEstilo() {
     .cc-bar-ok .cc-bar-dif{color:#0F6E56}
     .cc-bar-warn .cc-bar-dif{color:#854F0B}
     .cc-bar-wait .cc-bar-dif{color:#A8A29E}
+    .cc-nosug{padding:7px 12px;background:#FEFCE8;color:#854F0B;font-size:12px;border-bottom:1px solid #E7E5E4}
     .cc-multi{font-size:11px;color:#0C447C;background:#E6F1FB;border-radius:5px;padding:0 6px;cursor:pointer}
     .cc-sub{display:block;margin-top:5px;padding-left:8px;border-left:2px solid #E7E5E4}
     .cc-subr{display:flex;justify-content:space-between;gap:10px;font-size:11.5px;color:#78716C;padding:1px 0}
