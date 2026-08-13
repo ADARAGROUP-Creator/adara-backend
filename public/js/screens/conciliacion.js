@@ -107,8 +107,10 @@ function operaciones() {
     const p = PROV_BY_ID[g.proveedor_id];
     out.push({
       key: 'gasto:' + g.id, op_tipo: 'gasto', op_id: g.id,
-      titulo: g.descripcion || ('Gasto #' + g.id),
-      sub: p ? p.nombre : (g.nro_comprobante || 'Gasto'),
+      // Lidera el proveedor: es lo que distingue un gasto de un movimiento a
+      // simple vista. La descripción va abajo, como dato secundario.
+      titulo: p ? p.nombre : (g.descripcion || ('Gasto #' + g.id)),
+      sub: [p ? g.descripcion : null, g.nro_comprobante].filter(Boolean).join(' · ') || 'Gasto',
       cuit: p ? p.cuit : null, fecha: g.fecha, saldo, moneda: 'ARS', clase: 'gasto'
     });
   }
@@ -569,14 +571,23 @@ async function nuevoGastoDesde(g) {
 
   await abrirAltaGasto({
     fecha: String(m.fecha).slice(0, 10),
-    descripcion: desc.slice(0, 90),
-    monto: Math.abs(Number(m.monto)).toFixed(2),
+    // La descripción NO se copia del extracto: si el gasto se llama igual que el
+    // movimiento, las dos columnas muestran el mismo texto y no se distinguen.
+    // Se usa el nombre del proveedor si se detectó; si no, la escribe la persona.
+    descripcion: prov ? prov.nombre : '',
+    referencia_banco: desc.slice(0, 90),
+    // El extracto trae el TOTAL pagado (IVA incluido). El formulario lo desagrega:
+    // pasarlo como "neto" inflaba el gasto un 21% y obligaba a partirlo a mano.
+    total_pagado: Math.abs(Number(m.monto)),
+    iva_rate: 0.21,
     moneda: cta.moneda || 'ARS',
     pago: PAGO_POR_CUENTA[cta.codigo] || '',
     proveedor_id: prov ? prov.id : null
   }, async () => {
     // Al volver, se recargan solo los gastos: el nuevo aparece a la derecha con
     // el movimiento todavía marcado, listo para vincular.
+    PROVEEDORES = await sbGet('proveedores', 'order=nombre.asc').catch(() => PROVEEDORES);
+    PROV_BY_ID = Object.fromEntries(PROVEEDORES.map(p => [p.id, p]));
     GASTOS = await sbGet('v_gastos_ap', 'estado_pago=in.(pendiente,parcial)&order=fecha.desc,id.desc').catch(() => GASTOS);
     render();
     window.toast('Gasto cargado · marcalo a la derecha para conciliar');
@@ -601,6 +612,8 @@ async function nuevaCompraDesde(g) {
     monto_fmt: fmt(Math.abs(Number(m.monto)), 'ARS'),
     descripcion: desc.slice(0, 90)
   }, async () => {
+    PROVEEDORES = await sbGet('proveedores', 'order=nombre.asc').catch(() => PROVEEDORES);
+    PROV_BY_ID = Object.fromEntries(PROVEEDORES.map(p => [p.id, p]));
     COMPRAS = await sbGet('v_compras_ap', 'saldo_ap_ars=gt.0.02&order=fecha.desc,compra_id.desc').catch(() => COMPRAS);
     render();
     window.toast('Compra cargada · marcala a la derecha para conciliar');
