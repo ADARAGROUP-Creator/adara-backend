@@ -234,6 +234,16 @@ function movsDelMes() {
 // parte del comprobante del proveedor: no se imputan contra la operación, solo
 // heredan su línea de negocio. Si se imputaran, consumirían saldo de la factura
 // y la línea principal quedaría corta por el monto del impuesto — para siempre.
+// Mercado Pago a veces incluye el IDC (0,6%) DENTRO de la línea de la
+// transferencia en vez de mandarlo aparte. En ese caso el sobrante al conciliar
+// no es una factura faltante: es el impuesto. Se detecta por proporción exacta.
+// No se adivina el importe del comprobante: se VERIFICA la diferencia contra él.
+const IDC_TASA = 0.006;
+function esIdcEmbebido(dif, base) {
+  if (!(dif > 0.02) || !(base > 0)) return false;
+  return Math.abs(dif / base - IDC_TASA) < 0.0002;
+}
+
 function esAccesorio(m, g) {
   return m.id !== g.principal.id
       && tipoAccesorio(m, Math.abs(Number(g.principal.monto))) !== null;
@@ -417,9 +427,12 @@ function render() {
       const nombres = [...new Set(sobrantes)];
       estado = nombres.length
         ? `${fmt(dif, 'ARS')} de ${nombres.join(' + ')} — se imputan a la misma línea`
-        : `Sobran ${fmt(dif, 'ARS')} sin asignar en el movimiento`;
-      clase = 'cc-bar-warn';
-      acciones = `<button class="btn btn-primary" id="cc-go">Conciliar igual</button>`;
+        : (esIdcEmbebido(dif, totOps)
+            ? `${fmt(dif, 'ARS')} = 0,6% de impuesto al débito incluido en el pago ✓`
+            : `Sobran ${fmt(dif, 'ARS')} sin asignar en el movimiento`);
+      clase = (nombres.length || esIdcEmbebido(dif, totOps)) ? 'cc-bar-ok' : 'cc-bar-warn';
+      acciones = `<button class="btn btn-primary" id="cc-go">${
+        esIdcEmbebido(dif, totOps) ? 'Conciliar con IDC' : 'Conciliar igual'}</button>`;
     }
     barra = `<div class="cc-bar ${clase}">
       <div class="cc-bar-l">
@@ -558,7 +571,9 @@ async function conciliarSeleccion(opsSel, gruposSel, dif) {
         ? `Van a quedar ${fmt(-dif, 'ARS')} pendientes en la operación (pago parcial).`
         : (accesorios.length
             ? `${fmt(dif, 'ARS')} corresponden a ${accesorios.join(' + ')}.\nQuedan imputados a la misma línea de negocio que la operación.`
-            : `Van a quedar ${fmt(dif, 'ARS')} sin asignar en el movimiento. Si esperabas que cerrara, puede faltar cargar una factura.`));
+            : (esIdcEmbebido(dif, totOps)
+                ? `${fmt(dif, 'ARS')} son el 0,6% de impuesto al débito (Ley 25413) incluido en el pago.\nSe registran como tal y el movimiento queda cerrado.`
+                : `Van a quedar ${fmt(dif, 'ARS')} sin asignar en el movimiento. Si esperabas que cerrara, puede faltar cargar una factura.`)));
   const nLineas = gruposSel.reduce((a, g) => a + g.lineas.filter(x => !esAccesorio(x, g)).length, 0);
   if (!confirm(`Conciliar ${opsSel.length} operación/es con ${gruposSel.length} movimiento/s del extracto (${nLineas} líneas).\n\n${detalle}\n\n¿Confirmás?`)) return;
 
@@ -604,10 +619,28 @@ async function conciliarSeleccion(opsSel, gruposSel, dif) {
   // Los impuestos bancarios del grupo no tienen operación propia: heredan la
   // línea de la operación que los generó (LN9 usa movimientos.linea_id como
   // fallback). Sin esto quedarían como costo a nivel empresa, sin línea.
+  // IDC embebido: se registra en el propio movimiento como ajuste explicado.
+  // Sin esto el movimiento queda 'parcial' para siempre por el 0,6%.
+  const totOpsPlan = round2(opsSel.reduce((a, o) => a + o.saldo, 0));
+  if (esIdcEmbebido(dif, totOpsPlan) && gruposSel.length === 1 && gruposSel[0].lineas.length === 1) {
+    const mov = gruposSel[0].principal;
+    try {
+      await sbPatch('movimientos', `id=eq.${mov.id}`, {
+        ajuste_ars: round2(dif),
+        ajuste_motivo: 'IDC Ley 25413 0,6% incluido en el pago'
+      });
+      mov.ajuste_ars = round2(dif);
+      const en = MOVS.find(x => x.id === mov.id);
+      if (en) { en.saldo_pendiente = round2(en.saldo_pendiente - dif); en.estado = 'conciliado'; }
+      window.toast(`${fmt(dif, 'ARS')} registrados como impuesto al débito`);
+    } catch (e) { console.warn('No se pudo registrar el IDC embebido', e); }
+  }
+
   const conLinea = opsSel.filter(o => o.linea_id && Number(o.n_lineas || 1) === 1);
   if (conLinea.length === 1) {
     const lid = conLinea[0].linea_id;
-    const huerfanas = gruposSel.flatMap(g => g.lineas.filter(x => esAccesorio(x, g)))
+    const huerfanas = gruposSel
+      .flatMap(g => g.lineas.filter(x => esAccesorio(x, g) || Number(x.ajuste_ars || 0) > 0))
       .filter(x => x.linea_id !== lid);
     for (const x of huerfanas) {
       try {
