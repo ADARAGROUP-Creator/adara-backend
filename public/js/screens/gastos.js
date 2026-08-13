@@ -24,6 +24,13 @@ let PROVEEDORES = [];     // proveedores (opcional, puede estar vacío)
 let COMPRAS_CAP = [];     // compras activas: candidatas a recibir un gasto capitalizable
 let FILTRO = { periodo: '', categoria: '', linea: '', estado: '', q: '' };
 
+// Alta invocada desde OTRA pantalla (Conciliación). Se reutiliza este mismo
+// formulario en vez de duplicarlo: dos altas de gasto divergen tarde o temprano.
+// EXTERNO != null significa que no hay que re-renderizar la grilla de gastos al
+// guardar, sino devolverle el id a quien lo pidió.
+let EXTERNO = null;        // { prefill, onSaved }
+let CATALOGOS_OK = false;
+
 const CATEGORIAS = [
   ['servicios_basicos', 'Servicios básicos'],
   ['alquiler', 'Alquiler'],
@@ -108,6 +115,23 @@ function fmtMonto(valor, moneda = 'ARS') {
 }
 
 // ── Carga ──────────────────────────────────────────────────────────────
+// Abre el alta de gasto como overlay sobre CUALQUIER pantalla, con campos
+// precargados. onSaved(id) se llama al guardar bien.
+export async function abrirAltaGasto(prefill = {}, onSaved = null) {
+  if (!CATALOGOS_OK) {
+    LINEAS = await sbGet('lineas_negocio', 'order=id.asc');
+    LINEA_LABEL = Object.fromEntries(LINEAS.map(l => [l.id, lineaLabel(l)]));
+    CANALES = await sbGet('canales', 'order=codigo.asc').catch(() => []);
+    CUENTAS = await sbGet('cuentas', 'order=id.asc');
+    PROVEEDORES = await sbGet('proveedores', 'order=id.asc').catch(() => []);
+    COMPRAS_CAP = await sbGet('v_compras_ap', 'estado_compra=eq.activa&order=fecha.desc&limit=60').catch(() => []);
+    CATALOGOS_OK = true;
+  }
+  inyectarEstilo();
+  EXTERNO = { prefill, onSaved };
+  openModalNuevo();
+}
+
 export async function loadGastos() {
   const root = document.getElementById('app-screens');
   root.innerHTML = `<div class="loading">Cargando gastos…</div>`;
@@ -120,6 +144,7 @@ export async function loadGastos() {
     // Compras a las que un gasto puede capitalizar. Si la elegida ya tuvo ventas, el preview
     // avisa qué meses se recostean y pide confirmación antes de guardar.
     COMPRAS_CAP = await sbGet('v_compras_ap', 'estado_compra=eq.activa&order=fecha.desc&limit=60').catch(() => []);
+    CATALOGOS_OK = true;
     await recargar();
   } catch (e) {
     root.innerHTML = `<div class="error">No se pudieron cargar los gastos: ${e.message}</div>`;
@@ -392,7 +417,24 @@ function openModalNuevo() {
   document.body.appendChild(overlay);
 
   const $ = sel => overlay.querySelector(sel);
-  const close = () => overlay.remove();
+  const close = () => { overlay.remove(); EXTERNO = null; };
+
+  // Precarga desde Conciliación. OJO con el importe: se toma la línea PRINCIPAL
+  // del grupo, no el neto — los impuestos bancarios del movimiento no están en
+  // la factura del proveedor y lo inflarían.
+  if (EXTERNO && EXTERNO.prefill) {
+    const pf = EXTERNO.prefill;
+    const set = (id, val) => { const el = overlay.querySelector('#' + id); if (el && val != null && val !== '') el.value = val; };
+    set('g-fecha', pf.fecha);
+    set('g-desc', pf.descripcion);
+    set('g-neto', pf.monto);
+    set('g-moneda', pf.moneda);
+    set('g-pago', pf.pago);
+    if (pf.proveedor_id) set('g-prov', String(pf.proveedor_id));
+    overlay.querySelectorAll('.field').forEach(() => {});
+    const t = overlay.querySelector('.card-title');
+    if (t) t.textContent = 'Cargar gasto · desde conciliación';
+  }
   overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
   $('#g-cancel').addEventListener('click', close);
 
@@ -723,12 +765,17 @@ function openModalNuevo() {
           if (!ra.ok) { const da = await ra.json().catch(() => ({})); throw new Error(da.error || (ra.status + '')); }
         } catch (eAdj) {
           window.toast('Gasto guardado, pero la factura no se subió: ' + eAdj.message, 'error');
-          close(); await recargar(); render(); return;
+          const cbA = EXTERNO && EXTERNO.onSaved;
+          close();
+          if (cbA) { cbA(data.id); return; }
+          await recargar(); render(); return;
         }
       }
 
       window.toast('Gasto cargado');
+      const cb = EXTERNO && EXTERNO.onSaved;
       close();
+      if (cb) { cb(data.id); return; }
       await recargar();
       render();
     } catch (e) {
