@@ -26,6 +26,9 @@ import { sbGet } from '../core/sb.js';
 //    factura A → el "a pagar" sale alto (worst-case). El débito sí es exacto.
 //  - IIBB DETERMINADO y GANANCIAS pendientes de alícuotas/tasa del contador.
 
+let L25413 = [];   // v_impuesto_cheque_ganancias
+let RETEN  = [];   // v_retenciones_mensual
+
 function num(v) { return Number(v) || 0; }
 function fmtNum(n, dec = 0) {
   return num(n).toLocaleString('es-AR', { minimumFractionDigits: dec, maximumFractionDigits: dec });
@@ -49,6 +52,9 @@ export async function loadPosicionFiscal() {
   root.innerHTML = `<div class="loading">Cargando posición fiscal…</div>`;
   try {
     DATA = await sbGet('v_posicion_fiscal', 'select=*&order=periodo.asc');
+    // Tolerantes: si las vistas no existen todavía, la pantalla igual carga.
+    L25413 = await sbGet('v_impuesto_cheque_ganancias', 'select=*&order=periodo.asc').catch(() => []);
+    RETEN  = await sbGet('v_retenciones_mensual', 'select=*&order=periodo.asc').catch(() => []);
     render();
   } catch (e) {
     root.innerHTML = `<div class="error"><strong>Error al cargar Posición Fiscal.</strong><br>${esc(e.message)}</div>`;
@@ -136,6 +142,38 @@ function render() {
     return;
   }
 
+  // ── Ley 25413: base para el cómputo contra Ganancias, abierta por lado ─────
+  const l25 = [...L25413].sort((a, b) => String(a.periodo).localeCompare(String(b.periodo)));
+  const l25Body = l25.length
+    ? l25.map(f => `<tr><td>${fmtPeriodo(f.periodo)}</td><td class="n">${fmtMoney(num(f.sobre_debitos))}</td>`
+        + `<td class="n">${fmtMoney(num(f.sobre_creditos))}</td><td class="n"><b>${fmtMoney(num(f.total))}</b></td></tr>`).join('')
+    : `<tr><td colspan="4" class="empty">Sin movimientos registrados.</td></tr>`;
+  const l25T = l25.reduce((a, f) => ({
+    d: a.d + num(f.sobre_debitos), c: a.c + num(f.sobre_creditos), t: a.t + num(f.total)
+  }), { d: 0, c: 0, t: 0 });
+  const l25Tot = l25.length
+    ? `<tr class="tot"><td><b>Acumulado</b></td><td class="n"><b>${fmtMoney(l25T.d)}</b></td>`
+      + `<td class="n"><b>${fmtMoney(l25T.c)}</b></td><td class="n"><b>${fmtMoney(l25T.t)}</b></td></tr>`
+    : '';
+
+  // ── Retenciones sufridas, agrupadas por período y agente ───────────────────
+  const ret = [...RETEN].sort((a, b) =>
+    String(b.periodo).localeCompare(String(a.periodo))
+    || String(a.regimen).localeCompare(String(b.regimen))
+    || String(a.agente).localeCompare(String(b.agente)));
+  let retBody = '', ultPer = null;
+  for (const r of ret) {
+    if (r.periodo !== ultPer) {
+      const sub = ret.filter(x => x.periodo === r.periodo).reduce((a, x) => a + num(x.monto), 0);
+      retBody += `<tr class="tot"><td colspan="3"><b>${fmtPeriodo(r.periodo)}</b></td>`
+               + `<td class="n"><b>${fmtMoney(sub)}</b></td><td></td></tr>`;
+      ultPer = r.periodo;
+    }
+    retBody += `<tr><td></td><td>${esc(r.regimen)}</td><td>${esc(r.agente)}</td>`
+             + `<td class="n">${fmtMoney(num(r.monto))}</td><td class="n">${num(r.items)}</td></tr>`;
+  }
+  if (!retBody) retBody = `<tr><td colspan="5" class="empty">Sin retenciones registradas.</td></tr>`;
+
   // ── Meses oficiales (apertura + fino) para los totales de IVA ──────────────
   const esOficial = f => f.estado_fiscal === 'apertura' || f.estado_fiscal === 'fino';
   const oficial = filas.filter(esOficial);
@@ -185,13 +223,6 @@ function render() {
       <td><span class="pend">—</span></td>
       <td><span class="pend">—</span></td>
     </tr>`;
-
-  // ── Tabla Otros (impuesto al cheque) ───────────────────────────────────
-  const chBody = filas.map(f => `<tr>
-      <td>${esc(fmtPeriodo(f.periodo))}</td>
-      <td>${num(f.impuesto_cheque) ? fmtMoney(f.impuesto_cheque) : '<span class="pend">0,00</span>'}</td>
-    </tr>`).join('');
-  const chTot = `<tr class="tot"><td>Total</td><td>${fmtMoney(T.impuesto_cheque)}</td></tr>`;
 
   root.innerHTML = `${STYLE}
   <div class="pf">
@@ -246,14 +277,28 @@ function render() {
     </div>
 
     <div class="pf-sec">
-      <div class="pf-sec-h"><h3>Otros</h3><span class="tag">impuesto al cheque · Ganancias</span></div>
+      <div class="pf-sec-h"><h3>Impuesto Ley 25413</h3><span class="tag">débitos y créditos · crédito potencial contra Ganancias</span></div>
       <div class="tbl"><table>
-        <thead><tr><th>Período</th><th>Impuesto al cheque</th></tr></thead>
-        <tbody>${chBody}${chTot}</tbody>
+        <thead><tr><th>Período</th><th>Sobre débitos</th><th>Sobre créditos</th><th>Total</th></tr></thead>
+        <tbody>${l25Body}${l25Tot}</tbody>
       </table></div>
-      <div class="note"><b>Impuesto al cheque</b> (débitos/créditos bancarios): a definir con el contador si va como
-      costo financiero al Resultado y qué porción es computable como pago a cuenta de Ganancias. <b>Ganancias:</b>
-      pendiente de la tasa del contador; se sumará como renglón final del Resultado, no acá.</div>
+      <div class="note"><b>Se acumula para informar al contador al cierre del ejercicio.</b> La app
+      <b>no aplica ningún porcentaje</b> a propósito: la porción computable como pago a cuenta de Ganancias depende
+      de la categoría del contribuyente y del certificado MiPyME, y difiere entre el impuesto sobre débitos y sobre
+      créditos. Por eso la apertura por lado: con el total solo no alcanza para calcularlo.
+      La porción que resulte <b>no</b> computable es costo y va al Resultado con la línea de la operación que la generó.</div>
+    </div>
+
+    <div class="pf-sec">
+      <div class="pf-sec-h"><h3>Retenciones y percepciones sufridas</h3><span class="tag">para contrastar contra los certificados</span></div>
+      <div class="tbl"><table>
+        <thead><tr><th>Período</th><th>Régimen</th><th>Agente de retención</th><th>Monto</th><th>Items</th></tr></thead>
+        <tbody>${retBody}</tbody>
+      </table></div>
+      <div class="note">Un renglón por <b>agente retenedor</b>, que es como vienen los certificados: se comparan de a uno.
+      El IIBB de Mercado Libre sale de la columna IMPUESTOS de Ventas ML (canónica) e imputa por <b>fecha de cobro</b>,
+      que es cuando ocurre la retención. <b>No</b> incluye el impuesto Ley 25413 (tiene su propio cuadro) ni los pagos
+      al fisco (VEP, planes, débitos automáticos), que son cancelaciones y no retenciones sufridas.</div>
     </div>
   </div>`;
 
