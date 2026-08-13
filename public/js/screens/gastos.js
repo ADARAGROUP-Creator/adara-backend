@@ -424,16 +424,45 @@ function openModalNuevo() {
   // la factura del proveedor y lo inflarían.
   if (EXTERNO && EXTERNO.prefill) {
     const pf = EXTERNO.prefill;
-    const set = (id, val) => { const el = overlay.querySelector('#' + id); if (el && val != null && val !== '') el.value = val; };
+    // set + dispatch: cambiar .value por código no dispara los listeners, y el
+    // resumen (Total factura / A pagar) no se recalcularía.
+    const set = (id, val) => {
+      const el = overlay.querySelector('#' + id);
+      if (el && val != null && val !== '') {
+        el.value = val;
+        el.dispatchEvent(new Event(el.tagName === 'SELECT' ? 'change' : 'input', { bubbles: true }));
+      }
+    };
     set('g-fecha', pf.fecha);
     set('g-desc', pf.descripcion);
-    set('g-neto', pf.monto);
     set('g-moneda', pf.moneda);
     set('g-pago', pf.pago);
     if (pf.proveedor_id) set('g-prov', String(pf.proveedor_id));
-    overlay.querySelectorAll('.field').forEach(() => {});
+
+    // El movimiento del banco trae el TOTAL pagado (IVA incluido), pero el
+    // formulario pide neto + IVA por separado. Se desagrega a la alícuota
+    // indicada para que el total cierre contra el pago sin cuentas a mano.
+    const total = Number(pf.total_pagado);
+    if (total > 0) {
+      const tasa = Number(pf.iva_rate) > 0 ? Number(pf.iva_rate) : 0.21;
+      const neto = Math.round((total / (1 + tasa)) * 100) / 100;
+      set('g-neto', neto.toFixed(2));
+      set('g-iva', (Math.round((total - neto) * 100) / 100).toFixed(2));
+    }
+
     const t = overlay.querySelector('.card-title');
-    if (t) t.textContent = 'Cargar gasto · desde conciliación';
+    if (t) {
+      t.textContent = 'Cargar gasto · desde conciliación';
+      if (total > 0) {
+        const ref = document.createElement('div');
+        ref.className = 'gas-ref-pago';
+        ref.innerHTML = `Pago a cuadrar: <b>$ ${total.toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</b>`
+          + ` &middot; desagregado al ${Math.round((Number(pf.iva_rate) || 0.21) * 100)}%.`
+          + ` Si hay percepciones o la alícuota es otra, corregí neto e IVA.`
+          + (pf.referencia_banco ? `<br><span class="gas-ref-mov">Movimiento: ${esc(pf.referencia_banco)}</span>` : '');
+        t.insertAdjacentElement('afterend', ref);
+      }
+    }
   }
   overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
   $('#g-cancel').addEventListener('click', close);
@@ -794,6 +823,9 @@ function esc(s) {
 function inyectarEstilo() {
   if (document.getElementById('gas-style')) return;
   const css = `
+    .gas-ref-pago{margin:-6px 0 12px;padding:8px 11px;background:#FEFCE8;border:1px solid #FDE68A;border-radius:8px;font-size:12.5px;color:#854F0B;line-height:1.45}
+    .gas-ref-pago b{font-variant-numeric:tabular-nums}
+    .gas-ref-mov{display:inline-block;margin-top:4px;font-size:11.5px;color:#A8A29E}
     .gas-cap-box{margin-top:10px;padding:12px 14px;border:1px solid #E7E5E4;border-radius:8px;background:#FAFAF9;font-size:13px}
     .gas-cap-t{font-weight:600;margin-bottom:8px;color:#1C1917}
     .gas-cap-row{display:flex;justify-content:space-between;gap:12px;padding:3px 0;color:#57534E}
