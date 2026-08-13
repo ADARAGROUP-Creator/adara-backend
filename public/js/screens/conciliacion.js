@@ -520,11 +520,21 @@ function render() {
 async function conciliarSeleccion(opsSel, gruposSel, dif) {
   if (!opsSel.length || !gruposSel.length) return;
 
+  // El texto tiene que decir lo MISMO que la barra: si lo que sobra son los
+  // costos bancarios del grupo, se nombran en vez de sugerir que falta cargar
+  // una factura, que es lo contrario de lo que pasa.
+  const accesorios = [...new Set(gruposSel.flatMap(g => {
+    const base = Math.abs(Number(g.principal.monto));
+    return g.lineas.filter(x => x.id !== g.principal.id)
+                   .map(x => tipoAccesorio(x, base)).filter(Boolean);
+  }))];
   const detalle = Math.abs(dif) <= 0.02
     ? 'La diferencia cierra en cero.'
     : (dif < 0
         ? `Van a quedar ${fmt(-dif, 'ARS')} pendientes en la operación (pago parcial).`
-        : `Van a quedar ${fmt(dif, 'ARS')} sin asignar en el movimiento. Si esperabas que cerrara, puede faltar cargar una factura.`);
+        : (accesorios.length
+            ? `${fmt(dif, 'ARS')} corresponden a ${accesorios.join(' + ')}.\nQuedan imputados a la misma línea de negocio que la operación.`
+            : `Van a quedar ${fmt(dif, 'ARS')} sin asignar en el movimiento. Si esperabas que cerrara, puede faltar cargar una factura.`));
   const nLineas = gruposSel.reduce((a, g) => a + g.lineas.length, 0);
   if (!confirm(`Conciliar ${opsSel.length} operación/es con ${gruposSel.length} movimiento/s del extracto (${nLineas} líneas).\n\n${detalle}\n\n¿Confirmás?`)) return;
 
