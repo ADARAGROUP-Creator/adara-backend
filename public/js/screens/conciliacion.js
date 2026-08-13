@@ -1,4 +1,4 @@
-import { sbGet } from '../core/sb.js';
+import { sbGet, sbPatch } from '../core/sb.js';
 // Se reutiliza el alta REAL de gastos como overlay, sin cambiar de pantalla.
 // Duplicar el formulario acá haría que las dos altas diverjan con el tiempo.
 import { abrirAltaGasto } from './gastos.js';
@@ -80,6 +80,25 @@ function esEsperaMotor(m) {
 function esAccionable(m) {
   return (m.estado === 'pendiente' || m.estado === 'parcial') && !esEsperaMotor(m);
 }
+// Etiqueta legible de los costos bancarios que acompañan a una operación.
+// El extracto los nombra de forma críptica y con montos chicos: si no se
+// identifican, el que concilia no sabe qué está cerrando.
+function tipoAccesorio(m, base) {
+  const d = (m.descripcion || '').toLowerCase();
+  const pct = base > 0 ? Math.abs(Number(m.monto)) / base : 0;
+  const cerca = (p) => Math.abs(pct - p) < 0.0008;
+  if (/impuesto d.bitos y cr.ditos\/db|imp\.? d.b/.test(d)) return 'Impuesto al débito (Ley 25413)';
+  if (/impuesto d.bitos y cr.ditos\/cr/.test(d))             return 'Impuesto al crédito (Ley 25413)';
+  if (/iibb|ingresos brutos|sircreb/.test(d))                return 'Percepción IIBB';
+  if (/percepci.n i\.?v\.?a|rg\.? 3337/.test(d))             return 'Percepción IVA RG 3337';
+  if (/comis|comisi.n/.test(d))                              return 'Comisión bancaria';
+  if (/^iva$|\biva\b/.test(d))                               return 'IVA sobre comisión';
+  if (/pago de impuestos/.test(d))
+    return cerca(0.006) ? 'Impuesto al débito (Ley 25413) · 0,6%' : 'Impuesto bancario';
+  if (/retenci/.test(d))                                     return 'Retención';
+  return null;
+}
+
 function saldoMov(m) {
   const s = Number(m.saldo_pendiente);
   return Math.abs(isNaN(s) ? Number(m.monto) || 0 : s);
@@ -98,7 +117,8 @@ function operaciones() {
       key: 'compra:' + c.compra_id, op_tipo: 'compra', op_id: c.compra_id,
       titulo: c.nro_factura || ('Compra #' + c.compra_id),
       sub: p ? p.nombre : 'Sin proveedor',
-      cuit: p ? p.cuit : null, fecha: c.fecha, saldo, moneda: 'ARS', clase: 'compra'
+      cuit: p ? p.cuit : null, fecha: c.fecha, saldo, moneda: 'ARS', clase: 'compra',
+      linea_id: c.linea_id, n_lineas: 1
     });
   }
   for (const g of GASTOS) {
@@ -111,7 +131,8 @@ function operaciones() {
       // simple vista. La descripción va abajo, como dato secundario.
       titulo: p ? p.nombre : (g.descripcion || ('Gasto #' + g.id)),
       sub: [p ? g.descripcion : null, g.nro_comprobante].filter(Boolean).join(' · ') || 'Gasto',
-      cuit: p ? p.cuit : null, fecha: g.fecha, saldo, moneda: 'ARS', clase: 'gasto'
+      cuit: p ? p.cuit : null, fecha: g.fecha, saldo, moneda: 'ARS', clase: 'gasto',
+      linea_id: g.linea_id, n_lineas: Number(g.n_lineas || 1)
     });
   }
   for (const ch of CHEQUES) {
@@ -336,7 +357,11 @@ function render() {
     const multi = g.lineas.length > 1
       ? `<span class="cc-multi" data-exp="${esc(g.key)}">${g.lineas.length} líneas ▾</span>` : '';
     const detalle = (g.lineas.length > 1 && EXPANDIDO.has(g.key))
-      ? `<span class="cc-sub">${g.lineas.map(x => `<span class="cc-subr"><i>${esc((x.descripcion || '').slice(0, 52))}</i><b>${fmt(x.monto, 'ARS')}</b></span>`).join('')}</span>` : '';
+      ? `<span class="cc-sub">${g.lineas.map(x => {
+          const base = Math.abs(Number(g.principal.monto));
+          const tipo = x.id === g.principal.id ? null : tipoAccesorio(x, base);
+          return `<span class="cc-subr"><i>${tipo ? `<b class="cc-acc">${esc(tipo)}</b>` : esc((x.descripcion || '').slice(0, 52))}</i><b>${fmt(x.monto, 'ARS')}</b></span>`;
+        }).join('')}</span>` : '';
     return `<label class="cc-row${sel ? ' is-sel' : ''}${sug && !sel ? ' is-sug' : ''}${espera ? ' is-espera' : ''}${g.motivo ? ' is-trabado' : ''}" data-g="${esc(g.key)}">
       <input type="checkbox" class="cc-ck cc-ck-mov" data-key="${esc(g.key)}" ${sel ? 'checked' : ''} ${espera ? 'disabled' : ''}>
       <span class="cc-main">
@@ -366,7 +391,18 @@ function render() {
       estado = `Pago parcial · queda ${fmt(-dif, 'ARS')} pendiente en la operación`; clase = 'cc-bar-warn';
       acciones = `<button class="btn btn-primary" id="cc-go">Conciliar parcial</button>`;
     } else {
-      estado = `Sobran ${fmt(dif, 'ARS')} sin asignar en el movimiento`; clase = 'cc-bar-warn';
+      // Si lo que sobra son exactamente las lineas accesorias del grupo, se
+      // nombran: casi siempre es impuesto al débito, no un faltante de carga.
+      const sobrantes = gruposSel.flatMap(g => {
+        const base = Math.abs(Number(g.principal.monto));
+        return g.lineas.filter(x => x.id !== g.principal.id)
+                       .map(x => tipoAccesorio(x, base)).filter(Boolean);
+      });
+      const nombres = [...new Set(sobrantes)];
+      estado = nombres.length
+        ? `${fmt(dif, 'ARS')} de ${nombres.join(' + ')} — se imputan a la misma línea`
+        : `Sobran ${fmt(dif, 'ARS')} sin asignar en el movimiento`;
+      clase = 'cc-bar-warn';
       acciones = `<button class="btn btn-primary" id="cc-go">Conciliar igual</button>`;
     }
     barra = `<div class="cc-bar ${clase}">
@@ -530,6 +566,27 @@ async function conciliarSeleccion(opsSel, gruposSel, dif) {
     } catch (e) { errores.push(`${v.op_tipo} #${v.op_id}: ${e.message}`); }
   }
 
+  // Los impuestos bancarios del grupo no tienen operación propia: heredan la
+  // línea de la operación que los generó (LN9 usa movimientos.linea_id como
+  // fallback). Sin esto quedarían como costo a nivel empresa, sin línea.
+  const conLinea = opsSel.filter(o => o.linea_id && Number(o.n_lineas || 1) === 1);
+  if (conLinea.length === 1) {
+    const lid = conLinea[0].linea_id;
+    const huerfanas = gruposSel.flatMap(g => g.lineas)
+      .filter(x => saldoMov(x) > 0.02 && !(VINC_BY_MOV[x.id] || []).length && x.linea_id !== lid);
+    for (const x of huerfanas) {
+      try {
+        await sbPatch('movimientos', `id=eq.${x.id}`, { linea_id: lid });
+        x.linea_id = lid;
+      } catch (e) { console.warn('No se pudo imputar línea al accesorio', x.id, e); }
+    }
+    if (huerfanas.length) {
+      window.toast(`${huerfanas.length} costo/s bancario/s imputado/s a la misma línea`);
+    }
+  } else if (opsSel.some(o => Number(o.n_lineas || 1) > 1)) {
+    window.toast('La operación reparte entre varias líneas: los costos bancarios quedaron sin línea', 'error');
+  }
+
   SEL_OPS.clear(); SEL_MOVS.clear();
   render();
   if (errores.length) window.toast(`${plan.length - errores.length} de ${plan.length} OK. Error: ${errores[0]}`, 'error');
@@ -677,6 +734,7 @@ function inyectarEstilo() {
     .cc-bar-warn .cc-bar-dif{color:#854F0B}
     .cc-bar-wait .cc-bar-dif{color:#A8A29E}
     .cc-nosug{padding:7px 12px;background:#FEFCE8;color:#854F0B;font-size:12px;border-bottom:1px solid #E7E5E4}
+    .cc-acc{color:#854F0B;font-weight:600}
     .cc-multi{font-size:11px;color:#0C447C;background:#E6F1FB;border-radius:5px;padding:0 6px;cursor:pointer}
     .cc-sub{display:block;margin-top:5px;padding-left:8px;border-left:2px solid #E7E5E4}
     .cc-subr{display:flex;justify-content:space-between;gap:10px;font-size:11.5px;color:#78716C;padding:1px 0}
