@@ -2,6 +2,7 @@ import { sbGet } from '../core/sb.js';
 // Se reutiliza el alta REAL de gastos como overlay, sin cambiar de pantalla.
 // Duplicar el formulario acá haría que las dos altas diverjan con el tiempo.
 import { abrirAltaGasto } from './gastos.js';
+import { abrirAltaCompra } from './compras.js';
 
 // ── Pantalla: Conciliación ─────────────────────────────────────────────
 // Modelo de interacción: DOS LADOS con diferencia en vivo.
@@ -352,7 +353,8 @@ function render() {
       // Un movimiento marcado y nada del otro lado: es el caso "pagué y todavía
       // no cargué la factura". Se ofrece crearla acá mismo.
       estado = 'Sin contraparte marcada'; clase = 'cc-bar-wait';
-      acciones = `<button class="btn btn-ghost" id="cc-nuevo-gasto">+ Cargar gasto de este pago</button>`;
+      acciones = `<button class="btn btn-ghost" id="cc-nuevo-gasto">+ Gasto</button>
+                  <button class="btn btn-ghost" id="cc-nueva-compra">+ Compra</button>`;
     } else if (!opsSel.length || !movsSel.length) {
       estado = 'Marcá al menos uno de cada lado'; clase = 'cc-bar-wait'; acciones = '';
     } else if (Math.abs(dif) <= 0.02) {
@@ -469,6 +471,8 @@ function render() {
   if (go) go.addEventListener('click', () => conciliarSeleccion(opsSel, gruposSel, dif));
   const ng = document.getElementById('cc-nuevo-gasto');
   if (ng) ng.addEventListener('click', () => nuevoGastoDesde(gruposSel[0]));
+  const nc = document.getElementById('cc-nueva-compra');
+  if (nc) nc.addEventListener('click', () => nuevaCompraDesde(gruposSel[0]));
 }
 
 // ── Escritura ──────────────────────────────────────────────────────────
@@ -576,6 +580,30 @@ async function nuevoGastoDesde(g) {
     GASTOS = await sbGet('v_gastos_ap', 'estado_pago=in.(pendiente,parcial)&order=fecha.desc,id.desc').catch(() => GASTOS);
     render();
     window.toast('Gasto cargado · marcalo a la derecha para conciliar');
+  });
+}
+
+// Compra desde el movimiento. No precarga el importe: en una compra el total se
+// construye desde los ítems (cantidad x costo unitario) + IVA + percepciones —
+// CF6, el costo nace en la factura por lote. El pago se muestra como referencia
+// para cuadrar, no como dato a copiar.
+async function nuevaCompraDesde(g) {
+  if (!g) return;
+  const m = g.principal;
+  const desc = (m.descripcion || '').replace(/\s+/g, ' ').trim();
+  const digitos = desc.replace(/\D/g, '');
+  const prov = PROVEEDORES.find(p => p.cuit && digitos.includes(String(p.cuit)));
+
+  await abrirAltaCompra({
+    fecha: String(m.fecha).slice(0, 10),
+    proveedor_id: prov ? prov.id : null,
+    monto: Math.abs(Number(m.monto)).toFixed(2),
+    monto_fmt: fmt(Math.abs(Number(m.monto)), 'ARS'),
+    descripcion: desc.slice(0, 90)
+  }, async () => {
+    COMPRAS = await sbGet('v_compras_ap', 'saldo_ap_ars=gt.0.02&order=fecha.desc,compra_id.desc').catch(() => COMPRAS);
+    render();
+    window.toast('Compra cargada · marcala a la derecha para conciliar');
   });
 }
 
