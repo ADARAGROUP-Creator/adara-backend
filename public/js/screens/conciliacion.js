@@ -1,4 +1,7 @@
 import { sbGet } from '../core/sb.js';
+// Se reutiliza el alta REAL de gastos como overlay, sin cambiar de pantalla.
+// Duplicar el formulario acá haría que las dos altas diverjan con el tiempo.
+import { abrirAltaGasto } from './gastos.js';
 
 // ── Pantalla: Conciliación ─────────────────────────────────────────────
 // Modelo de interacción: DOS LADOS con diferencia en vivo.
@@ -50,6 +53,15 @@ function fmtFecha(f) {
   const [y, m, d] = String(f).slice(0, 10).split('-');
   return `${d}/${m}`;
 }
+// Código de cuenta -> opción del selector "Pago" de gastos.js
+const PAGO_POR_CUENTA = {
+  supervielle_ars: 'transferencia_svl',
+  mercadopago_ars: 'mp',
+  mp_ars: 'mp',
+  caja_ars: 'efectivo_caja_ars',
+  caja_usd: 'efectivo_caja_usd',
+  trust_wallet: 'usdt_trust'
+};
 const LABEL_CUENTA = { supervielle_ars: 'Supervielle', mercadopago_ars: 'Mercado Pago', caja_ars: 'Caja ARS', caja_usd: 'Caja USD' };
 function cuentaLabel(id) {
   const c = CUENTA_BY_ID[id];
@@ -336,7 +348,12 @@ function render() {
   let barra = '';
   if (opsSel.length || movsSel.length) {
     let estado, clase, acciones;
-    if (!opsSel.length || !movsSel.length) {
+    if (!opsSel.length && gruposSel.length === 1) {
+      // Un movimiento marcado y nada del otro lado: es el caso "pagué y todavía
+      // no cargué la factura". Se ofrece crearla acá mismo.
+      estado = 'Sin contraparte marcada'; clase = 'cc-bar-wait';
+      acciones = `<button class="btn btn-ghost" id="cc-nuevo-gasto">+ Cargar gasto de este pago</button>`;
+    } else if (!opsSel.length || !movsSel.length) {
       estado = 'Marcá al menos uno de cada lado'; clase = 'cc-bar-wait'; acciones = '';
     } else if (Math.abs(dif) <= 0.02) {
       estado = 'Cierra exacto ✓'; clase = 'cc-bar-ok';
@@ -386,7 +403,8 @@ function render() {
     <div class="cc-grid">
       <div class="cc-col">
         <div class="cc-head">
-          <span>Extracto <i>${grupos.length} operaciones</i></span>
+          <span>Movimientos de cuentas <i>${grupos.length} operaciones</i>
+            <em class="cc-sub2">Supervielle · Mercado Pago · Efectivo · USD · USDT</em></span>
           <input class="input cc-q" id="c-q-movs" placeholder="Buscar…" value="${esc(FILTRO.qMovs)}">
         </div>
         ${opsSel.length && mejorMov < 25 ? '<div class="cc-nosug">Sin sugerencia: ningún movimiento del filtro coincide por monto ni CUIT.</div>' : ''}
@@ -398,7 +416,8 @@ function render() {
       </div>
       <div class="cc-col">
         <div class="cc-head">
-          <span>Operaciones con saldo <i>${ops.length}</i></span>
+          <span>Datos cargados en la app <i>${ops.length} con saldo</i>
+            <em class="cc-sub2">Ventas · Compras · Gastos · Cheques</em></span>
           <input class="input cc-q" id="c-q-ops" placeholder="Buscar…" value="${esc(FILTRO.qOps)}">
         </div>
         ${gruposSel.length && mejorOp < 25 ? '<div class="cc-nosug">Sin sugerencia: ninguna operación coincide por monto ni CUIT.</div>' : ''}
@@ -448,6 +467,8 @@ function render() {
   if (clear) clear.addEventListener('click', () => { SEL_OPS.clear(); SEL_MOVS.clear(); render(); });
   const go = document.getElementById('cc-go');
   if (go) go.addEventListener('click', () => conciliarSeleccion(opsSel, gruposSel, dif));
+  const ng = document.getElementById('cc-nuevo-gasto');
+  if (ng) ng.addEventListener('click', () => nuevoGastoDesde(gruposSel[0]));
 }
 
 // ── Escritura ──────────────────────────────────────────────────────────
@@ -530,6 +551,34 @@ function aplicarLocal(v) {
   }
 }
 
+// Alta de gasto precargada desde un movimiento del extracto. El importe sale de
+// la línea PRINCIPAL, no del neto del grupo: los impuestos bancarios (impuesto
+// al débito, IIBB acreditaciones) no forman parte de la factura del proveedor.
+async function nuevoGastoDesde(g) {
+  if (!g) return;
+  const m = g.principal;
+  const cta = CUENTA_BY_ID[g.cuenta_id] || {};
+  const desc = (m.descripcion || '').replace(/\s+/g, ' ').trim();
+  // Proveedor por CUIT si el detalle lo trae.
+  const digitos = desc.replace(/\D/g, '');
+  const prov = PROVEEDORES.find(p => p.cuit && digitos.includes(String(p.cuit)));
+
+  await abrirAltaGasto({
+    fecha: String(m.fecha).slice(0, 10),
+    descripcion: desc.slice(0, 90),
+    monto: Math.abs(Number(m.monto)).toFixed(2),
+    moneda: cta.moneda || 'ARS',
+    pago: PAGO_POR_CUENTA[cta.codigo] || '',
+    proveedor_id: prov ? prov.id : null
+  }, async () => {
+    // Al volver, se recargan solo los gastos: el nuevo aparece a la derecha con
+    // el movimiento todavía marcado, listo para vincular.
+    GASTOS = await sbGet('v_gastos_ap', 'estado_pago=in.(pendiente,parcial)&order=fecha.desc,id.desc').catch(() => GASTOS);
+    render();
+    window.toast('Gasto cargado · marcalo a la derecha para conciliar');
+  });
+}
+
 async function desvincular(id) {
   if (!confirm('¿Desvincular? El movimiento y la operación vuelven a quedar pendientes.')) return;
   try {
@@ -548,7 +597,8 @@ function inyectarEstilo() {
   const css = `
     .cc-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px;padding-bottom:80px}
     .cc-col{border:1px solid #E7E5E4;border-radius:10px;overflow:hidden;background:#fff}
-    .cc-head{display:flex;align-items:center;gap:10px;padding:9px 12px;background:#FAFAF9;border-bottom:1px solid #E7E5E4;font-size:13px;font-weight:600;color:#44403C}
+    .cc-head{display:flex;align-items:flex-start;gap:10px;padding:9px 12px;background:#FAFAF9;border-bottom:1px solid #E7E5E4;font-size:13px;font-weight:600;color:#44403C}
+    .cc-sub2{display:block;font-style:normal;font-weight:400;font-size:11px;color:#A8A29E;margin-top:2px}
     .cc-head i{font-style:normal;color:#A8A29E;font-weight:400}
     .cc-q{margin-left:auto;max-width:190px;padding:5px 9px;font-size:13px}
     .cc-list{max-height:520px;overflow:auto}
