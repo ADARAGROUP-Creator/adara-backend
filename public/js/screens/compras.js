@@ -19,6 +19,11 @@ let FILTRO = { periodo: '', q: '' };
 let DETALLE_ID = null;   // compra con el detalle abierto (una por vez)
 let DETALLE = {};        // cache compra_id -> { comps, lotes, gastosCap }
 
+// Alta invocada desde otra pantalla (Conciliación). Mismo criterio que gastos.js:
+// se reutiliza este formulario en vez de duplicarlo.
+let EXTERNO = null;      // { prefill, onSaved }
+let CATALOGOS_OK = false;
+
 const hoyISO = () => new Date().toISOString().slice(0, 10);
 const lineaLabel = l => l.nombre || l.descripcion || l.codigo || ('Línea ' + l.id);
 const provLabel = p => p && (p.nombre || p.cuit || ('Proveedor #' + p.id)) || '— Sin proveedor —';
@@ -68,6 +73,25 @@ const FAMILIAS = [
   { val: 'mochila_individual', label: 'Mochila individual' },
 ];
 
+// Abre el alta de compra como overlay sobre cualquier pantalla, precargada.
+// A diferencia de un gasto, una compra genera lotes y stock: el detalle por SKU
+// (cantidad y costo unitario) lo tiene que completar la persona, no se infiere
+// del movimiento bancario.
+export async function abrirAltaCompra(prefill = {}, onSaved = null) {
+  if (!CATALOGOS_OK) {
+    LINEAS = await sbGet('lineas_negocio', 'order=id.asc');
+    LINEA_LABEL = Object.fromEntries(LINEAS.map(l => [l.id, lineaLabel(l)]));
+    SKUS = await sbGet('skus', 'activo=eq.true&order=codigo.asc&select=id,codigo,descripcion,alicuota_iva');
+    SKU_BY_ID = Object.fromEntries(SKUS.map(s => [s.id, s]));
+    PROVEEDORES = await sbGet('proveedores', 'order=nombre.asc').catch(() => []);
+    PROV_BY_ID = Object.fromEntries(PROVEEDORES.map(p => [p.id, p]));
+    CATALOGOS_OK = true;
+  }
+  inyectarEstilo();
+  EXTERNO = { prefill, onSaved };
+  openAlta();
+}
+
 export async function loadCompras() {
   const root = document.getElementById('app-screens');
   root.innerHTML = `<div class="loading">Cargando compras…</div>`;
@@ -76,6 +100,7 @@ export async function loadCompras() {
     LINEA_LABEL = Object.fromEntries(LINEAS.map(l => [l.id, lineaLabel(l)]));
     SKUS = await sbGet('skus', 'activo=eq.true&order=codigo.asc&select=id,codigo,descripcion,alicuota_iva');
     SKU_BY_ID = Object.fromEntries(SKUS.map(s => [s.id, s]));
+    CATALOGOS_OK = true;
     await recargar();
   } catch (e) {
     root.innerHTML = `<div class="error">No se pudo cargar Compras: ${e.message}</div>`;
@@ -579,7 +604,27 @@ function openAlta() {
     </div>`;
   document.body.appendChild(overlay);
   const $ = s => overlay.querySelector(s);
-  const close = () => overlay.remove();
+  const close = () => { overlay.remove(); EXTERNO = null; };
+
+  // Precarga desde Conciliación: fecha, proveedor y moneda. El importe NO se
+  // precarga: en una compra el total sale de los ítems (cantidad x costo) más
+  // IVA y percepciones, no al revés. Se muestra como referencia para cuadrar.
+  if (EXTERNO && EXTERNO.prefill) {
+    const pf = EXTERNO.prefill;
+    const set = (id, v) => { const el = overlay.querySelector('#' + id); if (el && v != null && v !== '') el.value = v; };
+    set('c-fecha', pf.fecha);
+    if (pf.proveedor_id) set('c-prov', String(pf.proveedor_id));
+    const t = overlay.querySelector('.card-title');
+    if (t) {
+      t.textContent = 'Nueva compra local · desde conciliación';
+      if (pf.monto) {
+        const ref = document.createElement('div');
+        ref.className = 'cmp-ref-pago';
+        ref.textContent = `Pago a cuadrar: ${pf.monto_fmt || pf.monto} · ${pf.descripcion || ''}`;
+        t.insertAdjacentElement('afterend', ref);
+      }
+    }
+  }
   overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
   $('#c-cancel').addEventListener('click', close);
 
@@ -999,11 +1044,16 @@ function openAlta() {
           if (!ra.ok) { const da = await ra.json().catch(() => ({})); throw new Error(da.error || (ra.status + '')); }
         } catch (eAdj) {
           window.toast('Compra guardada, pero la factura no se subió: ' + eAdj.message, 'error');
-          close(); await recargar(); render(); return;
+          const cbA = EXTERNO && EXTERNO.onSaved;
+          close();
+          if (cbA) { cbA(data.id); return; }
+          await recargar(); render(); return;
         }
       }
 
       window.toast('Compra cargada');
+      const cbC = EXTERNO && EXTERNO.onSaved;
+      if (cbC) { close(); cbC(data.id); return; }
       close();
       await recargar();
       render();
@@ -1022,6 +1072,7 @@ function optProv(selId) {
 function inyectarEstilo() {
   if (document.getElementById('com-style')) return;
   const css = `
+    .cmp-ref-pago{margin:-6px 0 12px;padding:7px 10px;background:#FEFCE8;border:1px solid #FDE68A;border-radius:8px;font-size:12.5px;color:#854F0B}
     /* fila clickeable + acciones */
     .com-fila{cursor:pointer;transition:background .12s}
     .com-fila:hover{background:#FAFAF9}
