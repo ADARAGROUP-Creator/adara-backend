@@ -47,6 +47,12 @@ function esDudoso(v) {
   return (ee === 'despachado' || ee === 'entregado') && cs !== 'reingresado' && cs !== 'perdida';
 }
 
+function mpId(v) {
+  if (v.mp_payment_ids) return String(v.mp_payment_ids);
+  if (v.mp_payment_id) return String(v.mp_payment_id);
+  return '';
+}
+
 // ── Función principal ──────────────────────────────────────────────────
 export async function exportarVentasXLSX(desde, hasta) {
   if (!desde || !hasta) throw new Error('Faltan fechas desde/hasta');
@@ -106,7 +112,7 @@ export async function exportarVentasXLSX(desde, hasta) {
 
   // ── Hojas por SKU ────────────────────────────────────────────────
   const HEADERS = [
-    '#', 'FECHA VENTA', 'N VENTA', 'CANT', 'F ENTREGA',
+    '#', 'FECHA VENTA', 'N VENTA', 'ID MP', 'CANT', 'F ENTREGA',
     'CANT F DEVOLUCION', 'MOTIVO', 'STOCK DUDOSO', 'CANT SALDO',
     'Factura', 'Importe', 'Cargo venta', 'x vender cuotas',
     'Cargo envio', 'Impuestos', 'A cobrar', 'Cobrado',
@@ -139,13 +145,14 @@ export async function exportarVentasXLSX(desde, hasta) {
         i + 1,
         ff(v.fecha),
         String(v.ml_order_id || ''),
+        mpId(v),
         cant,
         ff(v.fecha_entrega),
         esDev ? cant : null,
         getMotivo(v) || null,
         esDudoso(v) ? 'SI' : null,
         saldoAcum,
-        v.factura_tango || null,
+        v.nro_factura || null,
         n(v.importe_bruto),
         n(v.cargo_venta),
         n(v.costo_financiero),
@@ -161,7 +168,7 @@ export async function exportarVentasXLSX(desde, hasta) {
     });
 
     data.push([
-      null, 'TOTALES', null, totCant,
+      null, 'TOTALES', null, null, totCant,
       null, null, null, null, null, null,
       r2(sI), r2(sC), r2(sF), r2(sE), r2(sIm), r2(sAc),
       null, null, null,
@@ -172,9 +179,9 @@ export async function exportarVentasXLSX(desde, hasta) {
     const name = (sku || 'SIN_SKU').substring(0, 31).replace(/[\/\\*?\[\]]/g, '-');
     const ws = XLSX.utils.aoa_to_sheet(data);
     ws['!cols'] = [
-      {wch:5}, {wch:12}, {wch:18}, {wch:6}, {wch:12},
-      {wch:16}, {wch:16}, {wch:13}, {wch:11}, {wch:14},
-      {wch:14}, {wch:13}, {wch:15}, {wch:13}, {wch:12},
+      {wch:5}, {wch:12}, {wch:18}, {wch:16}, {wch:6}, {wch:12},
+      {wch:16}, {wch:16}, {wch:13}, {wch:11},
+      {wch:16}, {wch:14}, {wch:13}, {wch:15}, {wch:13}, {wch:12},
       {wch:14}, {wch:10}, {wch:13}, {wch:15}, {wch:18}, {wch:12},
     ];
     XLSX.utils.book_append_sheet(wb, ws, name);
