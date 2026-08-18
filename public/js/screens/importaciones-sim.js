@@ -100,11 +100,20 @@ function calc() {
   // Seguro: si hay monto cargado pisa el %. Se prorratea por FOB.
   const seguroTotal = segMonto > 0 ? segMonto : segPct * (sFob + fleteDecl);
 
-  // CIF DECLARADO (base aduanera): flete declarado por peso declarado, seguro por FOB declarado.
+  // ── DOS PRORRATEOS DISTINTOS PARA EL MISMO FLETE ──────────────────────────
+  // Fiscal: la aduana reparte flete y seguro por VALOR FOB. No es una preferencia
+  //   nuestra, es como liquida el despachante. Validado contra el despacho Bishop
+  //   (27/7/2026): por FOB da 5.653,578429 USD de derechos vs 5.653,58 del
+  //   despacho — 0,0016 de redondeo. Por peso daba 5.932,95 (+4,9%).
+  // Costo: el flete se reparte por PESO, porque un producto pesado efectivamente
+  //   consume más flete. Eso NO cambia: el pesado sigue cargando más al costo.
+  // Antes ambos compartían `fleteDeclShare` (por peso), y eso arrastraba el
+  // criterio de costeo a la base imponible.
   rows.forEach(r => {
-    r.fleteDeclShare = fleteDecl * safeDiv(r.pesoT, sPeso);
+    r.fleteFiscal = fleteDecl * safeDiv(r.fobDeclT, sFob);   // base aduanera → por FOB
+    r.fleteCostoShare = fleteDecl * safeDiv(r.pesoT, sPeso); // costo del producto → por peso
     r.seguro = seguroTotal * safeDiv(r.fobDeclT, sFob);
-    r.cif = r.fobDeclT + r.fleteDeclShare + r.seguro;
+    r.cif = r.fobDeclT + r.fleteFiscal + r.seguro;
   });
   const sCif = rows.reduce((s, r) => s + r.cif, 0);
 
@@ -114,10 +123,13 @@ function calc() {
   // La diferencia flete_real − flete_declarado es puro costeo (capitaliza vía bolsón) y NO es
   // subdeclaración aduanera → no debe generar ahorro ni coima. El ahorro nace solo de FOB + cantidad
   // + posición arancelaria del producto. (Fix HOKU 22/7/2026 — ver P15.)
-  const sPesoReal = rows.reduce((s, r) => s + num(r.p.peso_u) * r.cantReal, 0);
+  // El CIF sombra usa el MISMO criterio fiscal (por FOB) que el CIF declarado.
+  // Si uno repartiera por peso y el otro por valor, la diferencia entre ambos
+  // incluiría ruido de prorrateo y generaría ahorro (y coima) fantasma.
   rows.forEach(r => {
-    const pesoRealT = num(r.p.peso_u) * r.cantReal;
-    r.cifReal = r.fobRealT + fleteDecl * safeDiv(pesoRealT, sPesoReal) + seguroTotal * safeDiv(r.fobRealT, fobRealTot);
+    r.cifReal = r.fobRealT
+              + fleteDecl * safeDiv(r.fobRealT, fobRealTot)
+              + seguroTotal * safeDiv(r.fobRealT, fobRealTot);
   });
 
   // Tributos declarados (lo que pagás) + ahorro vs declarar todo real (derechos + estadística).
@@ -150,8 +162,9 @@ function calc() {
   // Costo por producto (necesita el bolsón ya cerrado, porque la coima vive ahí dentro).
   rows.forEach(r => {
     const p = r.p;
-    // El COSTO de flete usa el DECLARADO (por peso); la diferencia ya está en el bolsón.
-    r.fleteCosto = r.fleteDeclShare;
+    // El COSTO de flete usa el DECLARADO repartido por PESO (no el fiscal por
+    // FOB); la diferencia flete real − declarado ya está en el bolsón.
+    r.fleteCosto = r.fleteCostoShare;
     r.fijo = FIJOS_MODO === 'pct' ? num(p.fijo_asignado) / 100 * bolson : num(p.fijo_asignado);
     r.noDeclarado = r.fobRealT - r.fobDeclT;
     // Despachante y coima NO son línea propia del costo: viven dentro de r.fijo (bolsón).
