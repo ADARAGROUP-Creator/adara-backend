@@ -636,23 +636,48 @@ async function conciliarSeleccion(opsSel, gruposSel, dif) {
     } catch (e) { console.warn('No se pudo registrar el IDC embebido', e); }
   }
 
+  // Las líneas accesorias quedan EXPLICADAS por pertenecer a la operación: se
+  // registran como ajuste con su motivo. Sin esto quedan pendientes para
+  // siempre, sueltas y sin sentido (un impuesto de $2.844 no se concilia contra
+  // nada por sí solo). Y heredan la línea cuando la operación tiene una sola.
   const conLinea = opsSel.filter(o => o.linea_id && Number(o.n_lineas || 1) === 1);
-  if (conLinea.length === 1) {
-    const lid = conLinea[0].linea_id;
-    const huerfanas = gruposSel
-      .flatMap(g => g.lineas.filter(x => esAccesorio(x, g) || Number(x.ajuste_ars || 0) > 0))
-      .filter(x => x.linea_id !== lid);
-    for (const x of huerfanas) {
-      try {
-        await sbPatch('movimientos', `id=eq.${x.id}`, { linea_id: lid });
-        x.linea_id = lid;
-      } catch (e) { console.warn('No se pudo imputar línea al accesorio', x.id, e); }
+  const lid = conLinea.length === 1 ? conLinea[0].linea_id : null;
+
+  const accesorias = gruposSel.flatMap(g =>
+    g.lineas.filter(x => esAccesorio(x, g))
+            .map(x => ({ mov: x, motivo: tipoAccesorio(x, Math.abs(Number(g.principal.monto))) })));
+
+  let cerradas = 0;
+  for (const { mov, motivo } of accesorias) {
+    const pend = saldoMov(mov);
+    if (!(pend > 0.02)) continue;
+    const patch = { ajuste_ars: round2(pend), ajuste_motivo: motivo || 'Costo bancario de la operación' };
+    if (lid) patch.linea_id = lid;
+    try {
+      await sbPatch('movimientos', `id=eq.${mov.id}`, patch);
+      mov.ajuste_ars = patch.ajuste_ars;
+      if (lid) mov.linea_id = lid;
+      const en = MOVS.find(x => x.id === mov.id);
+      if (en) { en.saldo_pendiente = 0; en.estado = 'conciliado'; en.ajuste_ars = patch.ajuste_ars; }
+      cerradas++;
+    } catch (e) { console.warn('No se pudo cerrar el accesorio', mov.id, e); }
+  }
+
+  // El movimiento con IDC embebido (línea única) también hereda la línea.
+  if (lid) {
+    for (const g of gruposSel) {
+      const m0 = g.principal;
+      if (Number(m0.ajuste_ars || 0) > 0 && m0.linea_id !== lid) {
+        try { await sbPatch('movimientos', `id=eq.${m0.id}`, { linea_id: lid }); m0.linea_id = lid; }
+        catch (e) { console.warn('No se pudo imputar línea al IDC embebido', m0.id, e); }
+      }
     }
-    if (huerfanas.length) {
-      window.toast(`${huerfanas.length} costo/s bancario/s imputado/s a la misma línea`);
-    }
-  } else if (opsSel.some(o => Number(o.n_lineas || 1) > 1)) {
-    window.toast('La operación reparte entre varias líneas: los costos bancarios quedaron sin línea', 'error');
+  }
+
+  if (cerradas) {
+    window.toast(lid
+      ? `${cerradas} costo/s bancario/s cerrado/s e imputado/s a la misma línea`
+      : `${cerradas} costo/s bancario/s cerrado/s · sin línea (la operación reparte entre varias)`);
   }
 
   SEL_OPS.clear(); SEL_MOVS.clear();
