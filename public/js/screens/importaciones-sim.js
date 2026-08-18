@@ -32,7 +32,7 @@ let SKUS = [], SKU_BY_ID = {}, SKU_BY_COD = {};
 let CUENTAS = [];
 
 function blankParams() {
-  return { tc: '', flete_declarado_usd: '', flete_real_usd: '', seguro_pct: '', seguro_monto: '', despachante_pct: '', despachante_monto: '', iibb_pct: '', ganancias_pct: '', coima_pct: '', arancel_sim_usd: 10 };
+  return { tc: '', flete_declarado_usd: '', flete_real_usd: '', seguro_pct: '', seguro_monto: '', despachante_pct: '', despachante_monto: '', iibb_pct: '', iibb_monto: '', ganancias_pct: '', ganancias_monto: '', coima_pct: '', arancel_sim_usd: 10, tope_estadistica_usd: '' };
 }
 function blankProd() {
   // sku_id: OPCIONAL acá, OBLIGATORIO al confirmar (regla IMP-F2-2). Una simulación
@@ -67,7 +67,14 @@ function calc() {
   const despMonto = num(P.despachante_monto);
   const iibbPct = num(P.iibb_pct) / 100;
   const ganPct = num(P.ganancias_pct) / 100;
+  // Montos liquidados: si se cargan, PISAN al porcentaje (mismo criterio que
+  // seguro y despachante). El % sirve para simular ANTES de importar; una vez
+  // que tenés el despacho, cargás lo liquidado y el VEP y el crédito fiscal dan
+  // exactos. Son percepciones: NO capitalizan al costo (P12), solo crédito.
+  const iibbMonto = num(P.iibb_monto);
+  const ganMonto  = num(P.ganancias_monto);
   const coimaPct = num(P.coima_pct) / 100;
+  const topeEst = num(P.tope_estadistica_usd);  // 0 = sin tope
   const aranceSim = num(P.arancel_sim_usd);   // tasa SIM: monto fijo, capitaliza al costo (vía bolsón), NO entra a base IVA ni genera crédito, pero se paga en el VEP (suma a tributos)
   const bolsonManual = bolsonActual();
   const fleteDiff = fleteReal - fleteDecl;   // (real − declarado) → va al bolsón de fijos
@@ -133,23 +140,47 @@ function calc() {
   });
 
   // Tributos declarados (lo que pagás) + ahorro vs declarar todo real (derechos + estadística).
+  // La estadística se calcula en dos pasos porque tiene TOPE: primero la bruta por
+  // producto, después se escala al tope si lo supera, y recién ahí entra a la base
+  // de IVA. Validado contra el despacho Bishop: base sujeta USD 7.609,60, 3% =
+  // 228,29, tope 180 → se liquidó 180.
   rows.forEach(r => {
     const p = r.p;
-    // Tasas: el campo primario es el REAL; el declarado es override (vacío = real).
     r.derechos = r.cif * eff(p, p.derechos_pct_decl, p.derechos_pct) / 100;       // lo que PAGÁS (declarado)
-    r.estadistica = r.cif * eff(p, p.estadistica_pct_decl, p.estadistica_pct) / 100;
+    r.estBruta = r.cif * eff(p, p.estadistica_pct_decl, p.estadistica_pct) / 100;
     r.impInternos = r.cif * num(p.imp_internos_pct) / 100;       // se trata como derechos
+  });
+  const estBrutaTot = rows.reduce((s, r) => s + r.estBruta, 0);
+  // El tope se reparte proporcionalmente entre los productos que la generan.
+  const factorEst = (topeEst > 0 && estBrutaTot > topeEst) ? topeEst / estBrutaTot : 1;
+
+  rows.forEach(r => {
+    const p = r.p;
+    r.estadistica = r.estBruta * factorEst;
     r.baseIva = r.cif + r.derechos + r.estadistica + r.impInternos;
     r.iva = r.baseIva * num(p.iva_pct) / 100;
     r.iibb = r.baseIva * iibbPct;
     r.ganancias = r.baseIva * ganPct;
     // Ahorro = derechos+estad que pagarías declarando TODO real (FOB+cantidad+alícuota) − lo que pagás.
     r.derRealFull = r.cifReal * num(p.derechos_pct) / 100;
-    r.estRealFull = r.cifReal * num(p.estadistica_pct) / 100;
+    r.estRealFull = r.cifReal * num(p.estadistica_pct) / 100 * factorEst;   // el tope también acota el escenario real
     r.ahorroDer = r.derRealFull - r.derechos;
     r.ahorroEst = r.estRealFull - r.estadistica;
     r.ahorro = r.ahorroDer + r.ahorroEst;
   });
+
+  // Si se cargó el monto liquidado, se reparte por base de IVA (que es la base
+  // de la percepción) para que cada producto quede con su crédito exacto.
+  // Así el VEP y el crédito fiscal cierran contra el despacho aunque no sepamos
+  // qué alícuota exacta aplicó el despachante.
+  const sBaseIva = rows.reduce((s, r) => s + r.baseIva, 0);
+  if (iibbMonto > 0 || ganMonto > 0) {
+    rows.forEach(r => {
+      const share = safeDiv(r.baseIva, sBaseIva);
+      if (iibbMonto > 0) r.iibb = iibbMonto * share;
+      if (ganMonto > 0) r.ganancias = ganMonto * share;
+    });
+  }
 
   const ahorroTot = rows.reduce((s, r) => s + r.ahorro, 0);
   const coimaTot = coimaPct * ahorroTot;   // coima GLOBAL = % × ahorro total; capitaliza vía bolsón, SIN crédito, NO es tributo
@@ -295,7 +326,9 @@ function buildDatos() {
       seguro_pct: num(P.seguro_pct), seguro_monto: num(P.seguro_monto),
       despachante_pct: num(P.despachante_pct), despachante_monto: num(P.despachante_monto),
       iibb_pct: num(P.iibb_pct), ganancias_pct: num(P.ganancias_pct), coima_pct: num(P.coima_pct),
-      arancel_sim_usd: num(P.arancel_sim_usd)
+      arancel_sim_usd: num(P.arancel_sim_usd),
+      tope_estadistica_usd: num(P.tope_estadistica_usd),
+      iibb_monto: num(P.iibb_monto), ganancias_monto: num(P.ganancias_monto)
     },
     fijos: FIJOS.map(f => ({ concepto: f.concepto || '', monto_usd: num(f.monto_usd) })),
     fijos_modo: FIJOS_MODO,
@@ -322,8 +355,10 @@ function loadDatos(d) {
     tc: pa.tc ?? '', flete_declarado_usd: pa.flete_declarado_usd ?? '', flete_real_usd: pa.flete_real_usd ?? '',
     seguro_pct: pa.seguro_pct ?? '', seguro_monto: pa.seguro_monto ?? '',
     despachante_pct: pa.despachante_pct ?? '', despachante_monto: pa.despachante_monto ?? '',
-    iibb_pct: pa.iibb_pct ?? '', ganancias_pct: pa.ganancias_pct ?? '', coima_pct: pa.coima_pct ?? '',
-    arancel_sim_usd: pa.arancel_sim_usd ?? 10
+    iibb_pct: pa.iibb_pct ?? '', iibb_monto: pa.iibb_monto ?? '',
+    ganancias_pct: pa.ganancias_pct ?? '', ganancias_monto: pa.ganancias_monto ?? '', coima_pct: pa.coima_pct ?? '',
+    arancel_sim_usd: pa.arancel_sim_usd ?? 10,
+    tope_estadistica_usd: pa.tope_estadistica_usd ?? ''
   };
   FIJOS = (d.fijos || []).map(f => ({ concepto: f.concepto || '', monto_usd: f.monto_usd ?? '' }));
   FIJOS_MODO = d.fijos_modo === 'monto' ? 'monto' : 'pct';
@@ -499,9 +534,12 @@ function paramsCard() {
       ${f('Despachante %', 'despachante_pct', 'sobre el CIF')}
       ${f('Despachante $ (USD)', 'despachante_monto', 'si lo cargás, pisa el %')}
       ${f('IIBB percep. %', 'iibb_pct', 'crédito fiscal')}
+      ${f('IIBB percep. $ (USD)', 'iibb_monto', 'lo liquidado · pisa el %')}
       ${f('Ganancias percep. %', 'ganancias_pct', 'crédito fiscal')}
+      ${f('Ganancias percep. $ (USD)', 'ganancias_monto', 'lo liquidado · pisa el %')}
       ${f('Coima %', 'coima_pct', 'sobre derechos+estad. evitados')}
       ${f('Arancel SIM (USD)', 'arancel_sim_usd', 'tasa fija · capitaliza, sin crédito')}
+      ${f('Tope estadística (USD)', 'tope_estadistica_usd', 'vacío = sin tope · lo confirma el despachante')}
     </div>
     <div class="imp-bases" id="imp-bases"></div>
   </div>`;
@@ -1106,7 +1144,7 @@ function bindDelegation(body) {
     if (k === 'param') {
       P[f] = v;
       // Estos parámetros mueven el bolsón efectivo (flete-diff + despachante).
-      if (['flete_declarado_usd', 'flete_real_usd', 'despachante_pct', 'despachante_monto', 'arancel_sim_usd'].includes(f)) {
+      if (['flete_declarado_usd', 'flete_real_usd', 'despachante_pct', 'despachante_monto', 'arancel_sim_usd', 'tope_estadistica_usd', 'iibb_monto', 'ganancias_monto'].includes(f)) {
         onBolsonChanged(); syncProdFijoInputs();
       }
     }
