@@ -5,6 +5,7 @@ import { loadMovimientos } from './screens/movimientos.js';
 import { loadSaldos } from './screens/saldos.js';
 import { loadVentasML } from './screens/ventas-ml.js?v=dev6';
 import { loadFlex } from './screens/flex.js';
+import { loadMLPreguntas } from './screens/ml-preguntas.js?v=3';
 import { loadGastos } from './screens/gastos.js';
 import { loadConciliacion } from './screens/conciliacion.js';
 import { loadCuadre } from './screens/cuadre.js';
@@ -22,6 +23,7 @@ const screens = {
   saldos: { fn: loadSaldos, title: 'Saldos', sub: 'Saldo por cuenta y carga del saldo de arranque' },
   ventas_ml: { fn: loadVentasML, title: 'Ventas ML', sub: 'Ventas de Mercado Libre y su cobro' },
   flex: { fn: loadFlex, title: 'Flex', sub: 'Control semanal de envíos Flex contra el resumen del proveedor' },
+  ml_preguntas: { fn: loadMLPreguntas, title: 'Preguntas ML', sub: 'Bot de preventa: bandeja de respuestas, escaladas y fichas' },
   conciliacion: { fn: loadConciliacion, title: 'Conciliación', sub: 'Vincular movimientos con operaciones' },
   cuadre: { fn: loadCuadre, title: 'Cuadre', sub: 'Control de conciliación: semáforo por cuenta y cola priorizada' },
   gastos: { fn: loadGastos, title: 'Gastos', sub: 'Gastos operativos' },
@@ -48,7 +50,7 @@ function route() {
 
 // Qué item de nav resaltar para cada hash. Flex vive bajo "Mercado Libre"
 // (mismo item que Ventas ML), así que comparten el resaltado.
-const NAV_ALIAS = { flex: 'ventas_ml' };
+const NAV_ALIAS = { flex: 'ventas_ml', ml_preguntas: 'ventas_ml' };
 
 async function renderScreen(hash) {
   const screen = screens[hash] || screens.home;
