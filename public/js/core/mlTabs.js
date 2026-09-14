@@ -1,12 +1,12 @@
-// ── Sub-pestañas del grupo "Mercado Libre" (Ventas ML | Flex) ───────────
-// Barra compartida que se muestra arriba de ambas pantallas, para que el grupo
-// se sienta una sola sección. `active` = 'ventas_ml' | 'flex'.
+// ── Sub-pestañas del grupo "Mercado Libre" (Ventas ML | Flex | Preguntas) ──
+// Barra compartida que se muestra arriba de las pantallas del grupo, para que
+// se sienta una sola sección. `active` = 'ventas_ml' | 'flex' | 'ml_preguntas'.
 
 export function mlTabs(active) {
   injectMlTabsStyle();
   const tab = (hash, label) =>
     `<a class="ml-tab ${active === hash ? 'active' : ''}" href="#${hash}">${label}</a>`;
-  return `<div class="ml-tabs">${tab('ventas_ml', 'Ventas ML')}${tab('flex', 'Flex')}</div>`;
+  return `<div class="ml-tabs">${tab('ventas_ml', 'Ventas ML')}${tab('flex', 'Flex')}${tab('ml_preguntas', 'Preguntas')}</div>`;
 }
 
 function injectMlTabsStyle() {
