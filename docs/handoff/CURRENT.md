@@ -105,6 +105,14 @@ Si algo no lo sabés o no lo encontrás en el código, anotalo como pendiente; n
 - No tocar sin acuerdo previo: credenciales o `client_id` de ML, refresh tokens, costos vigentes de `products`, movimientos de stock, ni el esquema de ninguna de las dos bases.
 - El token de ML no choca hoy: las dos apps usan `client_id` distintos. La regla de un único proceso refrescando aplica cuando haya una integración unificada.
 
+### Decisiones de Sebastián a bajar al dominio correspondiente
+
+**24/9/2026**
+
+- **Flex:** el tarifario vigente para la operación es el de `pricing-adara-online`: CABA $3.850, GBA1 $5.350, GBA2 $5.950 y GBA3 $7.850 (IVA incluido). La grilla de backend de 21/6/2026 queda como referencia histórica de costo MEF, no como tarifario operativo vigente. Falta bajar la distinción formal al dominio Flex antes de cualquier sincronización.
+- **SKU `86G+AC001`:** se excluye del match de migración y se eliminará de pricing; no crear un `combo_map` en backend para ese código. La eliminación efectiva de datos queda para una tarea separada y verificable.
+- **Tienda Nube:** las ventas se integrarán en el futuro al backend como sistema propietario, incluyendo importación de órdenes, circuito fiscal y consumo FIFO. No se migra ni automatiza todavía.
+
 ---
 
 ## Preguntas abiertas
