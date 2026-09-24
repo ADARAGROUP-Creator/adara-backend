@@ -115,6 +115,10 @@ Si algo no lo sabés o no lo encontrás en el código, anotalo como pendiente; n
 - **SKU `86G+AC001`:** se excluye del match de migración y se eliminará de pricing; no crear un `combo_map` en backend para ese código. La eliminación efectiva de datos queda para una tarea separada y verificable.
 - **Tienda Nube:** las ventas se integrarán en el futuro al backend como sistema propietario, incluyendo importación de órdenes, circuito fiscal y consumo FIFO. No se migra ni automatiza todavía.
 
+### Documentación de pricing entregada
+
+**24/9/2026.** Se agregó `docs/ADARA-PRICING.md` y su entrada en el índice. El relevamiento se hizo contra código y schema real: pantallas, fórmula, 19 tablas, funciones/triggers/RLS, integraciones ML/TN, cron, variables por nombre, datos migrables y conflictos. No se modificaron datos ni lógica de `pricing-adara-online`.
+
 ---
 
 ## Preguntas abiertas
