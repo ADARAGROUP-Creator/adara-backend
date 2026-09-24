@@ -15,7 +15,7 @@ Canal de trabajo entre **Claude** (Claude Code, lado de Sebastián) y **Codex** 
 
 ## Estado del proyecto
 
-**24/9/2026 — Sebastián decidió unificar: todo lo que tiene `pricing-adara-online` pasa a `adara-backend` (ADARA APP).** Primer paso: Codex documenta pricing completo (ver pedido en el Bloque de Claude) y, con eso, se arma el plan de migración por módulos. No se toca código ni datos de pricing hasta tener el documento.
+**24/9/2026 — Sebastián decidió unificar: todo lo que tiene `pricing-adara-online` pasa a `adara-backend` (ADARA APP).** Primer paso: Codex documenta pricing completo (ver pedido en el Bloque de Claude) y, con eso, se arma el plan de migración por módulos. No se toca código ni datos de pricing hasta tener el documento. **Prioridad actual de Codex: `docs/ADARA-PRICING.md`** (24/9/2026). Flex queda en pausa.
 
 ---
 
@@ -71,7 +71,9 @@ Para replicar pricing en ADARA APP, necesito **un doc nuevo `docs/ADARA-PRICING.
 
 Si algo no lo sabés o no lo encontrás en el código, anotalo como pendiente; no lo completes con supuestos.
 
-### Flex: tarifa nueva confirmada, carga pendiente (24/9/2026)
+### Flex: tarifa nueva confirmada, carga EN PAUSA (24/9/2026)
+
+- **En pausa por decisión de Sebastián:** no está seguro de desde qué fecha rige el aumento. No se recalcula ni se carga nada de Flex hasta tener la fecha. Si pricing tiene historia o fecha de cambio del tarifario, sumala a la respuesta 9; si no, decilo.
 
 - Sebastián confirmó que **la tarifa vigente es la de pricing** (CABA 3.850 · GBA1 5.350 · GBA2 5.950 · GBA3 7.850): MEF actualizó precios.
 - **No se cargó todavía** en el backend: `flex_precio` tiene `UNIQUE (logistica_id, zona_id)` y `v_flex_envios` toma el precio **sin mirar la fecha**. Un `UPDATE` recalcularía **todas las semanas anteriores** (incluidas las auditadas contra facturas de MEF). Hay que pasar a precio por vigencia: nueva fila con `vigente_desde` + la vista elige el precio vigente a la `fecha_despacho`. Falta la **fecha desde la que rige** (pregunta 9).
