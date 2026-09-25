@@ -521,3 +521,23 @@ Regla que queda: **toda extensión de vista es aditiva al final** (invariante 20
 ### Vocabulario de jurisdicciones
 
 `iibb_jurisdiccion.jurisdiccion`, `retenciones.jurisdiccion` y la `descripcion` de las percepciones de compra comparten el mismo código `snake_case`. Sin eso, `v_iibb_jurisdiccion_mensual` no podría poner determinado, retenido y percibido en la misma fila. El fix de `iibb_tucuman` existe precisamente porque la ingesta no siempre escribía el campo: **la vista no debe depender de que el dato venga bien cargado.**
+
+---
+
+## Actualización — 25 Septiembre 2026 (pricing: 6 tablas propias)
+
+Migración **`20260925120000_pricing_tablas`** (copia en `supabase/migrations/`). Paso 2b de la unificación de pricing (`ADARA-PRICING.md`). Son datos de **simulación** (PRC1): **nunca** se escriben en `skus`, `lotes` ni `iibb_parametros` (PRC2). Tasas en **porcentaje** (21 = 21 %), como `core/pricing.js`.
+
+| Tabla | Clave | Qué guarda | Origen en pricing |
+|---|---|---|---|
+| `pricing_producto` | `sku_id` PK → `skus.id` (CASCADE) | `costo_sin_iva`, `iva_pct` (21 / 10,5), `categoria`, `envio_ml_monto` y `cargo_fijo_ml_monto` (**brutos**, manuales hasta el sync de publicaciones), `estado` | `products` |
+| `pricing_costo_historial` | `id` identity | cada cambio de costo o IVA, con `cambiado_por = auth.uid()`; lo llena el trigger `trg_pricing_costo_historial` | `product_cost_history` |
+| `pricing_tasas` | `id = 1` (una sola fila) | `iibb_pct`, `idc_pct`, `iigg_pct` (< 100), `estructura_pct` | `tax_settings` |
+| `pricing_canal` | `codigo` PK | los 9 canales: `tipo`, `cuotas`, `costo_financiacion_pct`, `margen_default_pct`, `redondeo_a`, `modo_redondeo`, `aplica_*` (**NULL = default de `normalizeOption`**: ML sí, directo no), `orden` | `mercadolibre_installment_fees` |
+| `pricing_comision_categoria` | `id`; UNIQUE `lower(categoria)` | `comision_pct` por categoría, `ml_category_ids` | `mercadolibre_category_fees` |
+| `pricing_margen` | UNIQUE `(sku_id, canal_codigo)`; FK a `skus` y `pricing_canal` | `margen_pct`, `utilidad_neta` (manda sobre margen), `pvp_manual` (manda sobre todo), montos de estructura y envío manual, `comision_venta_pct`, `venta_con_iva`, `iva_costo_pct`, `descuento_promo_pct` | `product_channel_margins` |
+
+- `actualizado_en` lo mantiene `fn_pricing_actualizado()` (BEFORE UPDATE). No se reutilizó `update_updated_at()` porque escribe `updated_at`.
+- Seguridad: patrón post-A17 en las 6 (RLS + policy `<tabla>_authenticated` + GRANT `authenticated` + REVOKE `anon`). Verificado: 0 grants a `anon`.
+- Datos iniciales: `pricing_tasas` con IIBB 5 % (el resto en 0, pendiente de copiar de pricing); `pricing_canal` con los 9 canales y los costos de cuotas MP3 8,4 · MP6 12,3 · MP9 15,7 · MP12 19,2 de la migración 037 de pricing. `pricing_producto`, `pricing_margen` y `pricing_comision_categoria` vacías.
+- Verificado con una transacción de prueba revertida: el historial registra alta + cambio de costo (no registra cambios de otras columnas) y la FK a `pricing_canal` rechaza canales inexistentes.
