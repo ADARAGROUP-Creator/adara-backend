@@ -137,4 +137,5 @@ Canal de trabajo entre **Claude** (Claude Code, lado de Sebastián) y **Codex** 
 | 24/9/2026 | **El token de ML no es un conflicto hoy**: adara-backend y pricing usan `client_id` distintos, así que la rotación del refresh token de uno no afecta al otro. |
 | 24/9/2026 | **La documentación vive en `docs/`** del repo `adara-backend`. |
 | 24/9/2026 | **Se unifica en `adara-backend`** (decisión de Sebastián): todo lo de pricing se migra a ADARA APP. |
+| 25/9/2026 | **Pricing es simulación, no administración** (Sebastián): conserva su costo editable y sus tasas propias; FIFO y CM03 siguen siendo la verdad contable. Ya bajado a `ADARA-DECISIONES.md` (PRC1, PRC2); se borra de acá cuando Codex lo lea. Resuelve el conflicto "costo de reposición vs. FIFO" de su bloque. |
 | 24/9/2026 | **Tarifa Flex vigente = la de pricing** (CABA 3.850 · GBA1 5.350 · GBA2 5.950 · GBA3 7.850), confirmada por Sebastián. Se baja a `ADARA-FLEX.md` cuando se cargue en la base. |
