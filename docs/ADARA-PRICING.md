@@ -117,3 +117,13 @@ Variables por nombre: `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY
 Migrar tras validación: productos/EAN, historia de costos como dato analítico, márgenes/canales, tasas/cuotas, banners y posiblemente documentación logística. Se regeneran por sync publicaciones ML, competencia, oportunidades y logs. No copiar tokens. Órdenes ML requieren plan de deduplicación contra ventas backend.
 
 Conflictos: costo de reposición vs FIFO; snapshots de stock vs propietario único backend; combos; token ML único; y Flex. Tarifas vigentes pricing: CABA $3.850, GBA1 $5.350, GBA2 $5.950, GBA3 $7.850 IVA incluido. La fecha de vigencia sigue pendiente: no actualizar la tabla backend actual, porque su vista recalcula historia. Tienda Nube se integrará luego al backend con órdenes, fiscal y FIFO; no automatizarla todavía.
+
+## Estado de la migración en ADARA APP
+
+**25/9/2026 — Paso 2a: motor de precios portado.** `public/js/core/pricing.js` es un port 1:1 de `lib/pricing.ts` de pricing (commit `8b56bcd`): `calculatePriceSummary`, `calculateB2bPriceSummary`, `normalizeOption`, `roundPrice`, `promoListPrice`, `priceForMercadoLibreUpload`. Es un módulo **puro**: no lee ni escribe base ni llama a ML. Conserva los nombres de campo de pricing (`cost_without_vat`, `vat_rate`, `iibb_rate`…) para que la migración de datos mapee directo; todas las tasas en porcentaje.
+
+- Tests: `tests/pricing.test.mjs` (`npm test`): el ejemplo del SKU 101 ($500.800), PVP manual, Ganancias sólo sobre ganancia positiva, canales directos, casos inválidos, redondeo, y el port de los tests B2B de pricing (exención del fijo bajo $33.000).
+- Todavía **no hay pantalla** ni datos: el módulo espera los datos de canales, tasas y márgenes que se migran en el paso 2b.
+- Sin resolver (decisiones aparte): con qué **costo** se calcula (el editable de pricing o el FIFO del backend) y qué **IIBB** se usa (5 % fijo de pricing o la alícuota efectiva del CM03).
+
+**Plan por pasos** (de menor a mayor riesgo): 1. catálogo (match `products.sku` → `skus.id`, EAN, categoría, medidas) · 2a. motor de precios ✅ · 2b. canales, tasas, cuotas, comisiones y márgenes + pantalla de Precios sólo lectura · 3. escrituras en ML (precio, B2B, promociones, preguntas), recién con la conexión de ML unificada · 4. análisis ML sobre `ventas_ml` · 5. logística y Tienda Nube.

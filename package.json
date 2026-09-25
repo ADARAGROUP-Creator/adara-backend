@@ -4,7 +4,8 @@
   "description": "ADARA Backend — ML + MP + Tango + Supabase",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test \"tests/**/*.test.mjs\""
   },
   "engines": {
     "node": ">=18.0.0"
