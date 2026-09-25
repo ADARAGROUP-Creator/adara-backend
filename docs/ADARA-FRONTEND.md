@@ -64,6 +64,7 @@ public/
         ├── conciliacion.js · resultado.js · costeo.js · psi.js
         ├── posicion-fiscal.js · flex.js · cuadre.js · saldos.js
         ├── ventas-ml.js · importaciones-sim.js
+        ├── precios.js · precios-config.js · precios-detalle.js
 ```
 
 > ⚠️ Al subir archivos a GitHub web, caen en la carpeta donde estás parado. Verificá la ruta final.
@@ -208,6 +209,7 @@ Síntoma para diagnosticar: una acción que debería pasar una vez se multiplica
 |----------|---------|--------|
 | Home | `home.js` | ✅ 5 KPIs + próximos pasos + **banner de token de ML** (7/8) |
 | SKUs | `skus.js` | ✅ Lista + buscador + pills + edición inline. Alícuota por `select`; la columna guarda la **fracción** (0.105) |
+| Precios | `precios.js` + `precios-config.js` + `precios-detalle.js` | ✅ (25/9/2026) Simulador de precios por canal, migrado de pricing (PRC1). Grilla SKU × canal con costo de simulación editable inline, IVA y categoría ML; costo FIFO sólo como referencia. Modal de detalle con desglose (comisión, IIBB, envío, ganancia) y edición de margen / utilidad / PVP manual con recálculo en vivo. Bloque de tasas, canales y comisión por categoría. Motor: `core/pricing.js`. No escribe en ML |
 | Movimientos | `movimientos.js` | ✅ Lista + filtros + KPIs + carga manual + **"+ Venta en efectivo"** (7/8). Ver `ADARA-MOVIMIENTOS.md` |
 | PSI Recompra | `psi.js` | ✅ Matriz de ventas/semana + velocidad + días de stock + recompra |
 | Inventario | `costeo.js` | ✅ (ex "Costeo", hash `#costeo`). Valorización + SKUs sin costo. `TC_USD=1465` hardcode |

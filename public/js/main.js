@@ -1,6 +1,7 @@
 import { initSB, login, changePassword, logout, hasSession, sessionUser } from './core/sb.js';
 import { loadHome } from './screens/home.js';
 import { loadSkus } from './screens/skus.js';
+import { loadPrecios } from './screens/precios.js?v=1';
 import { loadMovimientos } from './screens/movimientos.js';
 import { loadSaldos } from './screens/saldos.js';
 import { loadVentasML } from './screens/ventas-ml.js?v=dev6';
@@ -19,6 +20,7 @@ import { loadPosicionFiscal } from './screens/posicion-fiscal.js';
 const screens = {
   home: { fn: loadHome, title: 'Home', sub: 'Resumen del estado actual' },
   skus: { fn: loadSkus, title: 'SKUs', sub: 'Catálogo de productos' },
+  precios: { fn: loadPrecios, title: 'Precios', sub: 'Simulador de precios por canal (ex pricing)' },
   movimientos: { fn: loadMovimientos, title: 'Movimientos', sub: 'Extracto unificado de cuentas' },
   saldos: { fn: loadSaldos, title: 'Saldos', sub: 'Saldo por cuenta y carga del saldo de arranque' },
   ventas_ml: { fn: loadVentasML, title: 'Ventas ML', sub: 'Ventas de Mercado Libre y su cobro' },
