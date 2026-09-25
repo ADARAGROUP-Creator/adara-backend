@@ -124,6 +124,6 @@ Conflictos: costo de reposición vs FIFO; snapshots de stock vs propietario úni
 
 - Tests: `tests/pricing.test.mjs` (`npm test`): el ejemplo del SKU 101 ($500.800), PVP manual, Ganancias sólo sobre ganancia positiva, canales directos, casos inválidos, redondeo, y el port de los tests B2B de pricing (exención del fijo bajo $33.000).
 - Todavía **no hay pantalla** ni datos: el módulo espera los datos de canales, tasas y márgenes que se migran en el paso 2b.
-- Sin resolver (decisiones aparte): con qué **costo** se calcula (el editable de pricing o el FIFO del backend) y qué **IIBB** se usa (5 % fijo de pricing o la alícuota efectiva del CM03).
+- **Resuelto 25/9/2026 (PRC1, PRC2):** pricing es simulación. Calcula con **su propio costo editable y sus propias tasas**; no tiene que coincidir con FIFO ni con el CM03. Al migrar, esos datos van a **tablas propias de pricing** y nunca se escriben en `skus`, `lotes` ni `iibb_parametros`. La pantalla puede mostrar el costo FIFO al lado, como referencia.
 
 **Plan por pasos** (de menor a mayor riesgo): 1. catálogo (match `products.sku` → `skus.id`, EAN, categoría, medidas) · 2a. motor de precios ✅ · 2b. canales, tasas, cuotas, comisiones y márgenes + pantalla de Precios sólo lectura · 3. escrituras en ML (precio, B2B, promociones, preguntas), recién con la conexión de ML unificada · 4. análisis ML sobre `ventas_ml` · 5. logística y Tienda Nube.

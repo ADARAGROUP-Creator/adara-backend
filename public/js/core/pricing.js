@@ -6,9 +6,9 @@
 // Mantiene los nombres de campo de pricing (cost_without_vat, vat_rate, iibb_rate…) para
 // que la migración de datos mapee directo. Todas las tasas van en PORCENTAJE (21 = 21 %).
 //
-// Pendientes de la unificación (no resueltos acá, se deciden aparte):
-//   - Costo: pricing usa `cost_without_vat` editable; el backend tiene FIFO (CF6).
-//   - IIBB: pricing usa una tasa fija; el backend deriva la efectiva del CM03 (IIBB3).
+// Es SIMULACIÓN (PRC1): usa el costo editable y las tasas propias de pricing, que no tienen
+// que coincidir con FIFO (CF6) ni con el IIBB del CM03 (IIBB3). Sus números nunca
+// alimentan la administración (PRC2).
 
 export function money(value) {
   if (value === undefined || value === null || Number.isNaN(value)) return '-';
