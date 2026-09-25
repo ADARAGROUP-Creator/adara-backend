@@ -89,8 +89,9 @@ Los demás docs cubren dominios puntuales (ver lista completa abajo).
 | 29 | **`ADARA-IIBB-CONVENIO-MULTILATERAL.md`** | **(NUEVO 10/8/2026)** **IIBB de Convenio Multilateral: del CM03 al Resultado.** Cómo se derivan las alícuotas efectivas por jurisdicción desde la DJ Mensual CM03 (`determinado_j / base` = factor completo, sin separar coeficiente de alícuota), tablas `iibb_parametros` + `iibb_jurisdiccion`, vistas `v_iibb_base` / `v_iibb_determinado` / `v_iibb_jurisdiccion_mensual` / `v_impuesto_cheque_mensual`, extensión aditiva de `v_resultado_mensual` y `v_resultado_linea_mensual`, márgenes reales 2026, saldos a favor por jurisdicción, brecha de retenciones (SIRCREB) y la **limitación vigente: la alícuota efectiva de 5,2852 % es un techo hasta cargar la base imponible declarada** |
 
 | 30 | **`ADARA-FLEX-ZONAS-MEF.md`** | **(NUEVO 23/9/2026)** **Zonificación de MEF para Flex.** Las 26 zonas del cuadro de control, diccionario localidad→partido con las **ambiguas marcadas** (nunca se resuelven por nombre), split **La Matanza Norte/Sur** (comercial, no geográfico — La Tablada = Norte/GBA 1), lectura y normalización de etiquetas ZPL (`^FO0,660` manda sobre `^FO0,705`), y excepciones donde MEF zonifica distinto a la geografía. **No es criterio de clasificación**: el partido sale del dato vía Georef (F7) |
+| 31 | **`ADARA-PRICING.md`** | **(NUEVO 24/9/2026)** Relevamiento de `pricing-adara-online`: pantallas, fórmula, schema real, integraciones, cron, deploy, datos migrables y conflictos con backend. |
 
-Total rediseño: **30 documentos**.
+Total rediseño: **31 documentos**.
 
 ### Documentos del sistema v21 (referencia técnica del código actual en producción)
 
@@ -117,7 +118,7 @@ Total v21: **6 documentos**.
 
 Total proceso: **1 documento**.
 
-> **Conteo total:** 29 rediseño + 6 v21 + 1 proceso = **36 documentos `.md`** (+ `adara-app-v21.html`, legacy).
+> **Conteo total:** 31 rediseño + 6 v21 + 1 proceso = **38 documentos `.md`** (+ `adara-app-v21.html`, legacy).
 
 > ⚠️ **Motor de conciliación:** el del server v21 está MUERTO (`movimientos_mp` no existe). La conciliación viva es el front (`ventas-ml.js` + `vinculos`). Ver `ADARA-DECISIONES.md` O7.
 
